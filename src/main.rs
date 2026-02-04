@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
 
@@ -21,16 +21,27 @@ enum BlockType {
     Fabrica,
     Mina,
     Almacen,
+    Ruta,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct Block {
     hex: Axial,
     kind: BlockType,
+    #[serde(default)]
+    rotation: u8,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PlacedBlock {
+    kind: BlockType,
+    rotation: u8,
 }
 
 #[derive(Serialize, Deserialize)]
 struct MapData {
+    #[serde(default)]
+    resources: Vec<Axial>,
     blocks: Vec<Block>,
 }
 
@@ -106,11 +117,16 @@ fn hex_distance(a: Axial, b: Axial) -> i32 {
     (dq + dr + ds) / 2
 }
 
-fn save_map(path: &str, blocks: &HashMap<Axial, BlockType>) {
+fn save_map(path: &str, blocks: &HashMap<Axial, PlacedBlock>, resources: &HashSet<Axial>) {
     let data = MapData {
+        resources: resources.iter().copied().collect(),
         blocks: blocks
             .iter()
-            .map(|(hex, kind)| Block { hex: *hex, kind: *kind })
+            .map(|(hex, placed)| Block {
+                hex: *hex,
+                kind: placed.kind,
+                rotation: placed.rotation,
+            })
             .collect(),
     };
     if let Ok(json) = serde_json::to_string_pretty(&data) {
@@ -118,17 +134,27 @@ fn save_map(path: &str, blocks: &HashMap<Axial, BlockType>) {
     }
 }
 
-fn load_map(path: &str) -> HashMap<Axial, BlockType> {
+fn load_map(path: &str) -> (HashMap<Axial, PlacedBlock>, HashSet<Axial>) {
     if let Ok(json) = fs::read_to_string(path) {
         if let Ok(data) = serde_json::from_str::<MapData>(&json) {
-            return data
+            let blocks = data
                 .blocks
                 .into_iter()
-                .map(|b| (b.hex, b.kind))
+                .map(|b| {
+                    (
+                        b.hex,
+                        PlacedBlock {
+                            kind: b.kind,
+                            rotation: b.rotation % 6,
+                        },
+                    )
+                })
                 .collect();
+            let resources = data.resources.into_iter().collect();
+            return (blocks, resources);
         }
     }
-    HashMap::new()
+    (HashMap::new(), HashSet::new())
 }
 
 fn block_color(kind: BlockType) -> Color {
@@ -137,7 +163,82 @@ fn block_color(kind: BlockType) -> Color {
         BlockType::Fabrica => Color::from_rgba(220, 140, 80, 255),
         BlockType::Mina => Color::from_rgba(110, 150, 200, 255),
         BlockType::Almacen => Color::from_rgba(210, 190, 90, 255),
+        BlockType::Ruta => Color::from_rgba(90, 100, 115, 255),
     }
+}
+
+fn generate_resources(radius: i32, count: usize) -> HashSet<Axial> {
+    let mut resources = HashSet::new();
+    let max_attempts = count * 12;
+    let mut attempts = 0;
+    while resources.len() < count && attempts < max_attempts {
+        let q = rand::gen_range(-radius, radius + 1);
+        let r = rand::gen_range(-radius, radius + 1);
+        let hex = Axial { q, r };
+        if hex_distance(hex, Axial { q: 0, r: 0 }) <= radius {
+            resources.insert(hex);
+        }
+        attempts += 1;
+    }
+    resources
+}
+
+fn rotate_dir(dir: i32, rotation: u8) -> i32 {
+    (dir + rotation as i32).rem_euclid(6)
+}
+
+fn block_ports(kind: BlockType, rotation: u8) -> (Vec<i32>, Vec<i32>) {
+    let (inputs, outputs) = match kind {
+        BlockType::Vivienda => (vec![3], vec![0]),
+        BlockType::Fabrica => (vec![2, 4], vec![0]),
+        BlockType::Mina => (vec![], vec![0]),
+        BlockType::Almacen => (vec![3], vec![0]),
+        BlockType::Ruta => (vec![], vec![]),
+    };
+    let inputs = inputs
+        .into_iter()
+        .map(|d| rotate_dir(d, rotation))
+        .collect();
+    let outputs = outputs
+        .into_iter()
+        .map(|d| rotate_dir(d, rotation))
+        .collect();
+    (inputs, outputs)
+}
+
+fn edge_point(center: Vec2, size: f32, dir: i32) -> Vec2 {
+    let angle = (60.0 * dir as f32).to_radians();
+    center + vec2(size * angle.cos(), size * angle.sin())
+}
+
+fn draw_port_marker(center: Vec2, size: f32, dir: i32, color: Color) {
+    let mid = edge_point(center, size, dir);
+    let angle = (60.0 * dir as f32).to_radians();
+    let forward = vec2(angle.cos(), angle.sin());
+    let right = vec2(-forward.y, forward.x);
+    let tip = mid + forward * (size * 0.12);
+    let left = mid - forward * (size * 0.08) + right * (size * 0.08);
+    let right_pt = mid - forward * (size * 0.08) - right * (size * 0.08);
+    draw_triangle(tip, left, right_pt, color);
+}
+
+fn axial_neighbors(hex: Axial) -> [Axial; 6] {
+    let dirs = [
+        Axial { q: 1, r: 0 },
+        Axial { q: 1, r: -1 },
+        Axial { q: 0, r: -1 },
+        Axial { q: -1, r: 0 },
+        Axial { q: -1, r: 1 },
+        Axial { q: 0, r: 1 },
+    ];
+    [
+        Axial { q: hex.q + dirs[0].q, r: hex.r + dirs[0].r },
+        Axial { q: hex.q + dirs[1].q, r: hex.r + dirs[1].r },
+        Axial { q: hex.q + dirs[2].q, r: hex.r + dirs[2].r },
+        Axial { q: hex.q + dirs[3].q, r: hex.r + dirs[3].r },
+        Axial { q: hex.q + dirs[4].q, r: hex.r + dirs[4].r },
+        Axial { q: hex.q + dirs[5].q, r: hex.r + dirs[5].r },
+    ]
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -177,14 +278,16 @@ fn ui_button(rect: Rect, label: &str, mouse: Vec2) -> (bool, bool) {
 
 #[macroquad::main("GridGame")]
 async fn main() {
-    let mut blocks: HashMap<Axial, BlockType> = HashMap::new();
+    let mut blocks: HashMap<Axial, PlacedBlock> = HashMap::new();
+    let mut resources: HashSet<Axial> = HashSet::new();
     let mut cam_offset = Vec2::ZERO;
     let mut cam_zoom: f32 = 1.0;
-    let mut zoom_speed: f32 = 0.1;
+    let mut zoom_speed: f32 = 0.001;
     let mut dragging = false;
     let mut last_mouse = Vec2::ZERO;
     let map_path = "map.json";
     let mut selected: Option<BlockType> = Some(BlockType::Vivienda);
+    let mut placement_rotation: u8 = 0;
     let mut dirty = false;
     let mut scene = Scene::MainMenu;
 
@@ -216,7 +319,13 @@ async fn main() {
                 let rect = Rect::new((screen_width() - btn_w) * 0.5, y, btn_w, btn_h);
                 let (clicked, _) = ui_button(rect, "Continuar", mouse);
                 if clicked {
-                    blocks = load_map(map_path);
+                    let (loaded_blocks, loaded_resources) = load_map(map_path);
+                    blocks = loaded_blocks;
+                    resources = loaded_resources;
+                    if resources.is_empty() {
+                        resources = generate_resources(GRID_RADIUS, 140);
+                        dirty = true;
+                    }
                     scene = Scene::Game;
                 }
                 y += btn_h + 12.0;
@@ -226,8 +335,10 @@ async fn main() {
             let (clicked_new, _) = ui_button(rect_new, "Nueva Partida", mouse);
             if clicked_new {
                 blocks.clear();
+                resources = generate_resources(GRID_RADIUS, 140);
                 cam_offset = Vec2::ZERO;
                 cam_zoom = 1.0;
+                placement_rotation = 0;
                 scene = Scene::Game;
             }
             y += btn_h + 12.0;
@@ -242,7 +353,7 @@ async fn main() {
             let (clicked_exit, _) = ui_button(rect_exit, "Salir", mouse);
             if clicked_exit {
                 if !blocks.is_empty() {
-                    save_map(map_path, &blocks);
+                    save_map(map_path, &blocks, &resources);
                 }
                 break;
             }
@@ -319,7 +430,7 @@ async fn main() {
             let hover_hex = pixel_to_hex(world_mouse, HEX_SIZE, Vec2::ZERO);
 
             let panel_pos = vec2(16.0, screen_height() - 110.0);
-            let panel_size = vec2(320.0, 94.0);
+            let panel_size = vec2(392.0, 94.0);
             let panel_rect = Rect::new(panel_pos.x, panel_pos.y, panel_size.x, panel_size.y);
 
             let mut tooltip: Option<&str> = None;
@@ -328,8 +439,17 @@ async fn main() {
             if is_mouse_button_pressed(MouseButton::Left) && !ui_capturing {
                 if hex_distance(hover_hex, Axial { q: 0, r: 0 }) <= GRID_RADIUS {
                     if let Some(kind) = selected {
-                        blocks.insert(hover_hex, kind);
-                        dirty = true;
+                        if kind != BlockType::Mina || resources.contains(&hover_hex) {
+                            let rotation = if kind == BlockType::Ruta { 0 } else { placement_rotation };
+                            blocks.insert(
+                                hover_hex,
+                                PlacedBlock {
+                                    kind,
+                                    rotation,
+                                },
+                            );
+                            dirty = true;
+                        }
                     } else if blocks.remove(&hover_hex).is_some() {
                         dirty = true;
                     }
@@ -337,23 +457,39 @@ async fn main() {
             }
 
             if is_key_pressed(KeyCode::S) {
-                save_map(map_path, &blocks);
+                save_map(map_path, &blocks, &resources);
                 dirty = false;
             }
 
             if is_key_pressed(KeyCode::L) {
-                blocks = load_map(map_path);
+                let (loaded_blocks, loaded_resources) = load_map(map_path);
+                blocks = loaded_blocks;
+                resources = loaded_resources;
+                if resources.is_empty() {
+                    resources = generate_resources(GRID_RADIUS, 140);
+                }
                 dirty = false;
             }
 
             if dirty {
-                save_map(map_path, &blocks);
+                save_map(map_path, &blocks, &resources);
                 dirty = false;
             }
 
             if is_key_pressed(KeyCode::Escape) {
-                save_map(map_path, &blocks);
+                save_map(map_path, &blocks, &resources);
                 scene = Scene::MainMenu;
+            }
+
+            if is_key_pressed(KeyCode::R) {
+                if let Some(block) = blocks.get_mut(&hover_hex) {
+                    if block.kind != BlockType::Ruta {
+                        block.rotation = (block.rotation + 1) % 6;
+                        dirty = true;
+                    }
+                } else {
+                    placement_rotation = (placement_rotation + 1) % 6;
+                }
             }
 
             for r in -GRID_RADIUS..=GRID_RADIUS {
@@ -374,12 +510,37 @@ async fn main() {
                         continue;
                     }
 
-                    if let Some(kind) = blocks.get(&hex) {
+                    if resources.contains(&hex) {
+                        draw_hex_filled(
+                            center,
+                            (HEX_SIZE - 4.5) * cam_zoom,
+                            Color::from_rgba(70, 95, 80, 255),
+                        );
+                    }
+
+                    if let Some(placed) = blocks.get(&hex) {
                         draw_hex_filled(
                             center,
                             (HEX_SIZE - 2.5) * cam_zoom,
-                            block_color(*kind),
+                            block_color(placed.kind),
                         );
+                        let (inputs, outputs) = block_ports(placed.kind, placed.rotation);
+                        for dir in inputs {
+                            draw_port_marker(
+                                center,
+                                (HEX_SIZE - 3.0) * cam_zoom,
+                                dir,
+                                Color::from_rgba(80, 160, 220, 255),
+                            );
+                        }
+                        for dir in outputs {
+                            draw_port_marker(
+                                center,
+                                (HEX_SIZE - 3.0) * cam_zoom,
+                                dir,
+                                Color::from_rgba(220, 170, 90, 255),
+                            );
+                        }
                     }
 
                     draw_hex_outline(
@@ -388,6 +549,30 @@ async fn main() {
                         Color::from_rgba(70, 78, 86, 255),
                         1.0,
                     );
+                }
+            }
+
+            for (hex, placed) in blocks.iter() {
+                if placed.kind != BlockType::Ruta {
+                    continue;
+                }
+                let base_center =
+                    screen_center + cam_offset + hex_to_pixel(*hex, HEX_SIZE, Vec2::ZERO) * cam_zoom;
+                let neighbors = axial_neighbors(*hex);
+                for neighbor in neighbors {
+                    if blocks.contains_key(&neighbor) {
+                        let neighbor_center = screen_center
+                            + cam_offset
+                            + hex_to_pixel(neighbor, HEX_SIZE, Vec2::ZERO) * cam_zoom;
+                        draw_line(
+                            base_center.x,
+                            base_center.y,
+                            neighbor_center.x,
+                            neighbor_center.y,
+                            3.0 * cam_zoom,
+                            Color::from_rgba(120, 140, 160, 200),
+                        );
+                    }
                 }
             }
 
@@ -401,7 +586,7 @@ async fn main() {
             );
 
             draw_text(
-                "Click: colocar  |  Rueda: zoom  |  Boton medio: mover  |  S: guardar  |  L: cargar  |  Esc: menu",
+                "Click: colocar  |  Rueda: zoom  |  Boton medio: mover  |  R: rotar  |  S: guardar  |  L: cargar  |  Esc: menu",
                 16.0,
                 28.0,
                 22.0,
@@ -415,6 +600,15 @@ async fn main() {
                 52.0,
                 20.0,
                 Color::from_rgba(190, 200, 210, 255),
+            );
+
+            let rot_text = format!("Rotacion: {}", placement_rotation);
+            draw_text(
+                &rot_text,
+                16.0,
+                74.0,
+                18.0,
+                Color::from_rgba(170, 185, 200, 255),
             );
 
             draw_rectangle(
@@ -438,12 +632,13 @@ async fn main() {
             let mut bx = panel_pos.x + 12.0;
             let by = panel_pos.y + 16.0;
 
-            let buttons: [(Option<BlockType>, &str); 5] = [
+            let buttons: [(Option<BlockType>, &str); 6] = [
                 (None, "Deconstruir"),
                 (Some(BlockType::Vivienda), "Vivienda"),
                 (Some(BlockType::Fabrica), "Fabrica"),
                 (Some(BlockType::Mina), "Minas"),
                 (Some(BlockType::Almacen), "Almacen"),
+                (Some(BlockType::Ruta), "Ruta"),
             ];
 
             for (option, tip) in buttons {

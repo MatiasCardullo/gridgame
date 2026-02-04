@@ -2,87 +2,24 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use macroquad::prelude::*;
-use serde::{Deserialize, Serialize};
 
-mod ui;
 mod scenes;
 mod core;
-use core::{load_config, save_config, ConfigData};
-use ui::{AppColors, AppConfig, RuntimeColors, UiButtonColors};
+use core::{
+    load_config, save_config, Axial, BlockType, ConfigData, FrameContext, PlacedBlock, Scene,
+    TileData, Unit,
+};
+use core::ui::{UiButtonColors, WindowState};
 
 const HEX_SIZE: f32 = 16.0;
 const GRID_RADIUS: i32 = 64;
 const SQRT_3: f32 = 1.732_050_8;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
-struct Axial {
-    q: i32,
-    r: i32,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
-enum BlockType {
-    Vivienda,
-    Fabrica,
-    Mina,
-    Almacen,
-    Logistica,
-    Ruta,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
-enum TileType {
-    Piedra,
-    Hierro,
-    Cobre,
-    Agua,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-struct Block {
-    hex: Axial,
-    kind: BlockType,
-    #[serde(default)]
-    rotation: u8,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-struct Tile {
-    hex: Axial,
-    kind: TileType,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct PlacedBlock {
-    kind: BlockType,
-    rotation: u8,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Scene {
-    MainMenu,
-    Config,
-    Game,
-}
-
-#[derive(Clone, Copy, Debug)]
-struct FrameContext {
-    mouse: Vec2,
-    screen_center: Vec2,
-    has_save: bool,
-    font_sm: f32,
-    font_md: f32,
-    font_lg: f32,
-    font_title: f32,
-    button_colors: UiButtonColors,
-    colors_rt: RuntimeColors,
-}
-
 // Entry point and scene dispatcher.
 #[macroquad::main("GridGame")]
 async fn main() {
     let mut blocks: HashMap<Axial, PlacedBlock> = HashMap::new();
-    let mut tiles: HashMap<Axial, TileType> = HashMap::new();
+    let mut tiles: HashMap<Axial, TileData> = HashMap::new();
     let mut cam_offset = Vec2::ZERO;
     let mut cam_zoom: f32 = 1.0;
     let config_path = "config.json";
@@ -105,6 +42,14 @@ async fn main() {
     let mut selected: Option<BlockType> = Some(BlockType::Vivienda);
     let mut placement_rotation: u8 = 0;
     let mut panel_collapsed = false;
+    let mut block_window = WindowState {
+        title: String::new(),
+        rect: Rect::new(40.0, 120.0, 220.0, 120.0),
+        open: false,
+        target: None,
+    };
+    let mut units: Vec<Unit> = Vec::new();
+    let mut unit_spawn_from: Option<Axial> = None;
     let mut dirty = false;
     let mut scene = Scene::MainMenu;
 
@@ -179,6 +124,9 @@ async fn main() {
                     &mut selected,
                     &mut placement_rotation,
                     &mut panel_collapsed,
+                    &mut block_window,
+                    &mut units,
+                    &mut unit_spawn_from,
                     &mut dirty,
                     &mut scene,
                     map_path,

@@ -4,8 +4,308 @@ use std::fs;
 use macroquad::prelude::*;
 use serde::{Deserialize, Serialize};
 
-use crate::ui::{AppColors, AppConfig, RuntimeColors};
-use crate::{Axial, Block, BlockType, PlacedBlock, Tile, TileType, SQRT_3};
+pub mod ui;
+
+use crate::SQRT_3;
+use crate::core::ui::UiButtonColors;
+
+// Axial hex coordinates.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct Axial {
+    pub q: i32,
+    pub r: i32,
+}
+
+// Available building types.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum BlockType {
+    Vivienda,
+    Fabrica,
+    Mina,
+    Almacen,
+    Logistica,
+    Ruta,
+}
+
+// Available terrain/resource types.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum TileType {
+    Piedra,
+    Hierro,
+    Cobre,
+    Agua,
+}
+
+// Item types that can be stored and transported.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum ItemType {
+    Piedra,
+    Hierro,
+    Cobre,
+    Agua,
+}
+
+// Persisted block entry for map JSON.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Block {
+    pub hex: Axial,
+    pub kind: BlockType,
+    #[serde(default)]
+    pub rotation: u8,
+    #[serde(default)]
+    pub stored: Vec<ItemStack>,
+    #[serde(default)]
+    pub mine_progress: f32,
+    #[serde(default)]
+    pub capacity: i32,
+}
+
+// Persisted tile entry for map JSON.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Tile {
+    pub hex: Axial,
+    pub kind: TileType,
+    #[serde(default)]
+    pub amount: i32,
+}
+
+// Runtime tile data with remaining amount.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TileData {
+    pub kind: TileType,
+    pub amount: i32,
+}
+
+// Stored item stack for blocks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ItemStack {
+    pub kind: ItemType,
+    pub amount: i32,
+}
+
+// In-memory placed block data.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PlacedBlock {
+    pub kind: BlockType,
+    pub rotation: u8,
+    pub mine_progress: f32,
+    pub capacity: i32,
+    pub stored: Vec<ItemStack>,
+}
+
+// Simple unit moving along a hex path.
+#[derive(Clone, Debug)]
+pub struct Unit {
+    pub path: Vec<Axial>,
+    pub index: usize,
+    pub progress: f32,
+    pub speed: f32,
+}
+
+// Scene routing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Scene {
+    MainMenu,
+    Config,
+    Game,
+}
+
+// UI/frame context passed into scenes.
+#[derive(Clone, Copy, Debug)]
+pub struct FrameContext {
+    pub mouse: Vec2,
+    pub screen_center: Vec2,
+    pub has_save: bool,
+    pub font_sm: f32,
+    pub font_md: f32,
+    pub font_lg: f32,
+    pub font_title: f32,
+    pub button_colors: UiButtonColors,
+    pub colors_rt: RuntimeColors,
+}
+
+// Config values persisted to config.json.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub struct AppConfig {
+    pub zoom_speed: f32,
+    pub text_scale: f32,
+    pub tile_clusters: usize,
+    pub tile_cluster_min: usize,
+    pub tile_cluster_max: usize,
+    pub tile_neighbor_chance: f32,
+    pub tile_center_bonus: f32,
+    pub weight_piedra: f32,
+    pub weight_hierro: f32,
+    pub weight_cobre: f32,
+    pub weight_agua: f32,
+    pub line_thickness: f32,
+    pub arrow_scale: f32,
+}
+
+impl Default for AppConfig {
+    fn default() -> Self {
+        Self {
+            zoom_speed: 0.1,
+            text_scale: 1.0,
+            tile_clusters: 80,
+            tile_cluster_min: 8,
+            tile_cluster_max: 20,
+            tile_neighbor_chance: 0.45,
+            tile_center_bonus: 0.35,
+            weight_piedra: 0.35,
+            weight_hierro: 0.2,
+            weight_cobre: 0.2,
+            weight_agua: 0.25,
+            line_thickness: 1.0,
+            arrow_scale: 1.0,
+        }
+    }
+}
+
+// Serialized RGBA color.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub struct ColorRgba {
+    pub r: u8,
+    pub g: u8,
+    pub b: u8,
+    pub a: u8,
+}
+
+impl ColorRgba {
+    // Convert RGBA bytes to macroquad Color.
+    pub fn to_color(self) -> Color {
+        Color::from_rgba(self.r, self.g, self.b, self.a)
+    }
+}
+
+// Runtime palette (macroquad Colors).
+#[derive(Clone, Copy, Debug)]
+pub struct RuntimeColors {
+    pub background: Color,
+    pub grid: Color,
+    pub hover: Color,
+    pub text_primary: Color,
+    pub text_secondary: Color,
+    pub button_base: Color,
+    pub button_hover: Color,
+    pub button_border: Color,
+    pub button_text: Color,
+    pub panel_bg: Color,
+    pub panel_border: Color,
+    pub tooltip_bg: Color,
+    pub tooltip_border: Color,
+    pub route_line: Color,
+    pub port_in: Color,
+    pub port_out: Color,
+    pub block_vivienda: Color,
+    pub block_fabrica: Color,
+    pub block_mina: Color,
+    pub block_almacen: Color,
+    pub block_logistica: Color,
+    pub block_ruta: Color,
+    pub tile_piedra: Color,
+    pub tile_hierro: Color,
+    pub tile_cobre: Color,
+    pub tile_agua: Color,
+}
+
+// Configurable palette stored in config.json.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub struct AppColors {
+    pub background: ColorRgba,
+    pub grid: ColorRgba,
+    pub hover: ColorRgba,
+    pub text_primary: ColorRgba,
+    pub text_secondary: ColorRgba,
+    pub button_base: ColorRgba,
+    pub button_hover: ColorRgba,
+    pub button_border: ColorRgba,
+    pub button_text: ColorRgba,
+    pub panel_bg: ColorRgba,
+    pub panel_border: ColorRgba,
+    pub tooltip_bg: ColorRgba,
+    pub tooltip_border: ColorRgba,
+    pub route_line: ColorRgba,
+    pub port_in: ColorRgba,
+    pub port_out: ColorRgba,
+    pub block_vivienda: ColorRgba,
+    pub block_fabrica: ColorRgba,
+    pub block_mina: ColorRgba,
+    pub block_almacen: ColorRgba,
+    pub block_logistica: ColorRgba,
+    pub block_ruta: ColorRgba,
+    pub tile_piedra: ColorRgba,
+    pub tile_hierro: ColorRgba,
+    pub tile_cobre: ColorRgba,
+    pub tile_agua: ColorRgba,
+}
+
+impl Default for AppColors {
+    fn default() -> Self {
+        Self {
+            background: ColorRgba { r: 18, g: 22, b: 26, a: 255 },
+            grid: ColorRgba { r: 70, g: 78, b: 86, a: 255 },
+            hover: ColorRgba { r: 255, g: 210, b: 90, a: 255 },
+            text_primary: ColorRgba { r: 220, g: 220, b: 220, a: 255 },
+            text_secondary: ColorRgba { r: 190, g: 200, b: 210, a: 255 },
+            button_base: ColorRgba { r: 50, g: 62, b: 75, a: 255 },
+            button_hover: ColorRgba { r: 70, g: 85, b: 100, a: 255 },
+            button_border: ColorRgba { r: 110, g: 130, b: 150, a: 255 },
+            button_text: ColorRgba { r: 220, g: 230, b: 240, a: 255 },
+            panel_bg: ColorRgba { r: 28, g: 34, b: 40, a: 230 },
+            panel_border: ColorRgba { r: 80, g: 90, b: 100, a: 255 },
+            tooltip_bg: ColorRgba { r: 30, g: 36, b: 44, a: 240 },
+            tooltip_border: ColorRgba { r: 100, g: 120, b: 140, a: 255 },
+            route_line: ColorRgba { r: 120, g: 140, b: 160, a: 200 },
+            port_in: ColorRgba { r: 80, g: 160, b: 220, a: 255 },
+            port_out: ColorRgba { r: 220, g: 170, b: 90, a: 255 },
+            block_vivienda: ColorRgba { r: 120, g: 200, b: 120, a: 255 },
+            block_fabrica: ColorRgba { r: 220, g: 140, b: 80, a: 255 },
+            block_mina: ColorRgba { r: 110, g: 150, b: 200, a: 255 },
+            block_almacen: ColorRgba { r: 210, g: 190, b: 90, a: 255 },
+            block_logistica: ColorRgba { r: 120, g: 140, b: 160, a: 255 },
+            block_ruta: ColorRgba { r: 90, g: 100, b: 115, a: 255 },
+            tile_piedra: ColorRgba { r: 110, g: 110, b: 120, a: 255 },
+            tile_hierro: ColorRgba { r: 120, g: 95, b: 85, a: 255 },
+            tile_cobre: ColorRgba { r: 150, g: 95, b: 70, a: 255 },
+            tile_agua: ColorRgba { r: 60, g: 110, b: 160, a: 255 },
+        }
+    }
+}
+
+impl AppColors {
+    // Convert stored colors into runtime macroquad Colors.
+    pub fn runtime(&self) -> RuntimeColors {
+        RuntimeColors {
+            background: self.background.to_color(),
+            grid: self.grid.to_color(),
+            hover: self.hover.to_color(),
+            text_primary: self.text_primary.to_color(),
+            text_secondary: self.text_secondary.to_color(),
+            button_base: self.button_base.to_color(),
+            button_hover: self.button_hover.to_color(),
+            button_border: self.button_border.to_color(),
+            button_text: self.button_text.to_color(),
+            panel_bg: self.panel_bg.to_color(),
+            panel_border: self.panel_border.to_color(),
+            tooltip_bg: self.tooltip_bg.to_color(),
+            tooltip_border: self.tooltip_border.to_color(),
+            route_line: self.route_line.to_color(),
+            port_in: self.port_in.to_color(),
+            port_out: self.port_out.to_color(),
+            block_vivienda: self.block_vivienda.to_color(),
+            block_fabrica: self.block_fabrica.to_color(),
+            block_mina: self.block_mina.to_color(),
+            block_almacen: self.block_almacen.to_color(),
+            block_logistica: self.block_logistica.to_color(),
+            block_ruta: self.block_ruta.to_color(),
+            tile_piedra: self.tile_piedra.to_color(),
+            tile_hierro: self.tile_hierro.to_color(),
+            tile_cobre: self.tile_cobre.to_color(),
+            tile_agua: self.tile_agua.to_color(),
+        }
+    }
+}
 
 #[derive(Serialize, Deserialize)]
 struct MapData {
@@ -111,13 +411,14 @@ pub fn hex_distance(a: Axial, b: Axial) -> i32 {
 }
 
 // Save blocks/tiles to a map JSON file.
-pub fn save_map(path: &str, blocks: &HashMap<Axial, PlacedBlock>, tiles: &HashMap<Axial, TileType>) {
+pub fn save_map(path: &str, blocks: &HashMap<Axial, PlacedBlock>, tiles: &HashMap<Axial, TileData>) {
     let data = MapData {
         tiles: tiles
             .iter()
-            .map(|(hex, kind)| Tile {
+            .map(|(hex, data)| Tile {
                 hex: *hex,
-                kind: *kind,
+                kind: data.kind,
+                amount: data.amount,
             })
             .collect(),
         blocks: blocks
@@ -126,6 +427,9 @@ pub fn save_map(path: &str, blocks: &HashMap<Axial, PlacedBlock>, tiles: &HashMa
                 hex: *hex,
                 kind: placed.kind,
                 rotation: placed.rotation,
+                stored: placed.stored.clone(),
+                mine_progress: placed.mine_progress,
+                capacity: placed.capacity,
             })
             .collect(),
     };
@@ -152,7 +456,7 @@ pub fn load_config(path: &str) -> ConfigData {
 }
 
 // Load blocks/tiles from map JSON.
-pub fn load_map(path: &str) -> (HashMap<Axial, PlacedBlock>, HashMap<Axial, TileType>) {
+pub fn load_map(path: &str) -> (HashMap<Axial, PlacedBlock>, HashMap<Axial, TileData>) {
     if let Ok(json) = fs::read_to_string(path) {
         if let Ok(data) = serde_json::from_str::<MapData>(&json) {
             let blocks = data
@@ -164,6 +468,13 @@ pub fn load_map(path: &str) -> (HashMap<Axial, PlacedBlock>, HashMap<Axial, Tile
                         PlacedBlock {
                             kind: b.kind,
                             rotation: b.rotation % 6,
+                            mine_progress: b.mine_progress,
+                            capacity: if b.capacity == 0 {
+                                default_capacity(b.kind)
+                            } else {
+                                b.capacity
+                            },
+                            stored: b.stored,
                         },
                     )
                 })
@@ -171,7 +482,15 @@ pub fn load_map(path: &str) -> (HashMap<Axial, PlacedBlock>, HashMap<Axial, Tile
             let tiles = data
                 .tiles
                 .into_iter()
-                .map(|t| (t.hex, t.kind))
+                .map(|t| {
+                    (
+                        t.hex,
+                        TileData {
+                            kind: t.kind,
+                            amount: t.amount,
+                        },
+                    )
+                })
                 .collect();
             return (blocks, tiles);
         }
@@ -201,6 +520,29 @@ pub fn tile_color(kind: TileType, colors: &RuntimeColors) -> Color {
     }
 }
 
+// Default storage capacities.
+pub const DEFAULT_ALMACEN_CAPACITY: i32 = 200;
+pub const DEFAULT_MINE_CAPACITY: i32 = 50;
+
+// Default capacity by block type.
+pub fn default_capacity(kind: BlockType) -> i32 {
+    match kind {
+        BlockType::Almacen => DEFAULT_ALMACEN_CAPACITY,
+        BlockType::Mina => DEFAULT_MINE_CAPACITY,
+        _ => 0,
+    }
+}
+
+// Convert a tile kind to an item kind.
+pub fn item_from_tile(kind: TileType) -> ItemType {
+    match kind {
+        TileType::Piedra => ItemType::Piedra,
+        TileType::Hierro => ItemType::Hierro,
+        TileType::Cobre => ItemType::Cobre,
+        TileType::Agua => ItemType::Agua,
+    }
+}
+
 // Pick a tile type using weighted probabilities and center bias.
 pub fn tile_kind_weighted(dist: i32, radius: i32, config: &AppConfig) -> TileType {
     let center_bias = 1.0 - (dist as f32 / radius as f32).clamp(0.0, 1.0);
@@ -224,8 +566,22 @@ pub fn tile_kind_weighted(dist: i32, radius: i32, config: &AppConfig) -> TileTyp
     }
 }
 
+// Base amount of resources for a tile kind with a center bonus.
+pub fn tile_amount(kind: TileType, dist: i32, radius: i32) -> i32 {
+    let center_bias = 1.0 - (dist as f32 / radius as f32).clamp(0.0, 1.0);
+    let (min_base, max_base) = match kind {
+        TileType::Piedra => (80, 160),
+        TileType::Hierro => (70, 140),
+        TileType::Cobre => (60, 120),
+        TileType::Agua => (100, 200),
+    };
+    let span = (max_base - min_base) as f32;
+    let bonus = (span * 0.6 * center_bias) as i32;
+    min_base + rand::gen_range(0, (span as i32 + 1)) + bonus
+}
+
 // Generate clustered tiles with a center-weighted distribution.
-pub fn generate_tiles(radius: i32, config: &AppConfig) -> HashMap<Axial, TileType> {
+pub fn generate_tiles(radius: i32, config: &AppConfig) -> HashMap<Axial, TileData> {
     let mut tiles = HashMap::new();
     let max_clusters = config.tile_clusters.max(1);
     for _ in 0..max_clusters {
@@ -262,7 +618,14 @@ pub fn generate_tiles(radius: i32, config: &AppConfig) -> HashMap<Axial, TileTyp
             if tiles.contains_key(&current) {
                 continue;
             }
-            tiles.insert(current, kind);
+            let amount = tile_amount(kind, dist, radius);
+            tiles.insert(
+                current,
+                TileData {
+                    kind,
+                    amount,
+                },
+            );
             placed += 1;
             let neighbors = axial_neighbors(current);
             for neighbor in neighbors {
@@ -273,6 +636,46 @@ pub fn generate_tiles(radius: i32, config: &AppConfig) -> HashMap<Axial, TileTyp
         }
     }
     tiles
+}
+
+// Add items into a storage list with an optional capacity limit.
+pub fn add_item(
+    stored: &mut Vec<ItemStack>,
+    kind: ItemType,
+    amount: i32,
+    capacity: i32,
+) -> i32 {
+    if amount <= 0 {
+        return 0;
+    }
+    let mut current_total = stored.iter().map(|s| s.amount).sum::<i32>();
+    let limit = if capacity <= 0 { i32::MAX } else { capacity };
+    let available = (limit - current_total).max(0);
+    let add_amount = amount.min(available);
+    if add_amount <= 0 {
+        return 0;
+    }
+    if let Some(stack) = stored.iter_mut().find(|s| s.kind == kind) {
+        stack.amount += add_amount;
+    } else {
+        stored.push(ItemStack {
+            kind,
+            amount: add_amount,
+        });
+    }
+    current_total += add_amount;
+    add_amount
+}
+
+// Create a placed block with default storage settings.
+pub fn new_placed_block(kind: BlockType, rotation: u8) -> PlacedBlock {
+    PlacedBlock {
+        kind,
+        rotation,
+        mine_progress: 0.0,
+        capacity: default_capacity(kind),
+        stored: Vec::new(),
+    }
 }
 
 // Rotate a direction index (0-5) by a rotation step.

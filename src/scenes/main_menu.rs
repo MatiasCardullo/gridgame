@@ -1,17 +1,18 @@
 use macroquad::prelude::*;
 
-use crate::{
-    AppConfig, Axial, FrameContext, PlacedBlock, Scene, TileType, GRID_RADIUS,
+use crate::core::{
+    generate_tiles, load_map, save_map, AppConfig, Axial, FrameContext, PlacedBlock, Scene,
+    TileData,
 };
-use crate::core::{generate_tiles, load_map, save_map};
-use crate::ui::ui_button;
+use crate::core::ui::ui_button;
+use crate::GRID_RADIUS;
 use std::collections::HashMap;
 
 // Render and handle input for the main menu scene.
 pub fn run(
     ctx: &FrameContext,
     blocks: &mut HashMap<Axial, PlacedBlock>,
-    tiles: &mut HashMap<Axial, TileType>,
+    tiles: &mut HashMap<Axial, TileData>,
     cam_offset: &mut Vec2,
     cam_zoom: &mut f32,
     placement_rotation: &mut u8,

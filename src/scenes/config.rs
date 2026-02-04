@@ -1,10 +1,13 @@
 use macroquad::prelude::*;
 
-use crate::{AppColors, AppConfig, FrameContext, Scene, TileType, GRID_RADIUS};
-use crate::core::{generate_tiles, save_config, ConfigData};
-use crate::ui::{
+use crate::core::{
+    generate_tiles, save_config, AppColors, AppConfig, Axial, ConfigData, FrameContext, Scene,
+    TileData,
+};
+use crate::core::ui::{
     adjust_color_channel, color_target_list, color_target_mut, color_target_name, ui_button,
 };
+use crate::GRID_RADIUS;
 use std::collections::HashMap;
 
 // Render and handle input for the config scene.
@@ -13,7 +16,7 @@ pub fn run(
     config: &mut AppConfig,
     colors: &mut AppColors,
     color_target_index: &mut usize,
-    tiles: &mut HashMap<crate::Axial, TileType>,
+    tiles: &mut HashMap<Axial, TileData>,
     dirty: &mut bool,
     scene: &mut Scene,
     config_path: &str,

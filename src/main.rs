@@ -1,9 +1,15 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 
 use macroquad::prelude::*;
 use serde::{Deserialize, Serialize};
+
+mod ui;
+use ui::{
+    adjust_color_channel, color_target_list, color_target_mut, color_target_name, ui_button,
+    AppColors, AppConfig, RuntimeColors, UiButtonColors,
+};
 
 const HEX_SIZE: f32 = 16.0;
 const GRID_RADIUS: i32 = 64;
@@ -21,7 +27,16 @@ enum BlockType {
     Fabrica,
     Mina,
     Almacen,
+    Logistica,
     Ruta,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+enum TileType {
+    Piedra,
+    Hierro,
+    Cobre,
+    Agua,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -30,6 +45,12 @@ struct Block {
     kind: BlockType,
     #[serde(default)]
     rotation: u8,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct Tile {
+    hex: Axial,
+    kind: TileType,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -41,8 +62,25 @@ struct PlacedBlock {
 #[derive(Serialize, Deserialize)]
 struct MapData {
     #[serde(default)]
-    resources: Vec<Axial>,
+    tiles: Vec<Tile>,
     blocks: Vec<Block>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct ConfigData {
+    #[serde(default)]
+    config: AppConfig,
+    #[serde(default)]
+    colors: AppColors,
+}
+
+impl Default for ConfigData {
+    fn default() -> Self {
+        Self {
+            config: AppConfig::default(),
+            colors: AppColors::default(),
+        }
+    }
 }
 
 fn hex_to_pixel(hex: Axial, size: f32, origin: Vec2) -> Vec2 {
@@ -117,9 +155,15 @@ fn hex_distance(a: Axial, b: Axial) -> i32 {
     (dq + dr + ds) / 2
 }
 
-fn save_map(path: &str, blocks: &HashMap<Axial, PlacedBlock>, resources: &HashSet<Axial>) {
+fn save_map(path: &str, blocks: &HashMap<Axial, PlacedBlock>, tiles: &HashMap<Axial, TileType>) {
     let data = MapData {
-        resources: resources.iter().copied().collect(),
+        tiles: tiles
+            .iter()
+            .map(|(hex, kind)| Tile {
+                hex: *hex,
+                kind: *kind,
+            })
+            .collect(),
         blocks: blocks
             .iter()
             .map(|(hex, placed)| Block {
@@ -134,7 +178,22 @@ fn save_map(path: &str, blocks: &HashMap<Axial, PlacedBlock>, resources: &HashSe
     }
 }
 
-fn load_map(path: &str) -> (HashMap<Axial, PlacedBlock>, HashSet<Axial>) {
+fn save_config(path: &str, data: &ConfigData) {
+    if let Ok(json) = serde_json::to_string_pretty(data) {
+        let _ = fs::write(path, json);
+    }
+}
+
+fn load_config(path: &str) -> ConfigData {
+    if let Ok(json) = fs::read_to_string(path) {
+        if let Ok(data) = serde_json::from_str::<ConfigData>(&json) {
+            return data;
+        }
+    }
+    ConfigData::default()
+}
+
+fn load_map(path: &str) -> (HashMap<Axial, PlacedBlock>, HashMap<Axial, TileType>) {
     if let Ok(json) = fs::read_to_string(path) {
         if let Ok(data) = serde_json::from_str::<MapData>(&json) {
             let blocks = data
@@ -150,37 +209,107 @@ fn load_map(path: &str) -> (HashMap<Axial, PlacedBlock>, HashSet<Axial>) {
                     )
                 })
                 .collect();
-            let resources = data.resources.into_iter().collect();
-            return (blocks, resources);
+            let tiles = data
+                .tiles
+                .into_iter()
+                .map(|t| (t.hex, t.kind))
+                .collect();
+            return (blocks, tiles);
         }
     }
-    (HashMap::new(), HashSet::new())
+    (HashMap::new(), HashMap::new())
 }
 
-fn block_color(kind: BlockType) -> Color {
+fn block_color(kind: BlockType, colors: &RuntimeColors) -> Color {
     match kind {
-        BlockType::Vivienda => Color::from_rgba(120, 200, 120, 255),
-        BlockType::Fabrica => Color::from_rgba(220, 140, 80, 255),
-        BlockType::Mina => Color::from_rgba(110, 150, 200, 255),
-        BlockType::Almacen => Color::from_rgba(210, 190, 90, 255),
-        BlockType::Ruta => Color::from_rgba(90, 100, 115, 255),
+        BlockType::Vivienda => colors.block_vivienda,
+        BlockType::Fabrica => colors.block_fabrica,
+        BlockType::Mina => colors.block_mina,
+        BlockType::Almacen => colors.block_almacen,
+        BlockType::Logistica => colors.block_logistica,
+        BlockType::Ruta => colors.block_ruta,
     }
 }
 
-fn generate_resources(radius: i32, count: usize) -> HashSet<Axial> {
-    let mut resources = HashSet::new();
-    let max_attempts = count * 12;
-    let mut attempts = 0;
-    while resources.len() < count && attempts < max_attempts {
-        let q = rand::gen_range(-radius, radius + 1);
-        let r = rand::gen_range(-radius, radius + 1);
-        let hex = Axial { q, r };
-        if hex_distance(hex, Axial { q: 0, r: 0 }) <= radius {
-            resources.insert(hex);
-        }
-        attempts += 1;
+fn tile_color(kind: TileType, colors: &RuntimeColors) -> Color {
+    match kind {
+        TileType::Piedra => colors.tile_piedra,
+        TileType::Hierro => colors.tile_hierro,
+        TileType::Cobre => colors.tile_cobre,
+        TileType::Agua => colors.tile_agua,
     }
-    resources
+}
+
+fn tile_kind_weighted(dist: i32, radius: i32, config: &AppConfig) -> TileType {
+    let center_bias = 1.0 - (dist as f32 / radius as f32).clamp(0.0, 1.0);
+    let mut w_p = config.weight_piedra.max(0.0);
+    let mut w_h = config.weight_hierro.max(0.0);
+    let mut w_c = config.weight_cobre.max(0.0);
+    let mut w_a = config.weight_agua.max(0.0);
+    let bonus = center_bias * config.tile_center_bonus.max(0.0);
+    w_h += bonus * 0.6;
+    w_c += bonus * 0.4;
+    let total = (w_p + w_h + w_c + w_a).max(0.001);
+    let roll = rand::gen_range(0.0, total);
+    if roll < w_h {
+        TileType::Hierro
+    } else if roll < w_h + w_c {
+        TileType::Cobre
+    } else if roll < w_h + w_c + w_p {
+        TileType::Piedra
+    } else {
+        TileType::Agua
+    }
+}
+
+fn generate_tiles(radius: i32, config: &AppConfig) -> HashMap<Axial, TileType> {
+    let mut tiles = HashMap::new();
+    let max_clusters = config.tile_clusters.max(1);
+    for _ in 0..max_clusters {
+        let mut center = Axial { q: 0, r: 0 };
+        for _ in 0..60 {
+            let q = rand::gen_range(-radius, radius + 1);
+            let r = rand::gen_range(-radius, radius + 1);
+            let hex = Axial { q, r };
+            if hex_distance(hex, Axial { q: 0, r: 0 }) <= radius {
+                let dist = hex_distance(hex, Axial { q: 0, r: 0 });
+                let weight = 1.0 - (dist as f32 / radius as f32).clamp(0.0, 1.0);
+                let accept = rand::gen_range(0.0, 1.0) < (0.15 + weight * weight);
+                if accept {
+                    center = hex;
+                    break;
+                }
+                center = hex;
+            }
+        }
+        let dist = hex_distance(center, Axial { q: 0, r: 0 });
+        let kind = tile_kind_weighted(dist, radius, config);
+        let size_min = config.tile_cluster_min.max(1);
+        let size_max = config.tile_cluster_max.max(size_min);
+        let size = rand::gen_range(size_min as i32, (size_max + 1) as i32) as usize;
+        let mut frontier = vec![center];
+        let mut placed = 0;
+        while let Some(current) = frontier.pop() {
+            if placed >= size {
+                break;
+            }
+            if hex_distance(current, Axial { q: 0, r: 0 }) > radius {
+                continue;
+            }
+            if tiles.contains_key(&current) {
+                continue;
+            }
+            tiles.insert(current, kind);
+            placed += 1;
+            let neighbors = axial_neighbors(current);
+            for neighbor in neighbors {
+                if rand::gen_range(0.0, 1.0) < config.tile_neighbor_chance {
+                    frontier.push(neighbor);
+                }
+            }
+        }
+    }
+    tiles
 }
 
 fn rotate_dir(dir: i32, rotation: u8) -> i32 {
@@ -189,10 +318,11 @@ fn rotate_dir(dir: i32, rotation: u8) -> i32 {
 
 fn block_ports(kind: BlockType, rotation: u8) -> (Vec<i32>, Vec<i32>) {
     let (inputs, outputs) = match kind {
-        BlockType::Vivienda => (vec![3], vec![0]),
-        BlockType::Fabrica => (vec![2, 4], vec![0]),
-        BlockType::Mina => (vec![], vec![0]),
-        BlockType::Almacen => (vec![3], vec![0]),
+        BlockType::Vivienda => (vec![0,2,4], vec![1,3,5]),
+        BlockType::Fabrica => (vec![0,1,2], vec![3,4,5]),
+        BlockType::Mina => (vec![], vec![0,1,2,3,4,5]),
+        BlockType::Almacen => (vec![0,3], vec![0,3]),
+        BlockType::Logistica => (vec![0,3], vec![0,3]),
         BlockType::Ruta => (vec![], vec![]),
     };
     let inputs = inputs
@@ -248,66 +378,63 @@ enum Scene {
     Game,
 }
 
-fn ui_button(rect: Rect, label: &str, mouse: Vec2) -> (bool, bool) {
-    let hover = rect.contains(mouse);
-    let base = if hover {
-        Color::from_rgba(70, 85, 100, 255)
-    } else {
-        Color::from_rgba(50, 62, 75, 255)
-    };
-    draw_rectangle(rect.x, rect.y, rect.w, rect.h, base);
-    draw_rectangle_lines(
-        rect.x,
-        rect.y,
-        rect.w,
-        rect.h,
-        1.5,
-        Color::from_rgba(110, 130, 150, 255),
-    );
-    let font_size = 22.0;
-    let text_dim = measure_text(label, None, font_size as u16, 1.0);
-    draw_text(
-        label,
-        rect.x + (rect.w - text_dim.width) * 0.5,
-        rect.y + (rect.h + text_dim.height) * 0.5 - 4.0,
-        font_size,
-        Color::from_rgba(220, 230, 240, 255),
-    );
-    (hover && is_mouse_button_pressed(MouseButton::Left), hover)
-}
-
 #[macroquad::main("GridGame")]
 async fn main() {
     let mut blocks: HashMap<Axial, PlacedBlock> = HashMap::new();
-    let mut resources: HashSet<Axial> = HashSet::new();
+    let mut tiles: HashMap<Axial, TileType> = HashMap::new();
     let mut cam_offset = Vec2::ZERO;
     let mut cam_zoom: f32 = 1.0;
-    let mut zoom_speed: f32 = 0.001;
+    let config_path = "config.json";
+    let config_data = load_config(config_path);
+    let mut config = config_data.config;
+    let mut colors = config_data.colors;
+    if !Path::new(config_path).exists() {
+        save_config(
+            config_path,
+            &ConfigData {
+                config,
+                colors,
+            },
+        );
+    }
+    let mut color_target_index: usize = 0;
     let mut dragging = false;
     let mut last_mouse = Vec2::ZERO;
     let map_path = "map.json";
     let mut selected: Option<BlockType> = Some(BlockType::Vivienda);
     let mut placement_rotation: u8 = 0;
+    let mut panel_collapsed = false;
     let mut dirty = false;
     let mut scene = Scene::MainMenu;
 
     loop {
-        clear_background(Color::from_rgba(18, 22, 26, 255));
-
         let mouse = vec2(mouse_position().0, mouse_position().1);
         let screen_center = vec2(screen_width() * 0.5, screen_height() * 0.5);
         let has_save = Path::new(map_path).exists();
+        let colors_rt = colors.runtime();
+        clear_background(colors_rt.background);
+        let text_scale = config.text_scale;
+        let font_sm = 18.0 * text_scale;
+        let font_md = 22.0 * text_scale;
+        let font_lg = 40.0 * text_scale;
+        let font_title = 48.0 * text_scale;
+        let button_colors = UiButtonColors {
+            base: colors_rt.button_base,
+            hover: colors_rt.button_hover,
+            border: colors_rt.button_border,
+            text: colors_rt.button_text,
+        };
 
         if scene == Scene::MainMenu {
             let title = "GridGame";
-            let title_size = 48.0;
+            let title_size = font_title;
             let title_dim = measure_text(title, None, title_size as u16, 1.0);
             draw_text(
                 title,
                 (screen_width() - title_dim.width) * 0.5,
                 120.0,
                 title_size,
-                Color::from_rgba(235, 240, 245, 255),
+                colors_rt.text_primary,
             );
 
             let btn_w = 260.0;
@@ -317,13 +444,13 @@ async fn main() {
 
             if has_save {
                 let rect = Rect::new((screen_width() - btn_w) * 0.5, y, btn_w, btn_h);
-                let (clicked, _) = ui_button(rect, "Continuar", mouse);
+                let (clicked, _) = ui_button(rect, "Continuar", mouse, font_md, button_colors);
                 if clicked {
-                    let (loaded_blocks, loaded_resources) = load_map(map_path);
+                    let (loaded_blocks, loaded_tiles) = load_map(map_path);
                     blocks = loaded_blocks;
-                    resources = loaded_resources;
-                    if resources.is_empty() {
-                        resources = generate_resources(GRID_RADIUS, 140);
+                    tiles = loaded_tiles;
+                    if tiles.is_empty() {
+                        tiles = generate_tiles(GRID_RADIUS, &config);
                         dirty = true;
                     }
                     scene = Scene::Game;
@@ -332,10 +459,10 @@ async fn main() {
             }
 
             let rect_new = Rect::new((screen_width() - btn_w) * 0.5, y, btn_w, btn_h);
-            let (clicked_new, _) = ui_button(rect_new, "Nueva Partida", mouse);
+            let (clicked_new, _) = ui_button(rect_new, "Nueva Partida", mouse, font_md, button_colors);
             if clicked_new {
                 blocks.clear();
-                resources = generate_resources(GRID_RADIUS, 140);
+                tiles = generate_tiles(GRID_RADIUS, &config);
                 cam_offset = Vec2::ZERO;
                 cam_zoom = 1.0;
                 placement_rotation = 0;
@@ -344,16 +471,16 @@ async fn main() {
             y += btn_h + 12.0;
 
             let rect_cfg = Rect::new((screen_width() - btn_w) * 0.5, y, btn_w, btn_h);
-            let (clicked_cfg, _) = ui_button(rect_cfg, "Configuracion", mouse);
+            let (clicked_cfg, _) = ui_button(rect_cfg, "Configuracion", mouse, font_md, button_colors);
             if clicked_cfg {
                 scene = Scene::Config;
             }
 
             let rect_exit = Rect::new((screen_width() - btn_w) * 0.5, y + btn_h + 12.0, btn_w, btn_h);
-            let (clicked_exit, _) = ui_button(rect_exit, "Salir", mouse);
+            let (clicked_exit, _) = ui_button(rect_exit, "Salir", mouse, font_md, button_colors);
             if clicked_exit {
-                if !blocks.is_empty() {
-                    save_map(map_path, &blocks, &resources);
+                if !blocks.is_empty() || !tiles.is_empty() {
+                    save_map(map_path, &blocks, &tiles);
                 }
                 break;
             }
@@ -361,46 +488,298 @@ async fn main() {
 
         if scene == Scene::Config {
             let title = "Configuracion";
-            let title_size = 40.0;
+            let title_size = font_lg;
             let title_dim = measure_text(title, None, title_size as u16, 1.0);
+            let mut changed = false;
             draw_text(
                 title,
                 (screen_width() - title_dim.width) * 0.5,
                 120.0,
                 title_size,
-                Color::from_rgba(235, 240, 245, 255),
+                colors_rt.text_primary,
             );
 
-            draw_text(
-                "Velocidad de zoom",
-                100.0,
-                200.0,
-                22.0,
-                Color::from_rgba(210, 220, 230, 255),
-            );
+            let label_x = 100.0;
+            let mut y = 200.0;
+            let btn_w = 40.0;
+            let btn_h = 34.0;
+            let btn_gap = 8.0;
+            let btn_x = 330.0;
+            let value_x = btn_x + btn_w * 2.0 + btn_gap + 12.0;
+            let row_gap = 44.0;
 
-            let btn_w = 120.0;
-            let btn_h = 44.0;
-            let rect_dec = Rect::new(100.0, 220.0, btn_w, btn_h);
-            let rect_inc = Rect::new(230.0, 220.0, btn_w, btn_h);
-            let (dec, _) = ui_button(rect_dec, "-", mouse);
-            let (inc, _) = ui_button(rect_inc, "+", mouse);
+            let stepper_text = colors_rt.text_secondary;
+            let mut draw_stepper = |label: &str, value: &str, y: f32| -> (bool, bool) {
+                draw_text(label, label_x, y, font_md, stepper_text);
+                let rect_dec = Rect::new(btn_x, y - 24.0, btn_w, btn_h);
+                let rect_inc = Rect::new(btn_x + btn_w + btn_gap, y - 24.0, btn_w, btn_h);
+                let (dec, _) = ui_button(rect_dec, "-", mouse, font_md, button_colors);
+                let (inc, _) = ui_button(rect_inc, "+", mouse, font_md, button_colors);
+                draw_text(value, value_x, y, font_md, stepper_text);
+                (dec, inc)
+            };
+
+            let (dec, inc) = draw_stepper("Velocidad de zoom", &format!("{:.2}", config.zoom_speed), y);
             if dec {
-                zoom_speed = (zoom_speed - 0.02).max(0.02);
+                changed = true;
+                config.zoom_speed = (config.zoom_speed - 0.02).max(0.02);
             }
             if inc {
-                zoom_speed = (zoom_speed + 0.02).min(0.3);
+                changed = true;
+                config.zoom_speed = (config.zoom_speed + 0.02).min(0.3);
             }
-            draw_text(
-                &format!("{:.2}", zoom_speed),
-                370.0,
-                250.0,
-                22.0,
-                Color::from_rgba(210, 220, 230, 255),
-            );
+            y += row_gap;
 
-            let rect_back = Rect::new(100.0, 320.0, 180.0, 48.0);
-            let (back, _) = ui_button(rect_back, "Volver", mouse);
+            let (dec, inc) = draw_stepper(
+                "Escala de texto",
+                &format!("{:.2}", config.text_scale),
+                y,
+            );
+            if dec {
+                changed = true;
+                config.text_scale = (config.text_scale - 0.05).max(0.7);
+            }
+            if inc {
+                changed = true;
+                config.text_scale = (config.text_scale + 0.05).min(1.6);
+            }
+            y += row_gap;
+
+            let (dec, inc) = draw_stepper(
+                "Grosor de lineas",
+                &format!("{:.2}", config.line_thickness),
+                y,
+            );
+            if dec {
+                changed = true;
+                config.line_thickness = (config.line_thickness - 0.25).max(0.5);
+            }
+            if inc {
+                changed = true;
+                config.line_thickness = (config.line_thickness + 0.25).min(4.0);
+            }
+            y += row_gap;
+
+            let (dec, inc) =
+                draw_stepper("Escala flechas", &format!("{:.2}", config.arrow_scale), y);
+            if dec {
+                changed = true;
+                config.arrow_scale = (config.arrow_scale - 0.1).max(0.5);
+            }
+            if inc {
+                changed = true;
+                config.arrow_scale = (config.arrow_scale + 0.1).min(2.0);
+            }
+            y += row_gap;
+
+            let (dec, inc) =
+                draw_stepper("Clusters tiles", &format!("{}", config.tile_clusters), y);
+            if dec {
+                changed = true;
+                config.tile_clusters = config.tile_clusters.saturating_sub(5).max(5);
+            }
+            if inc {
+                changed = true;
+                config.tile_clusters = (config.tile_clusters + 5).min(300);
+            }
+            y += row_gap;
+
+            let (dec, inc) = draw_stepper(
+                "Cluster min",
+                &format!("{}", config.tile_cluster_min),
+                y,
+            );
+            if dec && config.tile_cluster_min > 1 {
+                changed = true;
+                config.tile_cluster_min -= 1;
+            }
+            if inc {
+                changed = true;
+                config.tile_cluster_min += 1;
+            }
+            if config.tile_cluster_min > config.tile_cluster_max {
+                config.tile_cluster_max = config.tile_cluster_min;
+            }
+            y += row_gap;
+
+            let (dec, inc) = draw_stepper(
+                "Cluster max",
+                &format!("{}", config.tile_cluster_max),
+                y,
+            );
+            if dec && config.tile_cluster_max > 1 {
+                changed = true;
+                config.tile_cluster_max -= 1;
+            }
+            if inc {
+                changed = true;
+                config.tile_cluster_max += 1;
+            }
+            if config.tile_cluster_max < config.tile_cluster_min {
+                config.tile_cluster_min = config.tile_cluster_max;
+            }
+            y += row_gap;
+
+            let (dec, inc) = draw_stepper(
+                "Chance vecinos",
+                &format!("{:.2}", config.tile_neighbor_chance),
+                y,
+            );
+            if dec {
+                changed = true;
+                config.tile_neighbor_chance = (config.tile_neighbor_chance - 0.05).max(0.05);
+            }
+            if inc {
+                changed = true;
+                config.tile_neighbor_chance = (config.tile_neighbor_chance + 0.05).min(0.95);
+            }
+            y += row_gap;
+
+            let (dec, inc) = draw_stepper(
+                "Bonus centro",
+                &format!("{:.2}", config.tile_center_bonus),
+                y,
+            );
+            if dec {
+                changed = true;
+                config.tile_center_bonus = (config.tile_center_bonus - 0.05).max(0.0);
+            }
+            if inc {
+                changed = true;
+                config.tile_center_bonus = (config.tile_center_bonus + 0.05).min(1.0);
+            }
+            y += row_gap;
+
+            let (dec, inc) =
+                draw_stepper("Peso piedra", &format!("{:.2}", config.weight_piedra), y);
+            if dec {
+                changed = true;
+                config.weight_piedra = (config.weight_piedra - 0.05).max(0.0);
+            }
+            if inc {
+                changed = true;
+                config.weight_piedra = (config.weight_piedra + 0.05).min(1.0);
+            }
+            y += row_gap;
+
+            let (dec, inc) =
+                draw_stepper("Peso hierro", &format!("{:.2}", config.weight_hierro), y);
+            if dec {
+                changed = true;
+                config.weight_hierro = (config.weight_hierro - 0.05).max(0.0);
+            }
+            if inc {
+                changed = true;
+                config.weight_hierro = (config.weight_hierro + 0.05).min(1.0);
+            }
+            y += row_gap;
+
+            let (dec, inc) =
+                draw_stepper("Peso cobre", &format!("{:.2}", config.weight_cobre), y);
+            if dec {
+                changed = true;
+                config.weight_cobre = (config.weight_cobre - 0.05).max(0.0);
+            }
+            if inc {
+                changed = true;
+                config.weight_cobre = (config.weight_cobre + 0.05).min(1.0);
+            }
+            y += row_gap;
+
+            let (dec, inc) =
+                draw_stepper("Peso agua", &format!("{:.2}", config.weight_agua), y);
+            if dec {
+                changed = true;
+                config.weight_agua = (config.weight_agua - 0.05).max(0.0);
+            }
+            if inc {
+                changed = true;
+                config.weight_agua = (config.weight_agua + 0.05).min(1.0);
+            }
+            y += row_gap;
+
+            let rect_regen = Rect::new(label_x, y - 16.0, 240.0, 38.0);
+            let (regen, _) = ui_button(rect_regen, "Regenerar tiles", mouse, font_md, button_colors);
+            if regen {
+                tiles = generate_tiles(GRID_RADIUS, &config);
+                dirty = true;
+            }
+
+            let color_targets = color_target_list();
+            let rect_prev = Rect::new(380.0, y - 16.0, 32.0, 38.0);
+            let rect_next = Rect::new(420.0, y - 16.0, 32.0, 38.0);
+            let (prev, _) = ui_button(rect_prev, "<", mouse, font_md, button_colors);
+            let (next, _) = ui_button(rect_next, ">", mouse, font_md, button_colors);
+            if prev {
+                if color_target_index == 0 {
+                    color_target_index = color_targets.len() - 1;
+                } else {
+                    color_target_index -= 1;
+                }
+            }
+            if next {
+                color_target_index = (color_target_index + 1) % color_targets.len();
+            }
+            let target = color_targets[color_target_index % color_targets.len()];
+            let target_name = color_target_name(target);
+            draw_text(
+                &format!("Color: {}", target_name),
+                470.0,
+                y + 10.0,
+                font_md,
+                colors_rt.text_secondary,
+            );
+            y += row_gap;
+
+            let text_secondary = colors_rt.text_secondary;
+            let color = color_target_mut(target, &mut colors);
+            let channels = [("R", color.r), ("G", color.g), ("B", color.b)];
+            let swatch_rect = Rect::new(680.0, y - 8.0, 36.0, 36.0);
+            draw_rectangle(
+                swatch_rect.x,
+                swatch_rect.y,
+                swatch_rect.w,
+                swatch_rect.h,
+                color.to_color(),
+            );
+            draw_rectangle_lines(
+                swatch_rect.x,
+                swatch_rect.y,
+                swatch_rect.w,
+                swatch_rect.h,
+                config.line_thickness.max(1.0),
+                colors_rt.panel_border,
+            );
+            for (idx, (label, value)) in channels.iter().enumerate() {
+                let row_y = y + idx as f32 * row_gap;
+                draw_text(label, label_x, row_y, font_md, text_secondary);
+                let rect_dec = Rect::new(btn_x, row_y - 24.0, btn_w, btn_h);
+                let rect_inc = Rect::new(btn_x + btn_w + btn_gap, row_y - 24.0, btn_w, btn_h);
+                let (dec, _) = ui_button(rect_dec, "-", mouse, font_md, button_colors);
+                let (inc, _) = ui_button(rect_inc, "+", mouse, font_md, button_colors);
+                if dec {
+                    changed = true;
+                    adjust_color_channel(color, idx, -8);
+                }
+                if inc {
+                    changed = true;
+                    adjust_color_channel(color, idx, 8);
+                }
+                draw_text(&format!("{}", value), value_x, row_y, font_md, text_secondary);
+            }
+
+            if changed {
+                save_config(
+                    config_path,
+                    &ConfigData {
+                        config,
+                        colors,
+                    },
+                );
+            }
+
+            let rect_back = Rect::new(100.0, screen_height() - 80.0, 180.0, 48.0);
+            let (back, _) = ui_button(rect_back, "Volver", mouse, font_md, button_colors);
             if back {
                 scene = Scene::MainMenu;
             }
@@ -409,7 +788,7 @@ async fn main() {
         if scene == Scene::Game {
             let wheel = mouse_wheel().1;
             if wheel.abs() > 0.01 {
-                let factor = 1.0 + wheel * zoom_speed;
+                let factor = 1.0 + wheel * config.zoom_speed;
                 cam_zoom = (cam_zoom * factor).clamp(0.3, 3.0);
             }
 
@@ -430,16 +809,24 @@ async fn main() {
             let hover_hex = pixel_to_hex(world_mouse, HEX_SIZE, Vec2::ZERO);
 
             let panel_pos = vec2(16.0, screen_height() - 110.0);
-            let panel_size = vec2(392.0, 94.0);
+            let panel_size = if panel_collapsed {
+                vec2(170.0, 36.0)
+            } else {
+                vec2(392.0, 94.0)
+            };
             let panel_rect = Rect::new(panel_pos.x, panel_pos.y, panel_size.x, panel_size.y);
 
             let mut tooltip: Option<&str> = None;
             let mut ui_capturing = panel_rect.contains(mouse);
 
-            if is_mouse_button_pressed(MouseButton::Left) && !ui_capturing {
+            if is_mouse_button_pressed(MouseButton::Right) && !ui_capturing {
                 if hex_distance(hover_hex, Axial { q: 0, r: 0 }) <= GRID_RADIUS {
                     if let Some(kind) = selected {
-                        if kind != BlockType::Mina || resources.contains(&hover_hex) {
+                        let can_mine = matches!(
+                            tiles.get(&hover_hex),
+                            Some(TileType::Piedra) | Some(TileType::Hierro) | Some(TileType::Cobre)
+                        );
+                        if kind != BlockType::Mina || can_mine {
                             let rotation = if kind == BlockType::Ruta { 0 } else { placement_rotation };
                             blocks.insert(
                                 hover_hex,
@@ -457,27 +844,27 @@ async fn main() {
             }
 
             if is_key_pressed(KeyCode::S) {
-                save_map(map_path, &blocks, &resources);
+                save_map(map_path, &blocks, &tiles);
                 dirty = false;
             }
 
             if is_key_pressed(KeyCode::L) {
-                let (loaded_blocks, loaded_resources) = load_map(map_path);
+                let (loaded_blocks, loaded_tiles) = load_map(map_path);
                 blocks = loaded_blocks;
-                resources = loaded_resources;
-                if resources.is_empty() {
-                    resources = generate_resources(GRID_RADIUS, 140);
+                tiles = loaded_tiles;
+                if tiles.is_empty() {
+                    tiles = generate_tiles(GRID_RADIUS, &config);
                 }
                 dirty = false;
             }
 
             if dirty {
-                save_map(map_path, &blocks, &resources);
+                save_map(map_path, &blocks, &tiles);
                 dirty = false;
             }
 
             if is_key_pressed(KeyCode::Escape) {
-                save_map(map_path, &blocks, &resources);
+                save_map(map_path, &blocks, &tiles);
                 scene = Scene::MainMenu;
             }
 
@@ -510,11 +897,11 @@ async fn main() {
                         continue;
                     }
 
-                    if resources.contains(&hex) {
+                    if let Some(tile) = tiles.get(&hex) {
                         draw_hex_filled(
                             center,
                             (HEX_SIZE - 4.5) * cam_zoom,
-                            Color::from_rgba(70, 95, 80, 255),
+                            tile_color(*tile, &colors_rt),
                         );
                     }
 
@@ -522,33 +909,28 @@ async fn main() {
                         draw_hex_filled(
                             center,
                             (HEX_SIZE - 2.5) * cam_zoom,
-                            block_color(placed.kind),
+                            block_color(placed.kind, &colors_rt),
                         );
                         let (inputs, outputs) = block_ports(placed.kind, placed.rotation);
                         for dir in inputs {
                             draw_port_marker(
                                 center,
-                                (HEX_SIZE - 3.0) * cam_zoom,
+                                (HEX_SIZE - 3.0) * cam_zoom * config.arrow_scale,
                                 dir,
-                                Color::from_rgba(80, 160, 220, 255),
+                                colors_rt.port_in,
                             );
                         }
                         for dir in outputs {
                             draw_port_marker(
                                 center,
-                                (HEX_SIZE - 3.0) * cam_zoom,
+                                (HEX_SIZE - 3.0) * cam_zoom * config.arrow_scale,
                                 dir,
-                                Color::from_rgba(220, 170, 90, 255),
+                                colors_rt.port_out,
                             );
                         }
                     }
 
-                    draw_hex_outline(
-                        center,
-                        size,
-                        Color::from_rgba(70, 78, 86, 255),
-                        1.0,
-                    );
+                    draw_hex_outline(center, size, colors_rt.grid, config.line_thickness);
                 }
             }
 
@@ -569,8 +951,8 @@ async fn main() {
                             base_center.y,
                             neighbor_center.x,
                             neighbor_center.y,
-                            3.0 * cam_zoom,
-                            Color::from_rgba(120, 140, 160, 200),
+                            (2.0 + config.line_thickness) * cam_zoom,
+                            colors_rt.route_line,
                         );
                     }
                 }
@@ -581,16 +963,16 @@ async fn main() {
             draw_hex_outline(
                 hover_center,
                 HEX_SIZE * cam_zoom,
-                Color::from_rgba(255, 210, 90, 255),
-                2.0,
+                colors_rt.hover,
+                config.line_thickness * 2.0,
             );
 
             draw_text(
-                "Click: colocar  |  Rueda: zoom  |  Boton medio: mover  |  R: rotar  |  S: guardar  |  L: cargar  |  Esc: menu",
+                "Click: colocar  |  Rueda: zoom  |  Boton medio: mover  |  R: rotar  |  Panel: <<  |  S: guardar  |  L: cargar  |  Esc: menu",
                 16.0,
                 28.0,
-                22.0,
-                Color::from_rgba(220, 220, 220, 255),
+                font_md,
+                colors_rt.text_primary,
             );
 
             let coord_text = format!("Hex: q={} r={}", hover_hex.q, hover_hex.r);
@@ -598,8 +980,8 @@ async fn main() {
                 &coord_text,
                 16.0,
                 52.0,
-                20.0,
-                Color::from_rgba(190, 200, 210, 255),
+                font_sm,
+                colors_rt.text_secondary,
             );
 
             let rot_text = format!("Rotacion: {}", placement_rotation);
@@ -607,8 +989,8 @@ async fn main() {
                 &rot_text,
                 16.0,
                 74.0,
-                18.0,
-                Color::from_rgba(170, 185, 200, 255),
+                font_sm,
+                colors_rt.text_secondary,
             );
 
             draw_rectangle(
@@ -616,100 +998,151 @@ async fn main() {
                 panel_pos.y,
                 panel_size.x,
                 panel_size.y,
-                Color::from_rgba(28, 34, 40, 230),
+                colors_rt.panel_bg,
             );
             draw_rectangle_lines(
                 panel_pos.x,
                 panel_pos.y,
                 panel_size.x,
                 panel_size.y,
-                1.5,
-                Color::from_rgba(80, 90, 100, 255),
+                config.line_thickness.max(1.0),
+                colors_rt.panel_border,
             );
 
-            let button_size = 52.0;
-            let gap = 8.0;
-            let mut bx = panel_pos.x + 12.0;
-            let by = panel_pos.y + 16.0;
+            let toggle_rect = Rect::new(
+                panel_pos.x + panel_size.x - 32.0,
+                panel_pos.y + 6.0,
+                26.0,
+                24.0,
+            );
+            let toggle_hover = toggle_rect.contains(mouse);
+            if toggle_hover {
+                ui_capturing = true;
+            }
+            let toggle_color = if toggle_hover {
+                colors_rt.button_hover
+            } else {
+                colors_rt.button_base
+            };
+            draw_rectangle(
+                toggle_rect.x,
+                toggle_rect.y,
+                toggle_rect.w,
+                toggle_rect.h,
+                toggle_color,
+            );
+            draw_rectangle_lines(
+                toggle_rect.x,
+                toggle_rect.y,
+                toggle_rect.w,
+                toggle_rect.h,
+                config.line_thickness.max(1.0),
+                    colors_rt.button_border,
+            );
+            let toggle_label = if panel_collapsed { ">>" } else { "<<" };
+            let toggle_dim = measure_text(toggle_label, None, font_sm as u16, 1.0);
+            draw_text(
+                toggle_label,
+                toggle_rect.x + (toggle_rect.w - toggle_dim.width) * 0.5,
+                toggle_rect.y + (toggle_rect.h + toggle_dim.height) * 0.5 - 2.0,
+                font_sm,
+                colors_rt.button_text,
+            );
+            if toggle_hover && is_mouse_button_pressed(MouseButton::Left) {
+                panel_collapsed = !panel_collapsed;
+                ui_capturing = true;
+            }
 
-            let buttons: [(Option<BlockType>, &str); 6] = [
-                (None, "Deconstruir"),
-                (Some(BlockType::Vivienda), "Vivienda"),
-                (Some(BlockType::Fabrica), "Fabrica"),
-                (Some(BlockType::Mina), "Minas"),
-                (Some(BlockType::Almacen), "Almacen"),
-                (Some(BlockType::Ruta), "Ruta"),
-            ];
+            if !panel_collapsed {
+                let button_size = 52.0;
+                let gap = 8.0;
+                let mut bx = panel_pos.x + 12.0;
+                let by = panel_pos.y + 16.0;
 
-            for (option, tip) in buttons {
-                let rect = Rect::new(bx, by, button_size, button_size);
-                let hover = rect.contains(mouse);
-                if hover {
-                    tooltip = Some(tip);
-                    ui_capturing = true;
-                }
-                let selected_now = selected == option;
+                let buttons: [(Option<BlockType>, &str); 6] = [
+                    (None, "Deconstruir"),
+                    (Some(BlockType::Vivienda), "Vivienda"),
+                    (Some(BlockType::Fabrica), "Fabrica"),
+                    (Some(BlockType::Mina), "Minas"),
+                    (Some(BlockType::Almacen), "Almacen"),
+                    (Some(BlockType::Ruta), "Ruta"),
+                ];
 
-                let base_color = if selected_now {
-                    Color::from_rgba(70, 100, 120, 255)
-                } else {
-                    Color::from_rgba(45, 55, 65, 255)
-                };
-                draw_rectangle(rect.x, rect.y, rect.w, rect.h, base_color);
-                draw_rectangle_lines(
-                    rect.x,
-                    rect.y,
-                    rect.w,
-                    rect.h,
-                    1.0,
-                    Color::from_rgba(90, 110, 130, 255),
-                );
+                for (option, tip) in buttons {
+                    let rect = Rect::new(bx, by, button_size, button_size);
+                    let hover = rect.contains(mouse);
+                    if hover {
+                        tooltip = Some(tip);
+                        ui_capturing = true;
+                    }
+                    let selected_now = selected == option;
 
-                if hover && is_mouse_button_pressed(MouseButton::Left) {
-                    selected = option;
-                }
-
-                if let Some(kind) = option {
-                    let icon_center = vec2(rect.x + rect.w * 0.5, rect.y + rect.h * 0.5);
-                    draw_hex_filled(icon_center, 16.0, block_color(kind));
-                    draw_hex_outline(icon_center, 16.0, Color::from_rgba(20, 25, 30, 255), 1.0);
-                } else {
-                    let pad = 10.0;
-                    draw_line(
-                        rect.x + pad,
-                        rect.y + pad,
-                        rect.x + rect.w - pad,
-                        rect.y + rect.h - pad,
-                        3.0,
-                        Color::from_rgba(220, 90, 90, 255),
-                    );
-                    draw_line(
-                        rect.x + rect.w - pad,
-                        rect.y + pad,
-                        rect.x + pad,
-                        rect.y + rect.h - pad,
-                        3.0,
-                        Color::from_rgba(220, 90, 90, 255),
-                    );
-                }
-
-                if hover {
+                    let base_color = if selected_now {
+                        colors_rt.button_hover
+                    } else {
+                        colors_rt.button_base
+                    };
+                    draw_rectangle(rect.x, rect.y, rect.w, rect.h, base_color);
                     draw_rectangle_lines(
-                        rect.x - 1.0,
-                        rect.y - 1.0,
-                        rect.w + 2.0,
-                        rect.h + 2.0,
-                        1.0,
-                        Color::from_rgba(180, 200, 220, 255),
+                        rect.x,
+                        rect.y,
+                        rect.w,
+                        rect.h,
+                        config.line_thickness.max(1.0),
+                        colors_rt.button_border,
                     );
-                }
 
-                bx += button_size + gap;
+                    if hover && is_mouse_button_pressed(MouseButton::Left) {
+                        selected = option;
+                    }
+
+                    if let Some(kind) = option {
+                        let icon_center = vec2(rect.x + rect.w * 0.5, rect.y + rect.h * 0.5);
+                        draw_hex_filled(icon_center, 16.0, block_color(kind, &colors_rt));
+                        draw_hex_outline(
+                            icon_center,
+                            16.0,
+                            colors_rt.panel_border,
+                            config.line_thickness.max(1.0),
+                        );
+                    } else {
+                        let pad = 10.0;
+                        draw_line(
+                            rect.x + pad,
+                            rect.y + pad,
+                            rect.x + rect.w - pad,
+                            rect.y + rect.h - pad,
+                            3.0,
+                            colors_rt.port_out,
+                        );
+                        draw_line(
+                            rect.x + rect.w - pad,
+                            rect.y + pad,
+                            rect.x + pad,
+                            rect.y + rect.h - pad,
+                            3.0,
+                            colors_rt.port_out,
+                        );
+                    }
+
+                    if hover {
+                        draw_rectangle_lines(
+                            rect.x - 1.0,
+                            rect.y - 1.0,
+                            rect.w + 2.0,
+                            rect.h + 2.0,
+                            config.line_thickness.max(1.0),
+                            colors_rt.hover,
+                        );
+                    }
+
+                    bx += button_size + gap;
+                }
             }
 
             if let Some(tip) = tooltip {
                 let pad = 6.0;
-                let font_size = 18.0;
+                let font_size = font_sm;
                 let dim = measure_text(tip, None, font_size as u16, 1.0);
                 let x = (mouse.x + 14.0).min(screen_width() - dim.width - 2.0 * pad);
                 let y = (mouse.y + 16.0).min(screen_height() - dim.height - 2.0 * pad);
@@ -718,22 +1151,22 @@ async fn main() {
                     y,
                     dim.width + 2.0 * pad,
                     dim.height + 2.0 * pad,
-                    Color::from_rgba(30, 36, 44, 240),
+                    colors_rt.tooltip_bg,
                 );
                 draw_rectangle_lines(
                     x,
                     y,
                     dim.width + 2.0 * pad,
                     dim.height + 2.0 * pad,
-                    1.0,
-                    Color::from_rgba(100, 120, 140, 255),
+                    config.line_thickness.max(1.0),
+                    colors_rt.tooltip_border,
                 );
                 draw_text(
                     tip,
                     x + pad,
                     y + dim.height + pad - 2.0,
                     font_size,
-                    Color::from_rgba(225, 235, 245, 255),
+                    colors_rt.text_primary,
                 );
             }
         }

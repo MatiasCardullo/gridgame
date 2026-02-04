@@ -1,19 +1,98 @@
 use macroquad::prelude::*;
 use std::collections::HashMap;
 
-use crate::{
-    Axial, BlockType, FrameContext, PlacedBlock, Scene, TileType, GRID_RADIUS, HEX_SIZE,
-};
 use crate::core::{
-    block_color, block_ports, draw_hex_filled, draw_hex_outline, draw_port_marker, generate_tiles,
-    hex_distance, hex_to_pixel, load_map, pixel_to_hex, save_map, tile_color, axial_neighbors,
+    axial_neighbors, block_color, block_ports, draw_hex_filled, draw_hex_outline, draw_port_marker,
+    generate_tiles, hex_distance, hex_to_pixel, load_map, pixel_to_hex, save_map, tile_color,
+    add_item, item_from_tile, new_placed_block, AppConfig, Axial, BlockType, FrameContext,
+    ItemType, PlacedBlock, RuntimeColors, Scene, TileData, TileType,
 };
+use crate::core::ui::{draw_window, ui_button, WindowState, WindowStyle};
+use crate::{GRID_RADIUS, HEX_SIZE};
+
+// Friendly label for a block type.
+fn block_label(kind: BlockType) -> &'static str {
+    match kind {
+        BlockType::Vivienda => "Vivienda",
+        BlockType::Fabrica => "Fabrica",
+        BlockType::Mina => "Mina",
+        BlockType::Almacen => "Almacen",
+        BlockType::Logistica => "Logistica",
+        BlockType::Ruta => "Ruta",
+    }
+}
+
+// Friendly label for an item type.
+fn item_label(kind: ItemType) -> &'static str {
+    match kind {
+        ItemType::Piedra => "Piedra",
+        ItemType::Hierro => "Hierro",
+        ItemType::Cobre => "Cobre",
+        ItemType::Agua => "Agua",
+    }
+}
+
+// Friendly label for a tile kind.
+fn tile_label(kind: TileType) -> &'static str {
+    match kind {
+        TileType::Piedra => "Piedra",
+        TileType::Hierro => "Hierro",
+        TileType::Cobre => "Cobre",
+        TileType::Agua => "Agua",
+    }
+}
+
+// Sum all stored items.
+fn storage_total(stored: &[crate::core::ItemStack]) -> i32 {
+    stored.iter().map(|s| s.amount).sum()
+}
+
+// Find a path from start to end traveling only along route tiles (plus endpoints).
+fn find_route_path(start: Axial, end: Axial, blocks: &HashMap<Axial, PlacedBlock>) -> Option<Vec<Axial>> {
+    if start == end {
+        return Some(vec![start]);
+    }
+    let mut queue = std::collections::VecDeque::new();
+    let mut came_from: HashMap<Axial, Axial> = HashMap::new();
+    queue.push_back(start);
+    came_from.insert(start, start);
+
+    while let Some(current) = queue.pop_front() {
+        for neighbor in axial_neighbors(current) {
+            if came_from.contains_key(&neighbor) {
+                continue;
+            }
+            let passable = neighbor == end
+                || blocks
+                    .get(&neighbor)
+                    .map(|b| b.kind == BlockType::Ruta)
+                    .unwrap_or(false);
+            if !passable {
+                continue;
+            }
+            came_from.insert(neighbor, current);
+            if neighbor == end {
+                let mut path = vec![end];
+                let mut step = current;
+                while step != start {
+                    path.push(step);
+                    step = *came_from.get(&step).unwrap();
+                }
+                path.push(start);
+                path.reverse();
+                return Some(path);
+            }
+            queue.push_back(neighbor);
+        }
+    }
+    None
+}
 
 // Render and handle input for the game scene.
 pub fn run(
     ctx: &FrameContext,
     blocks: &mut HashMap<Axial, PlacedBlock>,
-    tiles: &mut HashMap<Axial, TileType>,
+    tiles: &mut HashMap<Axial, TileData>,
     cam_offset: &mut Vec2,
     cam_zoom: &mut f32,
     dragging: &mut bool,
@@ -21,11 +100,14 @@ pub fn run(
     selected: &mut Option<BlockType>,
     placement_rotation: &mut u8,
     panel_collapsed: &mut bool,
+    window: &mut WindowState,
+    units: &mut Vec<crate::core::Unit>,
+    unit_spawn_from: &mut Option<Axial>,
     dirty: &mut bool,
     scene: &mut Scene,
     map_path: &str,
-    config: &crate::AppConfig,
-    colors: &crate::RuntimeColors,
+    config: &AppConfig,
+    colors: &RuntimeColors,
 ) {
     let wheel = mouse_wheel().1;
     if wheel.abs() > 0.01 {
@@ -60,22 +142,57 @@ pub fn run(
     let mut tooltip: Option<&str> = None;
     let mut ui_capturing = panel_rect.contains(ctx.mouse);
 
+    if window.open && window.rect.contains(ctx.mouse) {
+        ui_capturing = true;
+    }
+
     if is_mouse_button_pressed(MouseButton::Left) && !ui_capturing {
+        if let Some(source) = *unit_spawn_from {
+            if let Some(target_block) = blocks.get(&hover_hex) {
+                if hover_hex != source {
+                    if let Some(path) = find_route_path(source, hover_hex, blocks) {
+                        units.push(crate::core::Unit {
+                            path,
+                            index: 0,
+                            progress: 0.0,
+                            speed: 3.0,
+                        });
+                    }
+                }
+                window.title = block_label(target_block.kind).to_string();
+                window.rect = Rect::new(ctx.mouse.x.max(8.0), ctx.mouse.y.max(8.0), 220.0, 120.0);
+                window.open = true;
+                window.target = Some(hover_hex);
+                *unit_spawn_from = None;
+            }
+        } else if let Some(existing) = blocks.get(&hover_hex) {
+            let win_w = 220.0;
+            let win_h = 120.0;
+            let mut x = ctx.mouse.x + 12.0;
+            let mut y = ctx.mouse.y + 12.0;
+            if x + win_w > screen_width() {
+                x = screen_width() - win_w - 8.0;
+            }
+            if y + win_h > screen_height() {
+                y = screen_height() - win_h - 8.0;
+            }
+            window.title = block_label(existing.kind).to_string();
+            window.rect = Rect::new(x.max(8.0), y.max(8.0), win_w, win_h);
+            window.open = true;
+            window.target = Some(hover_hex);
+        }
+    }
+
+    if is_mouse_button_pressed(MouseButton::Right) && !ui_capturing {
         if hex_distance(hover_hex, Axial { q: 0, r: 0 }) <= GRID_RADIUS {
             if let Some(kind) = *selected {
-                let can_mine = matches!(
-                    tiles.get(&hover_hex),
-                    Some(TileType::Piedra) | Some(TileType::Hierro) | Some(TileType::Cobre)
-                );
+                let can_mine = tiles
+                    .get(&hover_hex)
+                    .map(|t| matches!(t.kind, TileType::Piedra | TileType::Hierro | TileType::Cobre) && t.amount > 0)
+                    .unwrap_or(false);
                 if kind != BlockType::Mina || can_mine {
                     let rotation = if kind == BlockType::Ruta { 0 } else { *placement_rotation };
-                    blocks.insert(
-                        hover_hex,
-                        PlacedBlock {
-                            kind,
-                            rotation,
-                        },
-                    );
+                    blocks.insert(hover_hex, new_placed_block(kind, rotation));
                     *dirty = true;
                 }
             } else if blocks.remove(&hover_hex).is_some() {
@@ -120,6 +237,44 @@ pub fn run(
         }
     }
 
+    let dt = get_frame_time();
+    for (hex, block) in blocks.iter_mut() {
+        if block.kind != BlockType::Mina {
+            continue;
+        }
+        if let Some(tile) = tiles.get_mut(hex) {
+            if tile.amount <= 0 {
+                continue;
+            }
+            block.mine_progress += dt;
+            while block.mine_progress >= 1.0 && tile.amount > 0 {
+                let added = add_item(
+                    &mut block.stored,
+                    item_from_tile(tile.kind),
+                    1,
+                    block.capacity,
+                );
+                if added <= 0 {
+                    break;
+                }
+                tile.amount -= added;
+                block.mine_progress -= added as f32;
+            }
+        }
+    }
+
+    for unit in units.iter_mut() {
+        if unit.path.len() < 2 || unit.index + 1 >= unit.path.len() {
+            continue;
+        }
+        unit.progress += dt * unit.speed;
+        while unit.progress >= 1.0 && unit.index + 1 < unit.path.len() - 1 {
+            unit.progress -= 1.0;
+            unit.index += 1;
+        }
+    }
+    units.retain(|u| u.path.len() >= 2 && u.index + 1 < u.path.len());
+
     for r in -GRID_RADIUS..=GRID_RADIUS {
         for q in -GRID_RADIUS..=GRID_RADIUS {
             let hex = Axial { q, r };
@@ -139,7 +294,11 @@ pub fn run(
             }
 
             if let Some(tile) = tiles.get(&hex) {
-                draw_hex_filled(center, (HEX_SIZE - 4.5) * *cam_zoom, tile_color(*tile, colors));
+                draw_hex_filled(
+                    center,
+                    (HEX_SIZE - 4.5) * *cam_zoom,
+                    tile_color(tile.kind, colors),
+                );
             }
 
             if let Some(placed) = blocks.get(&hex) {
@@ -194,6 +353,18 @@ pub fn run(
         }
     }
 
+    for unit in units.iter() {
+        if unit.path.len() < 2 || unit.index + 1 >= unit.path.len() {
+            continue;
+        }
+        let a = hex_to_pixel(unit.path[unit.index], HEX_SIZE, Vec2::ZERO);
+        let b = hex_to_pixel(unit.path[unit.index + 1], HEX_SIZE, Vec2::ZERO);
+        let t = unit.progress.clamp(0.0, 1.0);
+        let world = a.lerp(b, t);
+        let center = ctx.screen_center + *cam_offset + world * *cam_zoom;
+        draw_circle(center.x, center.y, 3.5 * *cam_zoom, colors.port_out);
+    }
+
     let hover_center = ctx.screen_center + *cam_offset + hex_to_pixel(hover_hex, HEX_SIZE, Vec2::ZERO) * *cam_zoom;
     draw_hex_outline(
         hover_center,
@@ -222,125 +393,108 @@ pub fn run(
     let rot_text = format!("Rotacion: {}", placement_rotation);
     draw_text(&rot_text, 16.0, 74.0, ctx.font_sm, colors.text_secondary);
 
-    draw_rectangle(panel_pos.x, panel_pos.y, panel_size.x, panel_size.y, colors.panel_bg);
-    draw_rectangle_lines(
-        panel_pos.x,
-        panel_pos.y,
-        panel_size.x,
-        panel_size.y,
-        config.line_thickness.max(1.0),
-        colors.panel_border,
+    let buttons: [(Option<BlockType>, &str); 6] = [
+        (None, "Deconstruir"),
+        (Some(BlockType::Vivienda), "Vivienda"),
+        (Some(BlockType::Fabrica), "Fabrica"),
+        (Some(BlockType::Mina), "Minas"),
+        (Some(BlockType::Almacen), "Almacen"),
+        (Some(BlockType::Ruta), "Ruta"),
+    ];
+    let panel_result = crate::core::ui::draw_build_panel(
+        panel_pos,
+        panel_size,
+        *panel_collapsed,
+        ctx.mouse,
+        config.line_thickness,
+        colors,
+        &buttons,
+        *selected,
     );
-
-    let toggle_rect = Rect::new(panel_pos.x + panel_size.x - 32.0, panel_pos.y + 6.0, 26.0, 24.0);
-    let toggle_hover = toggle_rect.contains(ctx.mouse);
-    if toggle_hover {
+    if panel_result.toggle_hovered {
         ui_capturing = true;
     }
-    let toggle_color = if toggle_hover { colors.button_hover } else { colors.button_base };
-    draw_rectangle(toggle_rect.x, toggle_rect.y, toggle_rect.w, toggle_rect.h, toggle_color);
-    draw_rectangle_lines(
-        toggle_rect.x,
-        toggle_rect.y,
-        toggle_rect.w,
-        toggle_rect.h,
-        config.line_thickness.max(1.0),
-        colors.button_border,
-    );
-    let toggle_label = if *panel_collapsed { ">>" } else { "<<" };
-    let toggle_dim = measure_text(toggle_label, None, ctx.font_sm as u16, 1.0);
-    draw_text(
-        toggle_label,
-        toggle_rect.x + (toggle_rect.w - toggle_dim.width) * 0.5,
-        toggle_rect.y + (toggle_rect.h + toggle_dim.height) * 0.5 - 2.0,
-        ctx.font_sm,
-        colors.button_text,
-    );
-    if toggle_hover && is_mouse_button_pressed(MouseButton::Left) {
+    if panel_result.toggled {
         *panel_collapsed = !*panel_collapsed;
         ui_capturing = true;
     }
+    if let Some(tip) = panel_result.hovered_tip {
+        tooltip = Some(tip);
+        ui_capturing = true;
+    }
+    if let Some(option) = panel_result.clicked_option {
+        *selected = option;
+    }
 
-    if !*panel_collapsed {
-        let button_size = 52.0;
-        let gap = 8.0;
-        let mut bx = panel_pos.x + 12.0;
-        let by = panel_pos.y + 16.0;
-
-        let buttons: [(Option<BlockType>, &str); 6] = [
-            (None, "Deconstruir"),
-            (Some(BlockType::Vivienda), "Vivienda"),
-            (Some(BlockType::Fabrica), "Fabrica"),
-            (Some(BlockType::Mina), "Minas"),
-            (Some(BlockType::Almacen), "Almacen"),
-            (Some(BlockType::Ruta), "Ruta"),
-        ];
-
-        for (option, tip) in buttons {
-            let rect = Rect::new(bx, by, button_size, button_size);
-            let hover = rect.contains(ctx.mouse);
-            if hover {
-                tooltip = Some(tip);
-                ui_capturing = true;
+    if window.open {
+        let style = WindowStyle {
+            bg: colors.panel_bg,
+            border: colors.panel_border,
+            title: colors.text_primary,
+            title_bg: colors.button_base,
+        };
+        if draw_window(window, style, ctx.font_sm, config.line_thickness, ctx.mouse) {
+            window.open = false;
+            window.target = None;
+        }
+        if let Some(target) = window.target {
+            if let Some(block) = blocks.get(&target) {
+                let content_x = window.rect.x + 10.0;
+                let mut content_y = window.rect.y + 48.0;
+                match block.kind {
+                    BlockType::Logistica => {
+                        let rect_spawn = Rect::new(content_x, content_y, 150.0, 28.0);
+                        let (clicked, _) = ui_button(
+                            rect_spawn,
+                            "Crear unidad",
+                            ctx.mouse,
+                            ctx.font_sm,
+                            ctx.button_colors,
+                        );
+                        if clicked {
+                            *unit_spawn_from = Some(target);
+                        }
+                    }
+                    BlockType::Mina => {
+                        if let Some(tile) = tiles.get(&target) {
+                            let txt =
+                                format!("Recurso: {} ({})", tile_label(tile.kind), tile.amount);
+                            draw_text(&txt, content_x, content_y, ctx.font_sm, colors.text_secondary);
+                            content_y += 20.0;
+                        }
+                        let total = storage_total(&block.stored);
+                        draw_text(
+                            &format!("Guardado: {}/{}", total, block.capacity),
+                            content_x,
+                            content_y,
+                            ctx.font_sm,
+                            colors.text_secondary,
+                        );
+                    }
+                    BlockType::Almacen => {
+                        let total = storage_total(&block.stored);
+                        draw_text(
+                            &format!("Capacidad: {}/{}", total, block.capacity),
+                            content_x,
+                            content_y,
+                            ctx.font_sm,
+                            colors.text_secondary,
+                        );
+                        content_y += 20.0;
+                        for stack in block.stored.iter() {
+                            draw_text(
+                                &format!("{}: {}", item_label(stack.kind), stack.amount),
+                                content_x,
+                                content_y,
+                                ctx.font_sm,
+                                colors.text_secondary,
+                            );
+                            content_y += 18.0;
+                        }
+                    }
+                    _ => {}
+                }
             }
-            let selected_now = *selected == option;
-
-            let base_color = if selected_now { colors.button_hover } else { colors.button_base };
-            draw_rectangle(rect.x, rect.y, rect.w, rect.h, base_color);
-            draw_rectangle_lines(
-                rect.x,
-                rect.y,
-                rect.w,
-                rect.h,
-                config.line_thickness.max(1.0),
-                colors.button_border,
-            );
-
-            if hover && is_mouse_button_pressed(MouseButton::Left) {
-                *selected = option;
-            }
-
-            if let Some(kind) = option {
-                let icon_center = vec2(rect.x + rect.w * 0.5, rect.y + rect.h * 0.5);
-                draw_hex_filled(icon_center, 16.0, block_color(kind, colors));
-                draw_hex_outline(
-                    icon_center,
-                    16.0,
-                    colors.panel_border,
-                    config.line_thickness.max(1.0),
-                );
-            } else {
-                let pad = 10.0;
-                draw_line(
-                    rect.x + pad,
-                    rect.y + pad,
-                    rect.x + rect.w - pad,
-                    rect.y + rect.h - pad,
-                    3.0,
-                    colors.port_out,
-                );
-                draw_line(
-                    rect.x + rect.w - pad,
-                    rect.y + pad,
-                    rect.x + pad,
-                    rect.y + rect.h - pad,
-                    3.0,
-                    colors.port_out,
-                );
-            }
-
-            if hover {
-                draw_rectangle_lines(
-                    rect.x - 1.0,
-                    rect.y - 1.0,
-                    rect.w + 2.0,
-                    rect.h + 2.0,
-                    config.line_thickness.max(1.0),
-                    colors.hover,
-                );
-            }
-
-            bx += button_size + gap;
         }
     }
 

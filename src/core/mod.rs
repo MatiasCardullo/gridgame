@@ -46,7 +46,7 @@ pub enum ItemType {
 }
 
 // Persisted block entry for map JSON.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Block {
     pub hex: Axial,
     pub kind: BlockType,
@@ -84,7 +84,7 @@ pub struct ItemStack {
 }
 
 // In-memory placed block data.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct PlacedBlock {
     pub kind: BlockType,
     pub rotation: u8,

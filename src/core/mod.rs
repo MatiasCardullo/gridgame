@@ -58,6 +58,14 @@ pub struct Block {
     pub mine_progress: f32,
     #[serde(default)]
     pub capacity: i32,
+    #[serde(default)]
+    pub build_progress: f32,
+    #[serde(default)]
+    pub build_time: f32,
+    #[serde(default)]
+    pub build_paid: bool,
+    #[serde(default)]
+    pub mine_extra: Vec<Axial>,
 }
 
 // Persisted tile entry for map JSON.
@@ -91,6 +99,10 @@ pub struct PlacedBlock {
     pub mine_progress: f32,
     pub capacity: i32,
     pub stored: Vec<ItemStack>,
+    pub build_progress: f32,
+    pub build_time: f32,
+    pub build_paid: bool,
+    pub mine_extra: Vec<Axial>,
 }
 
 // Simple unit moving along a hex path.
@@ -443,6 +455,10 @@ pub fn save_map(path: &str, blocks: &HashMap<Axial, PlacedBlock>, tiles: &HashMa
                 stored: placed.stored.clone(),
                 mine_progress: placed.mine_progress,
                 capacity: placed.capacity,
+                build_progress: placed.build_progress,
+                build_time: placed.build_time,
+                build_paid: placed.build_paid,
+                mine_extra: placed.mine_extra.clone(),
             })
             .collect(),
     };
@@ -488,6 +504,10 @@ pub fn load_map(path: &str) -> (HashMap<Axial, PlacedBlock>, HashMap<Axial, Tile
                                 b.capacity
                             },
                             stored: b.stored,
+                            build_progress: b.build_progress,
+                            build_time: b.build_time,
+                            build_paid: b.build_paid,
+                            mine_extra: b.mine_extra,
                         },
                     )
                 })
@@ -554,6 +574,74 @@ pub fn item_from_tile(kind: TileType) -> ItemType {
         TileType::Cobre => ItemType::Cobre,
         TileType::Agua => ItemType::Agua,
     }
+}
+
+// Build time (seconds) per block type.
+pub fn build_time(kind: BlockType) -> f32 {
+    match kind {
+        BlockType::Vivienda => 6.0,
+        BlockType::Fabrica => 9.0,
+        BlockType::Mina => 0.0,
+        BlockType::Almacen => 7.0,
+        BlockType::Logistica => 8.0,
+        BlockType::Ruta => 2.0,
+    }
+}
+
+// Build requirements per block type.
+pub fn build_requirements(kind: BlockType) -> Vec<ItemStack> {
+    match kind {
+        BlockType::Vivienda => vec![
+            ItemStack {
+                kind: ItemType::Piedra,
+                amount: 10,
+            },
+            ItemStack {
+                kind: ItemType::Cobre,
+                amount: 4,
+            },
+        ],
+        BlockType::Fabrica => vec![
+            ItemStack {
+                kind: ItemType::Hierro,
+                amount: 12,
+            },
+            ItemStack {
+                kind: ItemType::Cobre,
+                amount: 8,
+            },
+        ],
+        BlockType::Mina => vec![],
+        BlockType::Almacen => vec![
+            ItemStack {
+                kind: ItemType::Piedra,
+                amount: 12,
+            },
+            ItemStack {
+                kind: ItemType::Hierro,
+                amount: 6,
+            },
+        ],
+        BlockType::Logistica => vec![
+            ItemStack {
+                kind: ItemType::Hierro,
+                amount: 10,
+            },
+            ItemStack {
+                kind: ItemType::Cobre,
+                amount: 6,
+            },
+        ],
+        BlockType::Ruta => vec![ItemStack {
+            kind: ItemType::Piedra,
+            amount: 3,
+        }],
+    }
+}
+
+// True if the block is still building.
+pub fn is_under_construction(block: &PlacedBlock) -> bool {
+    block.build_time > 0.0 && block.build_progress < block.build_time
 }
 
 // Pick a tile type using weighted probabilities and center bias.
@@ -688,6 +776,10 @@ pub fn new_placed_block(kind: BlockType, rotation: u8) -> PlacedBlock {
         mine_progress: 0.0,
         capacity: default_capacity(kind),
         stored: Vec::new(),
+        build_progress: 0.0,
+        build_time: build_time(kind),
+        build_paid: false,
+        mine_extra: Vec::new(),
     }
 }
 

@@ -240,7 +240,6 @@ pub fn draw_game_panel(
     line_thickness: f32,
     colors: &RuntimeColors,
 ) -> PanelResult {
-    let panel_rect = Rect::new(panel_pos.x, panel_pos.y, panel_size.x, panel_size.y);
     let mut toggled = false;
     let mut toggle_hovered = false;
 
@@ -305,7 +304,7 @@ pub fn draw_build_panel(
 
     if !collapsed {
         let button_size = 52.0;
-        let gap = 8.0;
+        let gap = 3.0;
         let mut bx = panel_pos.x + 12.0;
         let by = panel_pos.y + 16.0;
 

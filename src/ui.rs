@@ -18,6 +18,7 @@ pub struct ColorRgba {
 }
 
 impl ColorRgba {
+    // Convert RGBA bytes to macroquad Color.
     pub fn to_color(self) -> Color {
         Color::from_rgba(self.r, self.g, self.b, self.a)
     }
@@ -154,6 +155,7 @@ impl Default for AppColors {
 }
 
 impl AppColors {
+    // Convert stored colors into runtime macroquad Colors.
     pub fn runtime(&self) -> RuntimeColors {
         RuntimeColors {
             background: self.background.to_color(),
@@ -247,6 +249,7 @@ pub fn color_target_list() -> [ColorTarget; 26] {
     ]
 }
 
+// Friendly label for a color target in UI.
 pub fn color_target_name(target: ColorTarget) -> &'static str {
     match target {
         ColorTarget::Background => "Fondo",
@@ -278,6 +281,7 @@ pub fn color_target_name(target: ColorTarget) -> &'static str {
     }
 }
 
+// Get a mutable color entry by target.
 pub fn color_target_mut(target: ColorTarget, colors: &mut AppColors) -> &mut ColorRgba {
     match target {
         ColorTarget::Background => &mut colors.background,
@@ -309,6 +313,7 @@ pub fn color_target_mut(target: ColorTarget, colors: &mut AppColors) -> &mut Col
     }
 }
 
+// Adjust a single RGBA channel by a delta in UI.
 pub fn adjust_color_channel(color: &mut ColorRgba, channel: usize, delta: i32) {
     let apply = |value: u8, delta: i32| -> u8 {
         let next = value as i32 + delta;
@@ -322,6 +327,7 @@ pub fn adjust_color_channel(color: &mut ColorRgba, channel: usize, delta: i32) {
     }
 }
 
+// Draw a simple UI button and return (clicked, hovered).
 pub fn ui_button(
     rect: Rect,
     label: &str,

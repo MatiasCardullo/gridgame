@@ -100,6 +100,19 @@ pub struct Unit {
     pub index: usize,
     pub progress: f32,
     pub speed: f32,
+    pub forward: bool,
+    pub capacity: i32,
+    pub cargo: Vec<ItemStack>,
+    pub depot: Axial,
+    pub station_in: Axial,
+    pub station_out: Axial,
+}
+
+// Select which endpoint to set for logistics units.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StationPick {
+    In,
+    Out,
 }
 
 // Scene routing.

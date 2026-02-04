@@ -3,11 +3,14 @@ use std::collections::HashMap;
 
 use crate::core::{
     axial_neighbors, block_color, block_ports, draw_hex_filled, draw_hex_outline, draw_port_marker,
-    generate_tiles, hex_distance, hex_to_pixel, load_map, pixel_to_hex, save_map, tile_color,
+    hex_distance, hex_to_pixel, pixel_to_hex, save_map, tile_color,
     add_item, item_from_tile, new_placed_block, AppConfig, Axial, BlockType, FrameContext,
     ItemType, PlacedBlock, RuntimeColors, Scene, TileData, TileType,
 };
-use crate::core::ui::{draw_window, ui_button, WindowState, WindowStyle};
+use crate::core::ui::{
+    draw_window, ui_button, window_close_rect, window_title_rect, WindowState, WindowStyle,
+    WINDOW_TITLE_HEIGHT,
+};
 use crate::{GRID_RADIUS, HEX_SIZE};
 
 // Friendly label for a block type.
@@ -45,6 +48,52 @@ fn tile_label(kind: TileType) -> &'static str {
 // Sum all stored items.
 fn storage_total(stored: &[crate::core::ItemStack]) -> i32 {
     stored.iter().map(|s| s.amount).sum()
+}
+
+// Move items from a block storage into unit cargo.
+fn load_unit_from_block(
+    block: &mut PlacedBlock,
+    cargo: &mut Vec<crate::core::ItemStack>,
+    capacity: i32,
+) {
+    let mut remaining = capacity - storage_total(cargo);
+    if remaining <= 0 {
+        return;
+    }
+    let mut index = 0usize;
+    while index < block.stored.len() && remaining > 0 {
+        let stack = block.stored[index];
+        let take = stack.amount.min(remaining);
+        if take > 0 {
+            let added = add_item(cargo, stack.kind, take, capacity);
+            if added > 0 {
+                block.stored[index].amount -= added;
+                remaining -= added;
+            }
+        }
+        if block.stored[index].amount <= 0 {
+            block.stored.remove(index);
+        } else {
+            index += 1;
+        }
+    }
+}
+
+// Move items from unit cargo into a block storage.
+fn unload_unit_to_block(cargo: &mut Vec<crate::core::ItemStack>, block: &mut PlacedBlock) {
+    let mut index = 0usize;
+    while index < cargo.len() {
+        let stack = cargo[index];
+        let added = add_item(&mut block.stored, stack.kind, stack.amount, block.capacity);
+        if added > 0 {
+            cargo[index].amount -= added;
+        }
+        if cargo[index].amount <= 0 {
+            cargo.remove(index);
+        } else {
+            index += 1;
+        }
+    }
 }
 
 // Find a path from start to end traveling only along route tiles (plus endpoints).
@@ -102,7 +151,9 @@ pub fn run(
     panel_collapsed: &mut bool,
     window: &mut WindowState,
     units: &mut Vec<crate::core::Unit>,
-    unit_spawn_from: &mut Option<Axial>,
+    station_in: &mut Option<Axial>,
+    station_out: &mut Option<Axial>,
+    station_pick: &mut Option<crate::core::StationPick>,
     dirty: &mut bool,
     scene: &mut Scene,
     map_path: &str,
@@ -131,39 +182,50 @@ pub fn run(
     let world_mouse = (ctx.mouse - ctx.screen_center - *cam_offset) / *cam_zoom;
     let hover_hex = pixel_to_hex(world_mouse, HEX_SIZE, Vec2::ZERO);
 
-    let panel_pos = vec2(16.0, screen_height() - 110.0);
+    let buttons: [(Option<BlockType>, &str); 7] = [
+        (None, "Deconstruir"),
+        (Some(BlockType::Vivienda), "Vivienda"),
+        (Some(BlockType::Fabrica), "Fabrica"),
+        (Some(BlockType::Mina), "Minas"),
+        (Some(BlockType::Almacen), "Almacen"),
+        (Some(BlockType::Logistica), "Logistica"),
+        (Some(BlockType::Ruta), "Ruta"),
+    ];
+
+    let button_size = 52.0;
+    let gap = 8.0;
+    let panel_pad_x = 12.0;
+    let panel_pad_y = 16.0;
+    let toggle_space = 36.0;
+    let button_count = buttons.len() as f32;
+    let panel_width = panel_pad_x * 2.0
+        + (button_size * button_count)
+        + (gap * (button_count - 1.0))
+        + toggle_space;
+    let panel_height = panel_pad_y * 2.0 + button_size;
     let panel_size = if *panel_collapsed {
         vec2(170.0, 36.0)
     } else {
-        vec2(392.0, 94.0)
+        vec2(panel_width, panel_height)
     };
+    let panel_pos = vec2(16.0, screen_height() - panel_size.y - 16.0);
     let panel_rect = Rect::new(panel_pos.x, panel_pos.y, panel_size.x, panel_size.y);
 
     let mut tooltip: Option<&str> = None;
     let mut ui_capturing = panel_rect.contains(ctx.mouse);
 
-    if window.open && window.rect.contains(ctx.mouse) {
+    if window.open && (window.rect.contains(ctx.mouse) || window.dragging) {
         ui_capturing = true;
     }
 
     if is_mouse_button_pressed(MouseButton::Left) && !ui_capturing {
-        if let Some(source) = *unit_spawn_from {
-            if let Some(target_block) = blocks.get(&hover_hex) {
-                if hover_hex != source {
-                    if let Some(path) = find_route_path(source, hover_hex, blocks) {
-                        units.push(crate::core::Unit {
-                            path,
-                            index: 0,
-                            progress: 0.0,
-                            speed: 3.0,
-                        });
-                    }
+        if let Some(pick) = *station_pick {
+            if blocks.contains_key(&hover_hex) {
+                match pick {
+                    crate::core::StationPick::In => *station_in = Some(hover_hex),
+                    crate::core::StationPick::Out => *station_out = Some(hover_hex),
                 }
-                window.title = block_label(target_block.kind).to_string();
-                window.rect = Rect::new(ctx.mouse.x.max(8.0), ctx.mouse.y.max(8.0), 220.0, 120.0);
-                window.open = true;
-                window.target = Some(hover_hex);
-                *unit_spawn_from = None;
+                *station_pick = None;
             }
         } else if let Some(existing) = blocks.get(&hover_hex) {
             let win_w = 220.0;
@@ -199,21 +261,6 @@ pub fn run(
                 *dirty = true;
             }
         }
-    }
-
-    if is_key_pressed(KeyCode::S) {
-        save_map(map_path, blocks, tiles);
-        *dirty = false;
-    }
-
-    if is_key_pressed(KeyCode::L) {
-        let (loaded_blocks, loaded_tiles) = load_map(map_path);
-        *blocks = loaded_blocks;
-        *tiles = loaded_tiles;
-        if tiles.is_empty() {
-            *tiles = generate_tiles(GRID_RADIUS, config);
-        }
-        *dirty = false;
     }
 
     if *dirty {
@@ -264,16 +311,40 @@ pub fn run(
     }
 
     for unit in units.iter_mut() {
-        if unit.path.len() < 2 || unit.index + 1 >= unit.path.len() {
+        if unit.path.len() < 2 {
             continue;
         }
         unit.progress += dt * unit.speed;
-        while unit.progress >= 1.0 && unit.index + 1 < unit.path.len() - 1 {
+        while unit.progress >= 1.0 {
             unit.progress -= 1.0;
-            unit.index += 1;
+            if unit.forward {
+                if unit.index + 1 < unit.path.len() {
+                    unit.index += 1;
+                }
+                if unit.index >= unit.path.len() - 1 {
+                    unit.forward = false;
+                }
+            } else {
+                if unit.index > 0 {
+                    unit.index -= 1;
+                }
+                if unit.index == 0 {
+                    unit.forward = true;
+                }
+            }
+            let arrived = unit.path[unit.index];
+            if arrived == unit.station_in {
+                if let Some(block) = blocks.get_mut(&arrived) {
+                    load_unit_from_block(block, &mut unit.cargo, unit.capacity);
+                }
+            }
+            if arrived == unit.station_out {
+                if let Some(block) = blocks.get_mut(&arrived) {
+                    unload_unit_to_block(&mut unit.cargo, block);
+                }
+            }
         }
     }
-    units.retain(|u| u.path.len() >= 2 && u.index + 1 < u.path.len());
 
     for r in -GRID_RADIUS..=GRID_RADIUS {
         for q in -GRID_RADIUS..=GRID_RADIUS {
@@ -354,11 +425,22 @@ pub fn run(
     }
 
     for unit in units.iter() {
-        if unit.path.len() < 2 || unit.index + 1 >= unit.path.len() {
+        if unit.path.len() < 2 {
             continue;
         }
+        let next_index = if unit.forward {
+            if unit.index + 1 < unit.path.len() {
+                unit.index + 1
+            } else {
+                unit.index
+            }
+        } else if unit.index > 0 {
+            unit.index - 1
+        } else {
+            unit.index
+        };
         let a = hex_to_pixel(unit.path[unit.index], HEX_SIZE, Vec2::ZERO);
-        let b = hex_to_pixel(unit.path[unit.index + 1], HEX_SIZE, Vec2::ZERO);
+        let b = hex_to_pixel(unit.path[next_index], HEX_SIZE, Vec2::ZERO);
         let t = unit.progress.clamp(0.0, 1.0);
         let world = a.lerp(b, t);
         let center = ctx.screen_center + *cam_offset + world * *cam_zoom;
@@ -374,7 +456,7 @@ pub fn run(
     );
 
     draw_text(
-        "Click: colocar  |  Rueda: zoom  |  Boton medio: mover  |  R: rotar  |  Panel: <<  |  S: guardar  |  L: cargar  |  Esc: menu",
+        "Click: colocar  |  Rueda: zoom  |  Boton medio: mover  |  R: rotar  |  Esc: menu",
         16.0,
         28.0,
         ctx.font_md,
@@ -393,14 +475,6 @@ pub fn run(
     let rot_text = format!("Rotacion: {}", placement_rotation);
     draw_text(&rot_text, 16.0, 74.0, ctx.font_sm, colors.text_secondary);
 
-    let buttons: [(Option<BlockType>, &str); 6] = [
-        (None, "Deconstruir"),
-        (Some(BlockType::Vivienda), "Vivienda"),
-        (Some(BlockType::Fabrica), "Fabrica"),
-        (Some(BlockType::Mina), "Minas"),
-        (Some(BlockType::Almacen), "Almacen"),
-        (Some(BlockType::Ruta), "Ruta"),
-    ];
     let panel_result = crate::core::ui::draw_build_panel(
         panel_pos,
         panel_size,
@@ -427,6 +501,37 @@ pub fn run(
     }
 
     if window.open {
+        let title_rect = window_title_rect(window);
+        let close_rect = window_close_rect(window);
+        if is_mouse_button_pressed(MouseButton::Left)
+            && title_rect.contains(ctx.mouse)
+            && !close_rect.contains(ctx.mouse)
+        {
+            window.dragging = true;
+            window.drag_offset = ctx.mouse - vec2(window.rect.x, window.rect.y);
+        }
+        if window.dragging && is_mouse_button_down(MouseButton::Left) {
+            let mut x = ctx.mouse.x - window.drag_offset.x;
+            let mut y = ctx.mouse.y - window.drag_offset.y;
+            if x + window.rect.w > screen_width() {
+                x = screen_width() - window.rect.w;
+            }
+            if y + window.rect.h > screen_height() {
+                y = screen_height() - window.rect.h;
+            }
+            if x < 0.0 {
+                x = 0.0;
+            }
+            if y < 0.0 {
+                y = 0.0;
+            }
+            window.rect.x = x;
+            window.rect.y = y;
+        }
+        if is_mouse_button_released(MouseButton::Left) {
+            window.dragging = false;
+        }
+
         let style = WindowStyle {
             bg: colors.panel_bg,
             border: colors.panel_border,
@@ -436,13 +541,41 @@ pub fn run(
         if draw_window(window, style, ctx.font_sm, config.line_thickness, ctx.mouse) {
             window.open = false;
             window.target = None;
+            window.dragging = false;
         }
         if let Some(target) = window.target {
             if let Some(block) = blocks.get(&target) {
                 let content_x = window.rect.x + 10.0;
-                let mut content_y = window.rect.y + 48.0;
+                let mut content_y = window.rect.y + WINDOW_TITLE_HEIGHT + 20.0;
                 match block.kind {
                     BlockType::Logistica => {
+                        let a_text = match station_in {
+                            Some(a) => format!("In: q={} r={}", a.q, a.r),
+                            None => "In: (sin)".to_string(),
+                        };
+                        let b_text = match station_out {
+                            Some(b) => format!("Out: q={} r={}", b.q, b.r),
+                            None => "Out: (sin)".to_string(),
+                        };
+                        draw_text(&a_text, content_x, content_y, ctx.font_sm, colors.text_secondary);
+                        content_y += 18.0;
+                        draw_text(&b_text, content_x, content_y, ctx.font_sm, colors.text_secondary);
+                        content_y += 22.0;
+
+                        let rect_set_a = Rect::new(content_x, content_y, 80.0, 26.0);
+                        let rect_set_b = Rect::new(content_x + 90.0, content_y, 80.0, 26.0);
+                        let (clicked_a, _) =
+                            ui_button(rect_set_a, "Set In", ctx.mouse, ctx.font_sm, ctx.button_colors);
+                        let (clicked_b, _) =
+                            ui_button(rect_set_b, "Set Out", ctx.mouse, ctx.font_sm, ctx.button_colors);
+                        if clicked_a {
+                            *station_pick = Some(crate::core::StationPick::In);
+                        }
+                        if clicked_b {
+                            *station_pick = Some(crate::core::StationPick::Out);
+                        }
+                        content_y += 34.0;
+
                         let rect_spawn = Rect::new(content_x, content_y, 150.0, 28.0);
                         let (clicked, _) = ui_button(
                             rect_spawn,
@@ -452,7 +585,22 @@ pub fn run(
                             ctx.button_colors,
                         );
                         if clicked {
-                            *unit_spawn_from = Some(target);
+                            if let (Some(a), Some(b)) = (*station_in, *station_out) {
+                                if let Some(path) = find_route_path(a, b, blocks) {
+                                    units.push(crate::core::Unit {
+                                        path,
+                                        index: 0,
+                                        progress: 0.0,
+                                        speed: 3.0,
+                                        forward: true,
+                                        capacity: 20,
+                                        cargo: Vec::new(),
+                                        depot: target,
+                                        station_in: a,
+                                        station_out: b,
+                                    });
+                                }
+                            }
                         }
                     }
                     BlockType::Mina => {

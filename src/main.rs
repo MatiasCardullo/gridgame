@@ -7,7 +7,7 @@ mod scenes;
 mod core;
 use core::{
     load_config, save_config, Axial, BlockType, ConfigData, FrameContext, PlacedBlock, Scene,
-    TileData, Unit,
+    StationPick, TileData, Unit,
 };
 use core::ui::{UiButtonColors, WindowState};
 
@@ -47,9 +47,13 @@ async fn main() {
         rect: Rect::new(40.0, 120.0, 220.0, 120.0),
         open: false,
         target: None,
+        dragging: false,
+        drag_offset: Vec2::ZERO,
     };
     let mut units: Vec<Unit> = Vec::new();
-    let mut unit_spawn_from: Option<Axial> = None;
+    let mut station_in: Option<Axial> = None;
+    let mut station_out: Option<Axial> = None;
+    let mut station_pick: Option<StationPick> = None;
     let mut dirty = false;
     let mut scene = Scene::MainMenu;
 
@@ -126,7 +130,9 @@ async fn main() {
                     &mut panel_collapsed,
                     &mut block_window,
                     &mut units,
-                    &mut unit_spawn_from,
+                    &mut station_in,
+                    &mut station_out,
+                    &mut station_pick,
                     &mut dirty,
                     &mut scene,
                     map_path,

@@ -30,6 +30,8 @@ pub struct WindowState {
     pub rect: Rect,
     pub open: bool,
     pub target: Option<Axial>,
+    pub dragging: bool,
+    pub drag_offset: Vec2,
 }
 
 // UI result from a panel template.
@@ -47,6 +49,23 @@ pub struct BuildPanelResult {
     pub toggle_hovered: bool,
     pub clicked_option: Option<Option<BlockType>>,
     pub hovered_tip: Option<&'static str>,
+}
+
+pub const WINDOW_TITLE_HEIGHT: f32 = 28.0;
+
+// Title bar rectangle for a window.
+pub fn window_title_rect(state: &WindowState) -> Rect {
+    Rect::new(state.rect.x, state.rect.y, state.rect.w, WINDOW_TITLE_HEIGHT)
+}
+
+// Close button rectangle for a window.
+pub fn window_close_rect(state: &WindowState) -> Rect {
+    Rect::new(
+        state.rect.x + state.rect.w - 24.0,
+        state.rect.y + 4.0,
+        18.0,
+        18.0,
+    )
 }
 
 // Draw a simple UI button and return (clicked, hovered).
@@ -386,18 +405,30 @@ pub fn draw_window(
         style.border,
     );
 
-    let title_h = 28.0;
-    draw_rectangle(state.rect.x, state.rect.y, state.rect.w, title_h, style.title_bg);
+    let title_rect = window_title_rect(state);
+    draw_rectangle(
+        title_rect.x,
+        title_rect.y,
+        title_rect.w,
+        title_rect.h,
+        style.title_bg,
+    );
     draw_text(
         &state.title,
         state.rect.x + 8.0,
-        state.rect.y + title_h - 8.0,
+        state.rect.y + WINDOW_TITLE_HEIGHT - 8.0,
         font_title,
         style.title,
     );
 
-    let close_rect = Rect::new(state.rect.x + state.rect.w - 24.0, state.rect.y + 4.0, 18.0, 18.0);
-    draw_rectangle(close_rect.x, close_rect.y, close_rect.w, close_rect.h, style.border);
+    let close_rect = window_close_rect(state);
+    draw_rectangle(
+        close_rect.x,
+        close_rect.y,
+        close_rect.w,
+        close_rect.h,
+        style.border,
+    );
     draw_text("x", close_rect.x + 5.0, close_rect.y + 14.0, font_title, style.title);
     close_rect.contains(mouse) && is_mouse_button_pressed(MouseButton::Left)
 }

@@ -49,6 +49,16 @@ async fn main() {
         target: None,
         dragging: false,
         drag_offset: Vec2::ZERO,
+        show_units: false,
+    };
+    let mut confirm_window = WindowState {
+        title: String::new(),
+        rect: Rect::new(40.0, 120.0, 240.0, 120.0),
+        open: false,
+        target: None,
+        dragging: false,
+        drag_offset: Vec2::ZERO,
+        show_units: false,
     };
     let mut units: Vec<Unit> = Vec::new();
     let mut station_in: Option<Axial> = None;
@@ -93,6 +103,7 @@ async fn main() {
                     &ctx,
                     &mut blocks,
                     &mut tiles,
+                    &mut units,
                     &mut cam_offset,
                     &mut cam_zoom,
                     &mut placement_rotation,
@@ -129,6 +140,7 @@ async fn main() {
                     &mut placement_rotation,
                     &mut panel_collapsed,
                     &mut block_window,
+                    &mut confirm_window,
                     &mut units,
                     &mut station_in,
                     &mut station_out,

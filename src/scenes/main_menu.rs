@@ -2,7 +2,7 @@ use macroquad::prelude::*;
 
 use crate::core::{
     generate_tiles, load_map, save_map, AppConfig, Axial, FrameContext, PlacedBlock, Scene,
-    TileData,
+    TileData, Unit,
 };
 use crate::core::ui::ui_button;
 use crate::GRID_RADIUS;
@@ -13,6 +13,7 @@ pub fn run(
     ctx: &FrameContext,
     blocks: &mut HashMap<Axial, PlacedBlock>,
     tiles: &mut HashMap<Axial, TileData>,
+    units: &mut Vec<Unit>,
     cam_offset: &mut Vec2,
     cam_zoom: &mut f32,
     placement_rotation: &mut u8,
@@ -41,9 +42,10 @@ pub fn run(
         let rect = Rect::new((screen_width() - btn_w) * 0.5, y, btn_w, btn_h);
         let (clicked, _) = ui_button(rect, "Continuar", ctx.mouse, ctx.font_md, ctx.button_colors);
         if clicked {
-            let (loaded_blocks, loaded_tiles) = load_map(map_path);
+            let (loaded_blocks, loaded_tiles, loaded_units) = load_map(map_path);
             *blocks = loaded_blocks;
             *tiles = loaded_tiles;
+            *units = loaded_units;
             if tiles.is_empty() {
                 *tiles = generate_tiles(GRID_RADIUS, config);
                 *dirty = true;
@@ -58,6 +60,7 @@ pub fn run(
     if clicked_new {
         blocks.clear();
         *tiles = generate_tiles(GRID_RADIUS, config);
+        units.clear();
         *cam_offset = Vec2::ZERO;
         *cam_zoom = 1.0;
         *placement_rotation = 0;
@@ -75,7 +78,7 @@ pub fn run(
     let (clicked_exit, _) = ui_button(rect_exit, "Salir", ctx.mouse, ctx.font_md, ctx.button_colors);
     if clicked_exit {
         if !blocks.is_empty() || !tiles.is_empty() {
-            save_map(map_path, blocks, tiles);
+            save_map(map_path, blocks, tiles, units);
         }
         return true;
     }

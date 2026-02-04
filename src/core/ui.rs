@@ -32,6 +32,7 @@ pub struct WindowState {
     pub target: Option<Axial>,
     pub dragging: bool,
     pub drag_offset: Vec2,
+    pub show_units: bool,
 }
 
 // UI result from a panel template.

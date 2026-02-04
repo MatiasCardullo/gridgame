@@ -258,6 +258,7 @@ pub fn run(
     placement_rotation: &mut u8,
     panel_collapsed: &mut bool,
     window: &mut WindowState,
+    confirm_window: &mut WindowState,
     units: &mut Vec<crate::core::Unit>,
     station_in: &mut Option<Axial>,
     station_out: &mut Option<Axial>,
@@ -325,6 +326,9 @@ pub fn run(
     if window.open && (window.rect.contains(ctx.mouse) || window.dragging) {
         ui_capturing = true;
     }
+    if confirm_window.open && (confirm_window.rect.contains(ctx.mouse) || confirm_window.dragging) {
+        ui_capturing = true;
+    }
 
     if is_mouse_button_pressed(MouseButton::Left) && !ui_capturing {
         if let Some(pick) = *station_pick {
@@ -352,6 +356,7 @@ pub fn run(
             window.rect = Rect::new(x.max(8.0), y.max(8.0), win_w, win_h);
             window.open = true;
             window.target = Some(hover_hex);
+            window.show_units = false;
         }
     }
 
@@ -369,19 +374,33 @@ pub fn run(
                         *dirty = true;
                     }
                 }
-            } else if blocks.remove(&hover_hex).is_some() {
-                *dirty = true;
+            } else if blocks.contains_key(&hover_hex) {
+                let win_w = 240.0;
+                let win_h = 120.0;
+                let mut x = ctx.mouse.x + 12.0;
+                let mut y = ctx.mouse.y + 12.0;
+                if x + win_w > screen_width() {
+                    x = screen_width() - win_w - 8.0;
+                }
+                if y + win_h > screen_height() {
+                    y = screen_height() - win_h - 8.0;
+                }
+                confirm_window.title = "Confirmar".to_string();
+                confirm_window.rect = Rect::new(x.max(8.0), y.max(8.0), win_w, win_h);
+                confirm_window.open = true;
+                confirm_window.target = Some(hover_hex);
+                confirm_window.dragging = false;
             }
         }
     }
 
     if *dirty {
-        save_map(map_path, blocks, tiles);
+        save_map(map_path, blocks, tiles, units);
         *dirty = false;
     }
 
     if is_key_pressed(KeyCode::Escape) {
-        save_map(map_path, blocks, tiles);
+        save_map(map_path, blocks, tiles, units);
         *scene = Scene::MainMenu;
     }
 
@@ -598,6 +617,24 @@ pub fn run(
         draw_circle(center.x, center.y, 3.5 * *cam_zoom, colors.port_out);
     }
 
+    if let Some(block) = blocks.get(&hover_hex) {
+        if block.kind == BlockType::Mina {
+            let mut highlight = colors.hover;
+            highlight.a = 0.55;
+            for target in mine_targets(hover_hex, block) {
+                let center = ctx.screen_center
+                    + *cam_offset
+                    + hex_to_pixel(target, HEX_SIZE, Vec2::ZERO) * *cam_zoom;
+                draw_hex_outline(
+                    center,
+                    (HEX_SIZE + 2.0) * *cam_zoom,
+                    highlight,
+                    config.line_thickness.max(1.0) * 2.0,
+                );
+            }
+        }
+    }
+
     let hover_center = ctx.screen_center + *cam_offset + hex_to_pixel(hover_hex, HEX_SIZE, Vec2::ZERO) * *cam_zoom;
     if let Some(kind) = *selected {
         let in_bounds = hex_distance(hover_hex, Axial { q: 0, r: 0 }) <= GRID_RADIUS;
@@ -699,6 +736,25 @@ pub fn run(
         }
         if is_mouse_button_released(MouseButton::Left) {
             window.dragging = false;
+        }
+
+        if let Some(target) = window.target {
+            if let Some(block) = blocks.get(&target) {
+                if block.kind == BlockType::Logistica {
+                    let owned_count = units.iter().filter(|u| u.depot == target).count();
+                    let visible_lines = owned_count.min(6) as f32;
+                    let extra = if window.show_units {
+                        let extra_lines = if owned_count > 6 { 1.0 } else { 0.0 };
+                        38.0 + (visible_lines + extra_lines) * 18.0
+                    } else {
+                        0.0
+                    };
+                    window.rect.h = 170.0 + extra;
+                } else {
+                    window.rect.h = window.rect.h.min(170.0);
+                    window.show_units = false;
+                }
+            }
         }
 
         let style = WindowStyle {
@@ -840,6 +896,63 @@ pub fn run(
                                     }
                                 }
                             }
+                            content_y += 34.0;
+
+                            let label = if window.show_units {
+                                "Ocultar lista"
+                            } else {
+                                "Lista unidades"
+                            };
+                            let rect_list = Rect::new(content_x, content_y, 150.0, 26.0);
+                            let (clicked_list, _) = ui_button(
+                                rect_list,
+                                label,
+                                ctx.mouse,
+                                ctx.font_sm,
+                                ctx.button_colors,
+                            );
+                            if clicked_list {
+                                window.show_units = !window.show_units;
+                            }
+                            content_y += 30.0;
+
+                            if window.show_units {
+                                let owned_units: Vec<(usize, &crate::core::Unit)> = units
+                                    .iter()
+                                    .enumerate()
+                                    .filter(|(_, unit)| unit.depot == target)
+                                    .collect();
+                                let total_units = owned_units.len();
+                                draw_text(
+                                    &format!("Unidades: {}", total_units),
+                                    content_x,
+                                    content_y,
+                                    ctx.font_sm,
+                                    colors.text_secondary,
+                                );
+                                content_y += 18.0;
+                                for (index, unit) in owned_units.iter().take(6) {
+                                    let total = storage_total(&unit.cargo);
+                                    let info = format!(
+                                        "#{} carga {}/{}",
+                                        index + 1,
+                                        total,
+                                        unit.capacity
+                                    );
+                                    draw_text(&info, content_x, content_y, ctx.font_sm, colors.text_secondary);
+                                    content_y += 18.0;
+                                }
+                                if total_units > 6 {
+                                    draw_text(
+                                        &format!("+{} mas", total_units - 6),
+                                        content_x,
+                                        content_y,
+                                        ctx.font_sm,
+                                        colors.text_secondary,
+                                    );
+                                    content_y += 18.0;
+                                }
+                            }
                         }
                     }
                     BlockType::Mina => {
@@ -907,6 +1020,85 @@ pub fn run(
                     _ => {}
                 }
             }
+        }
+    }
+
+    if confirm_window.open {
+        let title_rect = window_title_rect(confirm_window);
+        let close_rect = window_close_rect(confirm_window);
+        if is_mouse_button_pressed(MouseButton::Left)
+            && title_rect.contains(ctx.mouse)
+            && !close_rect.contains(ctx.mouse)
+        {
+            confirm_window.dragging = true;
+            confirm_window.drag_offset = ctx.mouse - vec2(confirm_window.rect.x, confirm_window.rect.y);
+        }
+        if confirm_window.dragging && is_mouse_button_down(MouseButton::Left) {
+            let mut x = ctx.mouse.x - confirm_window.drag_offset.x;
+            let mut y = ctx.mouse.y - confirm_window.drag_offset.y;
+            if x + confirm_window.rect.w > screen_width() {
+                x = screen_width() - confirm_window.rect.w;
+            }
+            if y + confirm_window.rect.h > screen_height() {
+                y = screen_height() - confirm_window.rect.h;
+            }
+            if x < 0.0 {
+                x = 0.0;
+            }
+            if y < 0.0 {
+                y = 0.0;
+            }
+            confirm_window.rect.x = x;
+            confirm_window.rect.y = y;
+        }
+        if is_mouse_button_released(MouseButton::Left) {
+            confirm_window.dragging = false;
+        }
+
+        let style = WindowStyle {
+            bg: colors.panel_bg,
+            border: colors.panel_border,
+            title: colors.text_primary,
+            title_bg: colors.button_base,
+        };
+        if draw_window(confirm_window, style, ctx.font_sm, config.line_thickness, ctx.mouse) {
+            confirm_window.open = false;
+            confirm_window.target = None;
+            confirm_window.dragging = false;
+        }
+
+        let content_x = confirm_window.rect.x + 10.0;
+        let mut content_y = confirm_window.rect.y + WINDOW_TITLE_HEIGHT + 20.0;
+        let label = if let Some(target) = confirm_window.target {
+            if let Some(block) = blocks.get(&target) {
+                format!("Deconstruir {}?", block_label(block.kind))
+            } else {
+                "Bloque no encontrado".to_string()
+            }
+        } else {
+            "Bloque no encontrado".to_string()
+        };
+        draw_text(&label, content_x, content_y, ctx.font_sm, colors.text_secondary);
+        content_y += 28.0;
+
+        let rect_cancel = Rect::new(content_x, content_y, 90.0, 26.0);
+        let rect_ok = Rect::new(content_x + 100.0, content_y, 90.0, 26.0);
+        let (clicked_cancel, _) =
+            ui_button(rect_cancel, "Cancelar", ctx.mouse, ctx.font_sm, ctx.button_colors);
+        let (clicked_ok, _) =
+            ui_button(rect_ok, "Eliminar", ctx.mouse, ctx.font_sm, ctx.button_colors);
+        if clicked_cancel {
+            confirm_window.open = false;
+            confirm_window.target = None;
+        }
+        if clicked_ok {
+            if let Some(target) = confirm_window.target {
+                if blocks.remove(&target).is_some() {
+                    *dirty = true;
+                }
+            }
+            confirm_window.open = false;
+            confirm_window.target = None;
         }
     }
 

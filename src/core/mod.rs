@@ -106,7 +106,7 @@ pub struct PlacedBlock {
 }
 
 // Simple unit moving along a hex path.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Unit {
     pub path: Vec<Axial>,
     pub index: usize,
@@ -337,6 +337,8 @@ struct MapData {
     #[serde(default)]
     tiles: Vec<Tile>,
     blocks: Vec<Block>,
+    #[serde(default)]
+    units: Vec<Unit>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -436,7 +438,12 @@ pub fn hex_distance(a: Axial, b: Axial) -> i32 {
 }
 
 // Save blocks/tiles to a map JSON file.
-pub fn save_map(path: &str, blocks: &HashMap<Axial, PlacedBlock>, tiles: &HashMap<Axial, TileData>) {
+pub fn save_map(
+    path: &str,
+    blocks: &HashMap<Axial, PlacedBlock>,
+    tiles: &HashMap<Axial, TileData>,
+    units: &[Unit],
+) {
     let data = MapData {
         tiles: tiles
             .iter()
@@ -461,6 +468,7 @@ pub fn save_map(path: &str, blocks: &HashMap<Axial, PlacedBlock>, tiles: &HashMa
                 mine_extra: placed.mine_extra.clone(),
             })
             .collect(),
+        units: units.to_vec(),
     };
     if let Ok(json) = serde_json::to_string_pretty(&data) {
         let _ = fs::write(path, json);
@@ -485,7 +493,11 @@ pub fn load_config(path: &str) -> ConfigData {
 }
 
 // Load blocks/tiles from map JSON.
-pub fn load_map(path: &str) -> (HashMap<Axial, PlacedBlock>, HashMap<Axial, TileData>) {
+pub fn load_map(path: &str) -> (
+    HashMap<Axial, PlacedBlock>,
+    HashMap<Axial, TileData>,
+    Vec<Unit>,
+) {
     if let Ok(json) = fs::read_to_string(path) {
         if let Ok(data) = serde_json::from_str::<MapData>(&json) {
             let blocks = data
@@ -525,10 +537,10 @@ pub fn load_map(path: &str) -> (HashMap<Axial, PlacedBlock>, HashMap<Axial, Tile
                     )
                 })
                 .collect();
-            return (blocks, tiles);
+            return (blocks, tiles, data.units);
         }
     }
-    (HashMap::new(), HashMap::new())
+    (HashMap::new(), HashMap::new(), Vec::new())
 }
 
 // Resolve block color from runtime palette.

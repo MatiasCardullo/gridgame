@@ -6,6 +6,7 @@ use crate::core::{
 };
 use crate::core::ui::ui_button;
 use crate::GRID_RADIUS;
+use crate::scenes::planet_sector::{outline_start_offset, MapOutline};
 use std::collections::HashMap;
 
 // Render and handle input for the main menu scene.
@@ -50,21 +51,23 @@ pub fn run(
                 *tiles = generate_tiles(GRID_RADIUS, config);
                 *dirty = true;
             }
-            *scene = Scene::Game;
+            *cam_offset = outline_start_offset(MapOutline::Triangle, config.zoom_level);
+            *cam_zoom = config.zoom_level;
+            *scene = Scene::PlanetSector;
         }
         y += btn_h + 12.0;
     }
 
     let rect_new = Rect::new((screen_width() - btn_w) * 0.5, y, btn_w, btn_h);
-    let (clicked_new, _) = ui_button(rect_new, "Nueva Partida", ctx.mouse, ctx.font_md, ctx.button_colors);
+    let (clicked_new, _) = ui_button(rect_new, "Planet Sector", ctx.mouse, ctx.font_md, ctx.button_colors);
     if clicked_new {
         blocks.clear();
         *tiles = generate_tiles(GRID_RADIUS, config);
         units.clear();
-        *cam_offset = Vec2::ZERO;
-        *cam_zoom = 1.0;
+        *cam_offset = outline_start_offset(MapOutline::Triangle, config.zoom_level);
+        *cam_zoom = config.zoom_level;
         *placement_rotation = 0;
-        *scene = Scene::Game;
+        *scene = Scene::PlanetSector;
     }
     y += btn_h + 12.0;
 
@@ -72,6 +75,16 @@ pub fn run(
     let (clicked_cfg, _) = ui_button(rect_cfg, "Configuracion", ctx.mouse, ctx.font_md, ctx.button_colors);
     if clicked_cfg {
         *scene = Scene::Config;
+    }
+    y += btn_h + 12.0;
+
+    let rect_template = Rect::new((screen_width() - btn_w) * 0.5, y, btn_w, btn_h);
+    let (clicked_template, _) =
+        ui_button(rect_template, "Build Template", ctx.mouse, ctx.font_md, ctx.button_colors);
+    if clicked_template {
+        *cam_offset = Vec2::ZERO;
+        *cam_zoom = config.zoom_level;
+        *scene = Scene::BuildTemplate;
     }
 
     let rect_exit = Rect::new((screen_width() - btn_w) * 0.5, y + btn_h + 12.0, btn_w, btn_h);

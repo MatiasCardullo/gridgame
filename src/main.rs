@@ -26,6 +26,7 @@ async fn main() {
     let config_data = load_config(config_path);
     let mut config = config_data.config;
     let mut colors = config_data.colors;
+    cam_zoom = config.zoom_level;
     if !Path::new(config_path).exists() {
         save_config(
             config_path,
@@ -127,8 +128,34 @@ async fn main() {
                     config_path,
                 );
             }
-            Scene::Game => {
-                scenes::game::run(
+            Scene::PlanetSector => {
+                scenes::planet_sector::run(
+                    &ctx,
+                    &mut blocks,
+                    &mut tiles,
+                    &mut cam_offset,
+                    &mut cam_zoom,
+                    &mut dragging,
+                    &mut last_mouse,
+                    &mut selected,
+                    &mut placement_rotation,
+                    &mut panel_collapsed,
+                    &mut block_window,
+                    &mut confirm_window,
+                    &mut units,
+                    &mut station_in,
+                    &mut station_out,
+                    &mut station_pick,
+                    &mut dirty,
+                    &mut scene,
+                    map_path,
+                    &config,
+                    &colors_rt,
+                    scenes::planet_sector::MapOutline::Triangle,
+                );
+            }
+            Scene::BuildTemplate => {
+                scenes::build_template::run(
                     &ctx,
                     &mut blocks,
                     &mut tiles,

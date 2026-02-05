@@ -13,6 +13,39 @@ use crate::core::ui::{
 };
 use crate::{GRID_RADIUS, HEX_SIZE};
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MapOutline {
+    Hexagon,
+    Triangle,
+}
+
+fn in_bounds(hex: Axial, outline: MapOutline) -> bool {
+    match outline {
+        MapOutline::Hexagon => hex_distance(hex, Axial { q: 0, r: 0 }) <= GRID_RADIUS,
+        MapOutline::Triangle => {
+            let q = hex.q;
+            let r = hex.r;
+            q >= 0 && r >= 0 && q + r <= GRID_RADIUS
+        }
+    }
+}
+
+fn outline_centroid(outline: MapOutline) -> Vec2 {
+    match outline {
+        MapOutline::Hexagon => Vec2::ZERO,
+        MapOutline::Triangle => {
+            let a = hex_to_pixel(Axial { q: 0, r: 0 }, HEX_SIZE, Vec2::ZERO);
+            let b = hex_to_pixel(Axial { q: GRID_RADIUS, r: 0 }, HEX_SIZE, Vec2::ZERO);
+            let c = hex_to_pixel(Axial { q: 0, r: GRID_RADIUS }, HEX_SIZE, Vec2::ZERO);
+            (a + b + c) / 3.0
+        }
+    }
+}
+
+pub fn outline_start_offset(outline: MapOutline, zoom: f32) -> Vec2 {
+    -outline_centroid(outline) * zoom
+}
+
 // Friendly label for a block type.
 fn block_label(kind: BlockType) -> &'static str {
     match kind {
@@ -268,6 +301,7 @@ pub fn run(
     map_path: &str,
     config: &AppConfig,
     colors: &RuntimeColors,
+    outline: MapOutline,
 ) {
     let wheel = mouse_wheel().1;
     if wheel.abs() > 0.01 {
@@ -361,7 +395,7 @@ pub fn run(
     }
 
     if is_mouse_button_pressed(MouseButton::Right) && !ui_capturing {
-        if hex_distance(hover_hex, Axial { q: 0, r: 0 }) <= GRID_RADIUS {
+        if in_bounds(hover_hex, outline) {
             if let Some(kind) = *selected {
                 if !blocks.contains_key(&hover_hex) {
                     let can_mine = tiles
@@ -517,7 +551,7 @@ pub fn run(
     for r in -GRID_RADIUS..=GRID_RADIUS {
         for q in -GRID_RADIUS..=GRID_RADIUS {
             let hex = Axial { q, r };
-            if hex_distance(hex, Axial { q: 0, r: 0 }) > GRID_RADIUS {
+            if !in_bounds(hex, outline) {
                 continue;
             }
             let world_center = hex_to_pixel(hex, HEX_SIZE, Vec2::ZERO);
@@ -637,13 +671,13 @@ pub fn run(
 
     let hover_center = ctx.screen_center + *cam_offset + hex_to_pixel(hover_hex, HEX_SIZE, Vec2::ZERO) * *cam_zoom;
     if let Some(kind) = *selected {
-        let in_bounds = hex_distance(hover_hex, Axial { q: 0, r: 0 }) <= GRID_RADIUS;
+        let within_bounds = in_bounds(hover_hex, outline);
         let empty = !blocks.contains_key(&hover_hex);
         let can_mine = tiles
             .get(&hover_hex)
             .map(|t| matches!(t.kind, TileType::Piedra | TileType::Hierro | TileType::Cobre) && t.amount > 0)
             .unwrap_or(false);
-        let can_place = in_bounds && empty && (kind != BlockType::Mina || can_mine);
+        let can_place = within_bounds && empty && (kind != BlockType::Mina || can_mine);
         if can_place {
             let mut ghost = block_color(kind, colors);
             ghost.a = 0.3;
@@ -654,12 +688,14 @@ pub fn run(
             );
         }
     }
-    draw_hex_outline(
-        hover_center,
-        HEX_SIZE * *cam_zoom,
-        colors.hover,
-        config.line_thickness * 2.0,
-    );
+    if in_bounds(hover_hex, outline) {
+        draw_hex_outline(
+            hover_center,
+            HEX_SIZE * *cam_zoom,
+            colors.hover,
+            config.line_thickness * 2.0,
+        );
+    }
 
     draw_text(
         "Click: colocar  |  Rueda: zoom  |  Boton medio: mover  |  R: rotar  |  Esc: menu",

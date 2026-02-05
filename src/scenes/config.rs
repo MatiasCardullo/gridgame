@@ -64,6 +64,17 @@ pub fn run(
     }
     y += row_gap;
 
+    let (dec, inc) = draw_stepper("Zoom inicial", &format!("{:.2}", config.zoom_level), y);
+    if dec {
+        changed = true;
+        config.zoom_level = (config.zoom_level - 0.1).max(0.3);
+    }
+    if inc {
+        changed = true;
+        config.zoom_level = (config.zoom_level + 0.1).min(3.0);
+    }
+    y += row_gap;
+
     let (dec, inc) = draw_stepper("Escala de texto", &format!("{:.2}", config.text_scale), y);
     if dec {
         changed = true;

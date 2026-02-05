@@ -132,7 +132,8 @@ pub enum StationPick {
 pub enum Scene {
     MainMenu,
     Config,
-    Game,
+    PlanetSector,
+    BuildTemplate,
 }
 
 // UI/frame context passed into scenes.
@@ -151,8 +152,10 @@ pub struct FrameContext {
 
 // Config values persisted to config.json.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[serde(default)]
 pub struct AppConfig {
     pub zoom_speed: f32,
+    pub zoom_level: f32,
     pub text_scale: f32,
     pub tile_clusters: usize,
     pub tile_cluster_min: usize,
@@ -171,6 +174,7 @@ impl Default for AppConfig {
     fn default() -> Self {
         Self {
             zoom_speed: 0.1,
+            zoom_level: 1.0,
             text_scale: 1.0,
             tile_clusters: 80,
             tile_cluster_min: 8,
@@ -236,6 +240,7 @@ pub struct RuntimeColors {
 
 // Configurable palette stored in config.json.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[serde(default)]
 pub struct AppColors {
     pub background: ColorRgba,
     pub grid: ColorRgba,

@@ -43,7 +43,7 @@ pub fn run(
     let row_gap = 44.0;
 
     let stepper_text = ctx.colors_rt.text_secondary;
-    let mut draw_stepper = |label: &str, value: &str, y: f32| -> (bool, bool) {
+    let draw_stepper = |label: &str, value: &str, y: f32| -> (bool, bool) {
         draw_text(label, label_x, y, ctx.font_md, stepper_text);
         let rect_dec = Rect::new(btn_x, y - 24.0, btn_w, btn_h);
         let rect_inc = Rect::new(btn_x + btn_w + btn_gap, y - 24.0, btn_w, btn_h);
@@ -169,47 +169,47 @@ pub fn run(
     }
     y += row_gap;
 
-    let (dec, inc) = draw_stepper("Peso piedra", &format!("{:.2}", config.weight_piedra), y);
+    let (dec, inc) = draw_stepper("Peso Stone", &format!("{:.2}", config.weight_Stone), y);
     if dec {
         changed = true;
-        config.weight_piedra = (config.weight_piedra - 0.05).max(0.0);
+        config.weight_Stone = (config.weight_Stone - 0.05).max(0.0);
     }
     if inc {
         changed = true;
-        config.weight_piedra = (config.weight_piedra + 0.05).min(1.0);
+        config.weight_Stone = (config.weight_Stone + 0.05).min(1.0);
     }
     y += row_gap;
 
-    let (dec, inc) = draw_stepper("Peso hierro", &format!("{:.2}", config.weight_hierro), y);
+    let (dec, inc) = draw_stepper("Peso Iron", &format!("{:.2}", config.weight_Iron), y);
     if dec {
         changed = true;
-        config.weight_hierro = (config.weight_hierro - 0.05).max(0.0);
+        config.weight_Iron = (config.weight_Iron - 0.05).max(0.0);
     }
     if inc {
         changed = true;
-        config.weight_hierro = (config.weight_hierro + 0.05).min(1.0);
+        config.weight_Iron = (config.weight_Iron + 0.05).min(1.0);
     }
     y += row_gap;
 
-    let (dec, inc) = draw_stepper("Peso cobre", &format!("{:.2}", config.weight_cobre), y);
+    let (dec, inc) = draw_stepper("Peso Copper", &format!("{:.2}", config.weight_Copper), y);
     if dec {
         changed = true;
-        config.weight_cobre = (config.weight_cobre - 0.05).max(0.0);
+        config.weight_Copper = (config.weight_Copper - 0.05).max(0.0);
     }
     if inc {
         changed = true;
-        config.weight_cobre = (config.weight_cobre + 0.05).min(1.0);
+        config.weight_Copper = (config.weight_Copper + 0.05).min(1.0);
     }
     y += row_gap;
 
-    let (dec, inc) = draw_stepper("Peso agua", &format!("{:.2}", config.weight_agua), y);
+    let (dec, inc) = draw_stepper("Peso Water", &format!("{:.2}", config.weight_Water), y);
     if dec {
         changed = true;
-        config.weight_agua = (config.weight_agua - 0.05).max(0.0);
+        config.weight_Water = (config.weight_Water - 0.05).max(0.0);
     }
     if inc {
         changed = true;
-        config.weight_agua = (config.weight_agua + 0.05).min(1.0);
+        config.weight_Water = (config.weight_Water + 0.05).min(1.0);
     }
     y += row_gap;
 
@@ -299,3 +299,4 @@ pub fn run(
         *scene = Scene::MainMenu;
     }
 }
+

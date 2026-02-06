@@ -16,40 +16,71 @@ pub struct Axial {
     pub r: i32,
 }
 
-// Available building types.
+// Available building types for planet sector.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum BlockType {
-    Vivienda,
-    Fabrica,
-    Mina,
-    Almacen,
-    Logistica,
-    Ruta,
+pub enum BuildBlockType {
+    #[serde(rename = "Housing", alias = "Vivienda")]
+    Housing,
+    #[serde(rename = "Factory", alias = "Fabrica")]
+    Factory,
+    #[serde(rename = "Mine", alias = "Mina")]
+    Mine,
+    #[serde(rename = "Warehouse", alias = "Almacen")]
+    Warehouse,
+    #[serde(rename = "Logistics", alias = "Logistica")]
+    Logistics,
+    #[serde(rename = "Route", alias = "Ruta")]
+    Route,
 }
+
+// Machine building types for the build template scene.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum MachineBlockType {
+    #[serde(rename = "ConveyorBelt", alias = "CintaTransportadora")]
+    ConveyorBelt,
+    #[serde(rename = "Inserter", alias = "Insertador")]
+    Inserter,
+    #[serde(rename = "Chest", alias = "Cofre")]
+    Chest,
+    #[serde(rename = "Assembler", alias = "Ensamblador")]
+    Assembler,
+    #[serde(rename = "Furnace", alias = "Horno")]
+    Furnace,
+}
+
+
 
 // Available terrain/resource types.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum TileType {
-    Piedra,
-    Hierro,
-    Cobre,
-    Agua,
+    #[serde(rename = "Stone", alias = "Piedra")]
+    Stone,
+    #[serde(rename = "Iron", alias = "Hierro")]
+    Iron,
+    #[serde(rename = "Copper", alias = "Cobre")]
+    Copper,
+    #[serde(rename = "Water", alias = "Agua")]
+    Water,
 }
 
 // Item types that can be stored and transported.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ItemType {
-    Piedra,
-    Hierro,
-    Cobre,
-    Agua,
+    #[serde(rename = "Stone", alias = "Piedra")]
+    Stone,
+    #[serde(rename = "Iron", alias = "Hierro")]
+    Iron,
+    #[serde(rename = "Copper", alias = "Cobre")]
+    Copper,
+    #[serde(rename = "Water", alias = "Agua")]
+    Water,
 }
 
 // Persisted block entry for map JSON.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Block {
     pub hex: Axial,
-    pub kind: BlockType,
+    pub kind: BuildBlockType,
     #[serde(default)]
     pub rotation: u8,
     #[serde(default)]
@@ -94,7 +125,7 @@ pub struct ItemStack {
 // In-memory placed block data.
 #[derive(Clone, Debug, PartialEq)]
 pub struct PlacedBlock {
-    pub kind: BlockType,
+    pub kind: BuildBlockType,
     pub rotation: u8,
     pub mine_progress: f32,
     pub capacity: i32,
@@ -103,6 +134,13 @@ pub struct PlacedBlock {
     pub build_time: f32,
     pub build_paid: bool,
     pub mine_extra: Vec<Axial>,
+}
+
+// Template block for the build template scene (factory/production building).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct MachineBlock {
+    pub kind: MachineBlockType,
+    pub rotation: u8,
 }
 
 // Simple unit moving along a hex path.
@@ -162,10 +200,10 @@ pub struct AppConfig {
     pub tile_cluster_max: usize,
     pub tile_neighbor_chance: f32,
     pub tile_center_bonus: f32,
-    pub weight_piedra: f32,
-    pub weight_hierro: f32,
-    pub weight_cobre: f32,
-    pub weight_agua: f32,
+    pub weight_Stone: f32,
+    pub weight_Iron: f32,
+    pub weight_Copper: f32,
+    pub weight_Water: f32,
     pub line_thickness: f32,
     pub arrow_scale: f32,
 }
@@ -181,10 +219,10 @@ impl Default for AppConfig {
             tile_cluster_max: 20,
             tile_neighbor_chance: 0.45,
             tile_center_bonus: 0.35,
-            weight_piedra: 0.35,
-            weight_hierro: 0.2,
-            weight_cobre: 0.2,
-            weight_agua: 0.25,
+            weight_Stone: 0.35,
+            weight_Iron: 0.2,
+            weight_Copper: 0.2,
+            weight_Water: 0.25,
             line_thickness: 1.0,
             arrow_scale: 1.0,
         }
@@ -226,16 +264,16 @@ pub struct RuntimeColors {
     pub route_line: Color,
     pub port_in: Color,
     pub port_out: Color,
-    pub block_vivienda: Color,
-    pub block_fabrica: Color,
-    pub block_mina: Color,
-    pub block_almacen: Color,
-    pub block_logistica: Color,
-    pub block_ruta: Color,
-    pub tile_piedra: Color,
-    pub tile_hierro: Color,
-    pub tile_cobre: Color,
-    pub tile_agua: Color,
+    pub block_Housing: Color,
+    pub block_Factory: Color,
+    pub block_Mine: Color,
+    pub block_Warehouse: Color,
+    pub block_Logistics: Color,
+    pub block_Route: Color,
+    pub tile_Stone: Color,
+    pub tile_Iron: Color,
+    pub tile_Copper: Color,
+    pub tile_Water: Color,
 }
 
 // Configurable palette stored in config.json.
@@ -258,16 +296,16 @@ pub struct AppColors {
     pub route_line: ColorRgba,
     pub port_in: ColorRgba,
     pub port_out: ColorRgba,
-    pub block_vivienda: ColorRgba,
-    pub block_fabrica: ColorRgba,
-    pub block_mina: ColorRgba,
-    pub block_almacen: ColorRgba,
-    pub block_logistica: ColorRgba,
-    pub block_ruta: ColorRgba,
-    pub tile_piedra: ColorRgba,
-    pub tile_hierro: ColorRgba,
-    pub tile_cobre: ColorRgba,
-    pub tile_agua: ColorRgba,
+    pub block_Housing: ColorRgba,
+    pub block_Factory: ColorRgba,
+    pub block_Mine: ColorRgba,
+    pub block_Warehouse: ColorRgba,
+    pub block_Logistics: ColorRgba,
+    pub block_Route: ColorRgba,
+    pub tile_Stone: ColorRgba,
+    pub tile_Iron: ColorRgba,
+    pub tile_Copper: ColorRgba,
+    pub tile_Water: ColorRgba,
 }
 
 impl Default for AppColors {
@@ -289,16 +327,16 @@ impl Default for AppColors {
             route_line: ColorRgba { r: 120, g: 140, b: 160, a: 200 },
             port_in: ColorRgba { r: 80, g: 160, b: 220, a: 255 },
             port_out: ColorRgba { r: 220, g: 170, b: 90, a: 255 },
-            block_vivienda: ColorRgba { r: 120, g: 200, b: 120, a: 255 },
-            block_fabrica: ColorRgba { r: 220, g: 140, b: 80, a: 255 },
-            block_mina: ColorRgba { r: 110, g: 150, b: 200, a: 255 },
-            block_almacen: ColorRgba { r: 210, g: 190, b: 90, a: 255 },
-            block_logistica: ColorRgba { r: 120, g: 140, b: 160, a: 255 },
-            block_ruta: ColorRgba { r: 90, g: 100, b: 115, a: 255 },
-            tile_piedra: ColorRgba { r: 110, g: 110, b: 120, a: 255 },
-            tile_hierro: ColorRgba { r: 120, g: 95, b: 85, a: 255 },
-            tile_cobre: ColorRgba { r: 150, g: 95, b: 70, a: 255 },
-            tile_agua: ColorRgba { r: 60, g: 110, b: 160, a: 255 },
+            block_Housing: ColorRgba { r: 120, g: 200, b: 120, a: 255 },
+            block_Factory: ColorRgba { r: 220, g: 140, b: 80, a: 255 },
+            block_Mine: ColorRgba { r: 110, g: 150, b: 200, a: 255 },
+            block_Warehouse: ColorRgba { r: 210, g: 190, b: 90, a: 255 },
+            block_Logistics: ColorRgba { r: 120, g: 140, b: 160, a: 255 },
+            block_Route: ColorRgba { r: 90, g: 100, b: 115, a: 255 },
+            tile_Stone: ColorRgba { r: 110, g: 110, b: 120, a: 255 },
+            tile_Iron: ColorRgba { r: 120, g: 95, b: 85, a: 255 },
+            tile_Copper: ColorRgba { r: 150, g: 95, b: 70, a: 255 },
+            tile_Water: ColorRgba { r: 60, g: 110, b: 160, a: 255 },
         }
     }
 }
@@ -323,16 +361,16 @@ impl AppColors {
             route_line: self.route_line.to_color(),
             port_in: self.port_in.to_color(),
             port_out: self.port_out.to_color(),
-            block_vivienda: self.block_vivienda.to_color(),
-            block_fabrica: self.block_fabrica.to_color(),
-            block_mina: self.block_mina.to_color(),
-            block_almacen: self.block_almacen.to_color(),
-            block_logistica: self.block_logistica.to_color(),
-            block_ruta: self.block_ruta.to_color(),
-            tile_piedra: self.tile_piedra.to_color(),
-            tile_hierro: self.tile_hierro.to_color(),
-            tile_cobre: self.tile_cobre.to_color(),
-            tile_agua: self.tile_agua.to_color(),
+            block_Housing: self.block_Housing.to_color(),
+            block_Factory: self.block_Factory.to_color(),
+            block_Mine: self.block_Mine.to_color(),
+            block_Warehouse: self.block_Warehouse.to_color(),
+            block_Logistics: self.block_Logistics.to_color(),
+            block_Route: self.block_Route.to_color(),
+            tile_Stone: self.tile_Stone.to_color(),
+            tile_Iron: self.tile_Iron.to_color(),
+            tile_Copper: self.tile_Copper.to_color(),
+            tile_Water: self.tile_Water.to_color(),
         }
     }
 }
@@ -549,36 +587,36 @@ pub fn load_map(path: &str) -> (
 }
 
 // Resolve block color from runtime palette.
-pub fn block_color(kind: BlockType, colors: &RuntimeColors) -> Color {
+pub fn block_color(kind: BuildBlockType, colors: &RuntimeColors) -> Color {
     match kind {
-        BlockType::Vivienda => colors.block_vivienda,
-        BlockType::Fabrica => colors.block_fabrica,
-        BlockType::Mina => colors.block_mina,
-        BlockType::Almacen => colors.block_almacen,
-        BlockType::Logistica => colors.block_logistica,
-        BlockType::Ruta => colors.block_ruta,
+        BuildBlockType::Housing => colors.block_Housing,
+        BuildBlockType::Factory => colors.block_Factory,
+        BuildBlockType::Mine => colors.block_Mine,
+        BuildBlockType::Warehouse => colors.block_Warehouse,
+        BuildBlockType::Logistics => colors.block_Logistics,
+        BuildBlockType::Route => colors.block_Route,
     }
 }
 
 // Resolve tile color from runtime palette.
 pub fn tile_color(kind: TileType, colors: &RuntimeColors) -> Color {
     match kind {
-        TileType::Piedra => colors.tile_piedra,
-        TileType::Hierro => colors.tile_hierro,
-        TileType::Cobre => colors.tile_cobre,
-        TileType::Agua => colors.tile_agua,
+        TileType::Stone => colors.tile_Stone,
+        TileType::Iron => colors.tile_Iron,
+        TileType::Copper => colors.tile_Copper,
+        TileType::Water => colors.tile_Water,
     }
 }
 
 // Default storage capacities.
-pub const DEFAULT_ALMACEN_CAPACITY: i32 = 200;
+pub const DEFAULT_Warehouse_CAPACITY: i32 = 200;
 pub const DEFAULT_MINE_CAPACITY: i32 = 50;
 
 // Default capacity by block type.
-pub fn default_capacity(kind: BlockType) -> i32 {
+pub fn default_capacity(kind: BuildBlockType) -> i32 {
     match kind {
-        BlockType::Almacen => DEFAULT_ALMACEN_CAPACITY,
-        BlockType::Mina => DEFAULT_MINE_CAPACITY,
+        BuildBlockType::Warehouse => DEFAULT_Warehouse_CAPACITY,
+        BuildBlockType::Mine => DEFAULT_MINE_CAPACITY,
         _ => 0,
     }
 }
@@ -586,71 +624,71 @@ pub fn default_capacity(kind: BlockType) -> i32 {
 // Convert a tile kind to an item kind.
 pub fn item_from_tile(kind: TileType) -> ItemType {
     match kind {
-        TileType::Piedra => ItemType::Piedra,
-        TileType::Hierro => ItemType::Hierro,
-        TileType::Cobre => ItemType::Cobre,
-        TileType::Agua => ItemType::Agua,
+        TileType::Stone => ItemType::Stone,
+        TileType::Iron => ItemType::Iron,
+        TileType::Copper => ItemType::Copper,
+        TileType::Water => ItemType::Water,
     }
 }
 
 // Build time (seconds) per block type.
-pub fn build_time(kind: BlockType) -> f32 {
+pub fn build_time(kind: BuildBlockType) -> f32 {
     match kind {
-        BlockType::Vivienda => 6.0,
-        BlockType::Fabrica => 9.0,
-        BlockType::Mina => 0.0,
-        BlockType::Almacen => 7.0,
-        BlockType::Logistica => 8.0,
-        BlockType::Ruta => 2.0,
+        BuildBlockType::Housing => 6.0,
+        BuildBlockType::Factory => 9.0,
+        BuildBlockType::Mine => 0.0,
+        BuildBlockType::Warehouse => 7.0,
+        BuildBlockType::Logistics => 8.0,
+        BuildBlockType::Route => 2.0,
     }
 }
 
 // Build requirements per block type.
-pub fn build_requirements(kind: BlockType) -> Vec<ItemStack> {
+pub fn build_requirements(kind: BuildBlockType) -> Vec<ItemStack> {
     match kind {
-        BlockType::Vivienda => vec![
+        BuildBlockType::Housing => vec![
             ItemStack {
-                kind: ItemType::Piedra,
+                kind: ItemType::Stone,
                 amount: 10,
             },
             ItemStack {
-                kind: ItemType::Cobre,
+                kind: ItemType::Copper,
                 amount: 4,
             },
         ],
-        BlockType::Fabrica => vec![
+        BuildBlockType::Factory => vec![
             ItemStack {
-                kind: ItemType::Hierro,
+                kind: ItemType::Iron,
                 amount: 12,
             },
             ItemStack {
-                kind: ItemType::Cobre,
+                kind: ItemType::Copper,
                 amount: 8,
             },
         ],
-        BlockType::Mina => vec![],
-        BlockType::Almacen => vec![
+        BuildBlockType::Mine => vec![],
+        BuildBlockType::Warehouse => vec![
             ItemStack {
-                kind: ItemType::Piedra,
+                kind: ItemType::Stone,
                 amount: 12,
             },
             ItemStack {
-                kind: ItemType::Hierro,
+                kind: ItemType::Iron,
                 amount: 6,
             },
         ],
-        BlockType::Logistica => vec![
+        BuildBlockType::Logistics => vec![
             ItemStack {
-                kind: ItemType::Hierro,
+                kind: ItemType::Iron,
                 amount: 10,
             },
             ItemStack {
-                kind: ItemType::Cobre,
+                kind: ItemType::Copper,
                 amount: 6,
             },
         ],
-        BlockType::Ruta => vec![ItemStack {
-            kind: ItemType::Piedra,
+        BuildBlockType::Route => vec![ItemStack {
+            kind: ItemType::Stone,
             amount: 3,
         }],
     }
@@ -664,23 +702,23 @@ pub fn is_under_construction(block: &PlacedBlock) -> bool {
 // Pick a tile type using weighted probabilities and center bias.
 pub fn tile_kind_weighted(dist: i32, radius: i32, config: &AppConfig) -> TileType {
     let center_bias = 1.0 - (dist as f32 / radius as f32).clamp(0.0, 1.0);
-    let mut w_p = config.weight_piedra.max(0.0);
-    let mut w_h = config.weight_hierro.max(0.0);
-    let mut w_c = config.weight_cobre.max(0.0);
-    let mut w_a = config.weight_agua.max(0.0);
+    let w_p = config.weight_Stone.max(0.0);
+    let mut w_h = config.weight_Iron.max(0.0);
+    let mut w_c = config.weight_Copper.max(0.0);
+    let w_a = config.weight_Water.max(0.0);
     let bonus = center_bias * config.tile_center_bonus.max(0.0);
     w_h += bonus * 0.6;
     w_c += bonus * 0.4;
     let total = (w_p + w_h + w_c + w_a).max(0.001);
     let roll = rand::gen_range(0.0, total);
     if roll < w_h {
-        TileType::Hierro
+        TileType::Iron
     } else if roll < w_h + w_c {
-        TileType::Cobre
+        TileType::Copper
     } else if roll < w_h + w_c + w_p {
-        TileType::Piedra
+        TileType::Stone
     } else {
-        TileType::Agua
+        TileType::Water
     }
 }
 
@@ -688,14 +726,14 @@ pub fn tile_kind_weighted(dist: i32, radius: i32, config: &AppConfig) -> TileTyp
 pub fn tile_amount(kind: TileType, dist: i32, radius: i32) -> i32 {
     let center_bias = 1.0 - (dist as f32 / radius as f32).clamp(0.0, 1.0);
     let (min_base, max_base) = match kind {
-        TileType::Piedra => (80, 160),
-        TileType::Hierro => (70, 140),
-        TileType::Cobre => (60, 120),
-        TileType::Agua => (100, 200),
+        TileType::Stone => (80, 160),
+        TileType::Iron => (70, 140),
+        TileType::Copper => (60, 120),
+        TileType::Water => (100, 200),
     };
     let span = (max_base - min_base) as f32;
     let bonus = (span * 0.6 * center_bias) as i32;
-    min_base + rand::gen_range(0, (span as i32 + 1)) + bonus
+    min_base + rand::gen_range(0, span as i32 + 1) + bonus
 }
 
 // Generate clustered tiles with a center-weighted distribution.
@@ -766,7 +804,7 @@ pub fn add_item(
     if amount <= 0 {
         return 0;
     }
-    let mut current_total = stored.iter().map(|s| s.amount).sum::<i32>();
+    let current_total = stored.iter().map(|s| s.amount).sum::<i32>();
     let limit = if capacity <= 0 { i32::MAX } else { capacity };
     let available = (limit - current_total).max(0);
     let add_amount = amount.min(available);
@@ -781,12 +819,11 @@ pub fn add_item(
             amount: add_amount,
         });
     }
-    current_total += add_amount;
     add_amount
 }
 
 // Create a placed block with default storage settings.
-pub fn new_placed_block(kind: BlockType, rotation: u8) -> PlacedBlock {
+pub fn new_placed_block(kind: BuildBlockType, rotation: u8) -> PlacedBlock {
     PlacedBlock {
         kind,
         rotation,
@@ -806,14 +843,14 @@ pub fn rotate_dir(dir: i32, rotation: u8) -> i32 {
 }
 
 // Return input/output port directions for a block.
-pub fn block_ports(kind: BlockType, rotation: u8) -> (Vec<i32>, Vec<i32>) {
+pub fn block_ports(kind: BuildBlockType, rotation: u8) -> (Vec<i32>, Vec<i32>) {
     let (inputs, outputs) = match kind {
-        BlockType::Vivienda => (vec![0, 2, 4], vec![1, 3, 5]),
-        BlockType::Fabrica => (vec![0, 1, 2], vec![3, 4, 5]),
-        BlockType::Mina => (vec![], vec![0, 1, 2, 3, 4, 5]),
-        BlockType::Almacen => (vec![0, 3], vec![0, 3]),
-        BlockType::Logistica => (vec![0, 3], vec![0, 3]),
-        BlockType::Ruta => (vec![], vec![]),
+        BuildBlockType::Housing => (vec![0, 2, 4], vec![1, 3, 5]),
+        BuildBlockType::Factory => (vec![0, 1, 2], vec![3, 4, 5]),
+        BuildBlockType::Mine => (vec![], vec![0, 1, 2, 3, 4, 5]),
+        BuildBlockType::Warehouse => (vec![0, 3], vec![0, 3]),
+        BuildBlockType::Logistics => (vec![0, 3], vec![0, 3]),
+        BuildBlockType::Route => (vec![], vec![]),
     };
     let inputs = inputs
         .into_iter()
@@ -863,3 +900,4 @@ pub fn axial_neighbors(hex: Axial) -> [Axial; 6] {
         Axial { q: hex.q + dirs[5].q, r: hex.r + dirs[5].r },
     ]
 }
+

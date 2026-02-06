@@ -8,6 +8,11 @@ Juego de estrategia en grilla hexagonal hecho con Rust y Macroquad. Permite cons
 **Ejecutar**
 1. `cargo run`
 
+**Desarrollo**
+1. `cargo check` para validar tipos rapido.
+2. `cargo build` para compilar en modo debug.
+3. `cargo test` para ejecutar pruebas.
+
 **Controles**
 1. Click izquierdo: abrir ventana de un bloque.
 2. Click derecho: colocar bloque o iniciar deconstruccion (si esta seleccionado "Deconstruir").

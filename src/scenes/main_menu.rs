@@ -1,12 +1,12 @@
 use macroquad::prelude::*;
 
 use crate::core::{
-    generate_tiles, load_map, save_map, AppConfig, Axial, FrameContext, PlacedBlock, Scene,
+    generate_tiles, load_map, save_map, AppConfig, Axial, FrameContext, PlacedBlock, MachineBlock, Scene,
     TileData, Unit,
 };
 use crate::core::ui::ui_button;
 use crate::GRID_RADIUS;
-use crate::scenes::planet_sector::{outline_start_offset, MapOutline};
+use crate::scenes::map_common::{outline_start_offset, MapOutline};
 use std::collections::HashMap;
 
 // Render and handle input for the main menu scene.
@@ -15,6 +15,7 @@ pub fn run(
     blocks: &mut HashMap<Axial, PlacedBlock>,
     tiles: &mut HashMap<Axial, TileData>,
     units: &mut Vec<Unit>,
+    template_blocks: &mut HashMap<Axial, MachineBlock>,
     cam_offset: &mut Vec2,
     cam_zoom: &mut f32,
     placement_rotation: &mut u8,
@@ -84,6 +85,7 @@ pub fn run(
     if clicked_template {
         *cam_offset = Vec2::ZERO;
         *cam_zoom = config.zoom_level;
+        template_blocks.clear();
         *scene = Scene::BuildTemplate;
     }
 
@@ -98,3 +100,4 @@ pub fn run(
 
     false
 }
+

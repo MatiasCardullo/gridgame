@@ -6,7 +6,7 @@ use macroquad::prelude::*;
 mod scenes;
 mod core;
 use core::{
-    load_config, save_config, Axial, BlockType, ConfigData, FrameContext, PlacedBlock, Scene,
+    load_config, save_config, Axial, BuildBlockType, MachineBlock, MachineBlockType, ConfigData, FrameContext, PlacedBlock, Scene,
     StationPick, TileData, Unit,
 };
 use core::ui::{UiButtonColors, WindowState};
@@ -21,7 +21,7 @@ async fn main() {
     let mut blocks: HashMap<Axial, PlacedBlock> = HashMap::new();
     let mut tiles: HashMap<Axial, TileData> = HashMap::new();
     let mut cam_offset = Vec2::ZERO;
-    let mut cam_zoom: f32 = 1.0;
+    let mut cam_zoom: f32;
     let config_path = "config.json";
     let config_data = load_config(config_path);
     let mut config = config_data.config;
@@ -40,7 +40,10 @@ async fn main() {
     let mut dragging = false;
     let mut last_mouse = Vec2::ZERO;
     let map_path = "map.json";
-    let mut selected: Option<BlockType> = Some(BlockType::Vivienda);
+    let _template_path = "template.json";
+    let mut selected: Option<BuildBlockType> = Some(BuildBlockType::Housing);
+    let mut template_blocks: HashMap<Axial, MachineBlock> = HashMap::new();
+    let mut template_selected: Option<MachineBlockType> = Some(MachineBlockType::ConveyorBelt);
     let mut placement_rotation: u8 = 0;
     let mut panel_collapsed = false;
     let mut block_window = WindowState {
@@ -105,6 +108,7 @@ async fn main() {
                     &mut blocks,
                     &mut tiles,
                     &mut units,
+                    &mut template_blocks,
                     &mut cam_offset,
                     &mut cam_zoom,
                     &mut placement_rotation,
@@ -151,32 +155,25 @@ async fn main() {
                     map_path,
                     &config,
                     &colors_rt,
-                    scenes::planet_sector::MapOutline::Triangle,
+                    scenes::map_common::MapOutline::Triangle,
                 );
             }
             Scene::BuildTemplate => {
                 scenes::build_template::run(
                     &ctx,
-                    &mut blocks,
-                    &mut tiles,
                     &mut cam_offset,
                     &mut cam_zoom,
                     &mut dragging,
                     &mut last_mouse,
-                    &mut selected,
+                    &mut template_selected,
                     &mut placement_rotation,
                     &mut panel_collapsed,
                     &mut block_window,
                     &mut confirm_window,
-                    &mut units,
-                    &mut station_in,
-                    &mut station_out,
-                    &mut station_pick,
-                    &mut dirty,
                     &mut scene,
-                    map_path,
                     &config,
                     &colors_rt,
+                    &mut template_blocks,
                 );
             }
         }
@@ -184,3 +181,4 @@ async fn main() {
         next_frame().await;
     }
 }
+

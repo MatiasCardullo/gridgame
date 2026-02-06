@@ -3,78 +3,58 @@ use std::collections::HashMap;
 
 use crate::core::{
     axial_neighbors, block_color, block_ports, draw_hex_filled, draw_hex_outline, draw_port_marker,
-    hex_distance, hex_to_pixel, pixel_to_hex, save_map, tile_color,
+    hex_to_pixel, save_map, tile_color,
     add_item, build_requirements, is_under_construction, item_from_tile, new_placed_block, AppConfig, Axial,
-    BlockType, FrameContext, ItemType, PlacedBlock, RuntimeColors, Scene, TileData, TileType,
+    BuildBlockType, FrameContext, ItemType, PlacedBlock, RuntimeColors, Scene, TileData, TileType,
 };
-use crate::core::ui::{
-    draw_window, ui_button, window_close_rect, window_title_rect, WindowState, WindowStyle,
-    WINDOW_TITLE_HEIGHT,
-};
+use crate::core::ui::{ui_button, WindowState, WINDOW_TITLE_HEIGHT};
 use crate::{GRID_RADIUS, HEX_SIZE};
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum MapOutline {
-    Hexagon,
-    Triangle,
-}
-
-fn in_bounds(hex: Axial, outline: MapOutline) -> bool {
-    match outline {
-        MapOutline::Hexagon => hex_distance(hex, Axial { q: 0, r: 0 }) <= GRID_RADIUS,
-        MapOutline::Triangle => {
-            let q = hex.q;
-            let r = hex.r;
-            q >= 0 && r >= 0 && q + r <= GRID_RADIUS
-        }
-    }
-}
-
-fn outline_centroid(outline: MapOutline) -> Vec2 {
-    match outline {
-        MapOutline::Hexagon => Vec2::ZERO,
-        MapOutline::Triangle => {
-            let a = hex_to_pixel(Axial { q: 0, r: 0 }, HEX_SIZE, Vec2::ZERO);
-            let b = hex_to_pixel(Axial { q: GRID_RADIUS, r: 0 }, HEX_SIZE, Vec2::ZERO);
-            let c = hex_to_pixel(Axial { q: 0, r: GRID_RADIUS }, HEX_SIZE, Vec2::ZERO);
-            (a + b + c) / 3.0
-        }
-    }
-}
-
-pub fn outline_start_offset(outline: MapOutline, zoom: f32) -> Vec2 {
-    -outline_centroid(outline) * zoom
-}
+use crate::scenes::map_common::{
+    build_panel_layout,
+    confirm_label_for_target,
+    draw_window_frame,
+    is_ui_capturing,
+    popup_rect_near_mouse,
+    run_confirm_window,
+    ConfirmAction,
+    MapOutline,
+    draw_common_hud,
+    handle_camera_drag,
+    handle_cursor_zoom,
+    hex_screen_center,
+    hover_hex_from_mouse,
+    in_bounds,
+};
 
 // Friendly label for a block type.
-fn block_label(kind: BlockType) -> &'static str {
+fn block_label(kind: BuildBlockType) -> &'static str {
     match kind {
-        BlockType::Vivienda => "Vivienda",
-        BlockType::Fabrica => "Fabrica",
-        BlockType::Mina => "Mina",
-        BlockType::Almacen => "Almacen",
-        BlockType::Logistica => "Logistica",
-        BlockType::Ruta => "Ruta",
+        BuildBlockType::Housing => "Housing",
+        BuildBlockType::Factory => "Factory",
+        BuildBlockType::Mine => "Mine",
+        BuildBlockType::Warehouse => "Warehouse",
+        BuildBlockType::Logistics => "Logistics",
+        BuildBlockType::Route => "Route",
     }
 }
 
 // Friendly label for an item type.
 fn item_label(kind: ItemType) -> &'static str {
     match kind {
-        ItemType::Piedra => "Piedra",
-        ItemType::Hierro => "Hierro",
-        ItemType::Cobre => "Cobre",
-        ItemType::Agua => "Agua",
+        ItemType::Stone => "Stone",
+        ItemType::Iron => "Iron",
+        ItemType::Copper => "Copper",
+        ItemType::Water => "Water",
     }
 }
 
 // Friendly label for a tile kind.
 fn tile_label(kind: TileType) -> &'static str {
     match kind {
-        TileType::Piedra => "Piedra",
-        TileType::Hierro => "Hierro",
-        TileType::Cobre => "Cobre",
-        TileType::Agua => "Agua",
+        TileType::Stone => "Stone",
+        TileType::Iron => "Iron",
+        TileType::Copper => "Copper",
+        TileType::Water => "Water",
     }
 }
 
@@ -255,7 +235,7 @@ fn find_route_path(start: Axial, end: Axial, blocks: &HashMap<Axial, PlacedBlock
             let passable = neighbor == end
                 || blocks
                     .get(&neighbor)
-                    .map(|b| b.kind == BlockType::Ruta && !is_under_construction(b))
+                    .map(|b| b.kind == BuildBlockType::Route && !is_under_construction(b))
                     .unwrap_or(false);
             if !passable {
                 continue;
@@ -287,7 +267,7 @@ pub fn run(
     cam_zoom: &mut f32,
     dragging: &mut bool,
     last_mouse: &mut Vec2,
-    selected: &mut Option<BlockType>,
+    selected: &mut Option<BuildBlockType>,
     placement_rotation: &mut u8,
     panel_collapsed: &mut bool,
     window: &mut WindowState,
@@ -303,66 +283,28 @@ pub fn run(
     colors: &RuntimeColors,
     outline: MapOutline,
 ) {
-    let wheel = mouse_wheel().1;
-    if wheel.abs() > 0.01 {
-        let factor = 1.0 + wheel * config.zoom_speed;
-        *cam_zoom = (*cam_zoom * factor).clamp(0.3, 3.0);
-    }
+    handle_cursor_zoom(ctx, cam_offset, cam_zoom, config.zoom_speed);
+    handle_camera_drag(ctx, cam_offset, dragging, last_mouse);
 
-    if is_mouse_button_pressed(MouseButton::Middle) {
-        *dragging = true;
-        *last_mouse = ctx.mouse;
-    }
-    if is_mouse_button_down(MouseButton::Middle) && *dragging {
-        let delta = ctx.mouse - *last_mouse;
-        *cam_offset += delta;
-        *last_mouse = ctx.mouse;
-    }
-    if is_mouse_button_released(MouseButton::Middle) {
-        *dragging = false;
-    }
+    let hover_hex = hover_hex_from_mouse(ctx, *cam_offset, *cam_zoom);
 
-    let world_mouse = (ctx.mouse - ctx.screen_center - *cam_offset) / *cam_zoom;
-    let hover_hex = pixel_to_hex(world_mouse, HEX_SIZE, Vec2::ZERO);
-
-    let buttons: [(Option<BlockType>, &str); 7] = [
-        (None, "Deconstruir"),
-        (Some(BlockType::Vivienda), "Vivienda"),
-        (Some(BlockType::Fabrica), "Fabrica"),
-        (Some(BlockType::Mina), "Minas"),
-        (Some(BlockType::Almacen), "Almacen"),
-        (Some(BlockType::Logistica), "Logistica"),
-        (Some(BlockType::Ruta), "Ruta"),
+    let buttons: [(Option<BuildBlockType>, &str); 7] = [
+        (None, "Demolish"),
+        (Some(BuildBlockType::Housing), "Housing"),
+        (Some(BuildBlockType::Factory), "Factory"),
+        (Some(BuildBlockType::Mine), "Mines"),
+        (Some(BuildBlockType::Warehouse), "Warehouse"),
+        (Some(BuildBlockType::Logistics), "Logistics"),
+        (Some(BuildBlockType::Route), "Route"),
     ];
 
-    let button_size = 52.0;
-    let gap = 8.0;
-    let panel_pad_x = 12.0;
-    let panel_pad_y = 16.0;
-    let toggle_space = 36.0;
-    let button_count = buttons.len() as f32;
-    let panel_width = panel_pad_x * 2.0
-        + (button_size * button_count)
-        + (gap * (button_count - 1.0))
-        + toggle_space;
-    let panel_height = panel_pad_y * 2.0 + button_size;
-    let panel_size = if *panel_collapsed {
-        vec2(170.0, 36.0)
-    } else {
-        vec2(panel_width, panel_height)
-    };
-    let panel_pos = vec2(16.0, screen_height() - panel_size.y - 16.0);
-    let panel_rect = Rect::new(panel_pos.x, panel_pos.y, panel_size.x, panel_size.y);
+    let panel_layout = build_panel_layout(buttons.len(), *panel_collapsed);
+    let panel_pos = panel_layout.pos;
+    let panel_size = panel_layout.size;
+    let panel_rect = panel_layout.rect;
 
     let mut tooltip: Option<&str> = None;
-    let mut ui_capturing = panel_rect.contains(ctx.mouse);
-
-    if window.open && (window.rect.contains(ctx.mouse) || window.dragging) {
-        ui_capturing = true;
-    }
-    if confirm_window.open && (confirm_window.rect.contains(ctx.mouse) || confirm_window.dragging) {
-        ui_capturing = true;
-    }
+    let ui_capturing = is_ui_capturing(panel_rect, window, confirm_window, ctx.mouse);
 
     if is_mouse_button_pressed(MouseButton::Left) && !ui_capturing {
         if let Some(pick) = *station_pick {
@@ -378,16 +320,9 @@ pub fn run(
         } else if let Some(existing) = blocks.get(&hover_hex) {
             let win_w = 220.0;
             let win_h = 170.0;
-            let mut x = ctx.mouse.x + 12.0;
-            let mut y = ctx.mouse.y + 12.0;
-            if x + win_w > screen_width() {
-                x = screen_width() - win_w - 8.0;
-            }
-            if y + win_h > screen_height() {
-                y = screen_height() - win_h - 8.0;
-            }
+            let rect = popup_rect_near_mouse(ctx.mouse, win_w, win_h);
             window.title = block_label(existing.kind).to_string();
-            window.rect = Rect::new(x.max(8.0), y.max(8.0), win_w, win_h);
+            window.rect = rect;
             window.open = true;
             window.target = Some(hover_hex);
             window.show_units = false;
@@ -400,10 +335,10 @@ pub fn run(
                 if !blocks.contains_key(&hover_hex) {
                     let can_mine = tiles
                         .get(&hover_hex)
-                        .map(|t| matches!(t.kind, TileType::Piedra | TileType::Hierro | TileType::Cobre) && t.amount > 0)
+                        .map(|t| matches!(t.kind, TileType::Stone | TileType::Iron | TileType::Copper) && t.amount > 0)
                         .unwrap_or(false);
-                    if kind != BlockType::Mina || can_mine {
-                        let rotation = if kind == BlockType::Ruta { 0 } else { *placement_rotation };
+                    if kind != BuildBlockType::Mine || can_mine {
+                        let rotation = if kind == BuildBlockType::Route { 0 } else { *placement_rotation };
                         blocks.insert(hover_hex, new_placed_block(kind, rotation));
                         *dirty = true;
                     }
@@ -411,16 +346,9 @@ pub fn run(
             } else if blocks.contains_key(&hover_hex) {
                 let win_w = 240.0;
                 let win_h = 120.0;
-                let mut x = ctx.mouse.x + 12.0;
-                let mut y = ctx.mouse.y + 12.0;
-                if x + win_w > screen_width() {
-                    x = screen_width() - win_w - 8.0;
-                }
-                if y + win_h > screen_height() {
-                    y = screen_height() - win_h - 8.0;
-                }
-                confirm_window.title = "Confirmar".to_string();
-                confirm_window.rect = Rect::new(x.max(8.0), y.max(8.0), win_w, win_h);
+                let rect = popup_rect_near_mouse(ctx.mouse, win_w, win_h);
+                confirm_window.title = "Confirm".to_string();
+                confirm_window.rect = rect;
                 confirm_window.open = true;
                 confirm_window.target = Some(hover_hex);
                 confirm_window.dragging = false;
@@ -440,7 +368,7 @@ pub fn run(
 
     if is_key_pressed(KeyCode::R) {
         if let Some(block) = blocks.get_mut(&hover_hex) {
-            if block.kind != BlockType::Ruta {
+            if block.kind != BuildBlockType::Route {
                 block.rotation = (block.rotation + 1) % 6;
                 *dirty = true;
             }
@@ -479,7 +407,7 @@ pub fn run(
         }
     }
     for (hex, block) in blocks.iter_mut() {
-        if block.kind != BlockType::Mina || is_under_construction(block) {
+        if block.kind != BuildBlockType::Mine || is_under_construction(block) {
             continue;
         }
         let targets = mine_targets(*hex, block);
@@ -606,7 +534,7 @@ pub fn run(
     }
 
     for (hex, placed) in blocks.iter() {
-        if placed.kind != BlockType::Ruta || is_under_construction(placed) {
+        if placed.kind != BuildBlockType::Route || is_under_construction(placed) {
             continue;
         }
         let base_center = ctx.screen_center + *cam_offset + hex_to_pixel(*hex, HEX_SIZE, Vec2::ZERO) * *cam_zoom;
@@ -652,7 +580,7 @@ pub fn run(
     }
 
     if let Some(block) = blocks.get(&hover_hex) {
-        if block.kind == BlockType::Mina {
+        if block.kind == BuildBlockType::Mine {
             let mut highlight = colors.hover;
             highlight.a = 0.55;
             for target in mine_targets(hover_hex, block) {
@@ -669,15 +597,15 @@ pub fn run(
         }
     }
 
-    let hover_center = ctx.screen_center + *cam_offset + hex_to_pixel(hover_hex, HEX_SIZE, Vec2::ZERO) * *cam_zoom;
+    let hover_center = hex_screen_center(ctx, *cam_offset, *cam_zoom, hover_hex);
     if let Some(kind) = *selected {
         let within_bounds = in_bounds(hover_hex, outline);
         let empty = !blocks.contains_key(&hover_hex);
         let can_mine = tiles
             .get(&hover_hex)
-            .map(|t| matches!(t.kind, TileType::Piedra | TileType::Hierro | TileType::Cobre) && t.amount > 0)
+            .map(|t| matches!(t.kind, TileType::Stone | TileType::Iron | TileType::Copper) && t.amount > 0)
             .unwrap_or(false);
-        let can_place = within_bounds && empty && (kind != BlockType::Mina || can_mine);
+        let can_place = within_bounds && empty && (kind != BuildBlockType::Mine || can_mine);
         if can_place {
             let mut ghost = block_color(kind, colors);
             ghost.a = 0.3;
@@ -697,25 +625,7 @@ pub fn run(
         );
     }
 
-    draw_text(
-        "Click: colocar  |  Rueda: zoom  |  Boton medio: mover  |  R: rotar  |  Esc: menu",
-        16.0,
-        28.0,
-        ctx.font_md,
-        colors.text_primary,
-    );
-
-    let coord_text = format!("Hex: q={} r={}", hover_hex.q, hover_hex.r);
-    draw_text(
-        &coord_text,
-        16.0,
-        52.0,
-        ctx.font_sm,
-        colors.text_secondary,
-    );
-
-    let rot_text = format!("Rotacion: {}", placement_rotation);
-    draw_text(&rot_text, 16.0, 74.0, ctx.font_sm, colors.text_secondary);
+    draw_common_hud(ctx, colors, *placement_rotation, hover_hex);
 
     let panel_result = crate::core::ui::draw_build_panel(
         panel_pos,
@@ -726,57 +636,25 @@ pub fn run(
         colors,
         &buttons,
         *selected,
+        |kind| block_color(kind, colors),
     );
     if panel_result.toggle_hovered {
-        ui_capturing = true;
+        // ui_capturing would be updated here but not used after
     }
     if panel_result.toggled {
         *panel_collapsed = !*panel_collapsed;
-        ui_capturing = true;
     }
     if let Some(tip) = panel_result.hovered_tip {
         tooltip = Some(tip);
-        ui_capturing = true;
     }
     if let Some(option) = panel_result.clicked_option {
         *selected = option;
     }
 
     if window.open {
-        let title_rect = window_title_rect(window);
-        let close_rect = window_close_rect(window);
-        if is_mouse_button_pressed(MouseButton::Left)
-            && title_rect.contains(ctx.mouse)
-            && !close_rect.contains(ctx.mouse)
-        {
-            window.dragging = true;
-            window.drag_offset = ctx.mouse - vec2(window.rect.x, window.rect.y);
-        }
-        if window.dragging && is_mouse_button_down(MouseButton::Left) {
-            let mut x = ctx.mouse.x - window.drag_offset.x;
-            let mut y = ctx.mouse.y - window.drag_offset.y;
-            if x + window.rect.w > screen_width() {
-                x = screen_width() - window.rect.w;
-            }
-            if y + window.rect.h > screen_height() {
-                y = screen_height() - window.rect.h;
-            }
-            if x < 0.0 {
-                x = 0.0;
-            }
-            if y < 0.0 {
-                y = 0.0;
-            }
-            window.rect.x = x;
-            window.rect.y = y;
-        }
-        if is_mouse_button_released(MouseButton::Left) {
-            window.dragging = false;
-        }
-
         if let Some(target) = window.target {
             if let Some(block) = blocks.get(&target) {
-                if block.kind == BlockType::Logistica {
+                if block.kind == BuildBlockType::Logistics {
                     let owned_count = units.iter().filter(|u| u.depot == target).count();
                     let visible_lines = owned_count.min(6) as f32;
                     let extra = if window.show_units {
@@ -793,348 +671,305 @@ pub fn run(
             }
         }
 
-        let style = WindowStyle {
-            bg: colors.panel_bg,
-            border: colors.panel_border,
-            title: colors.text_primary,
-            title_bg: colors.button_base,
-        };
-        if draw_window(window, style, ctx.font_sm, config.line_thickness, ctx.mouse) {
-            window.open = false;
-            window.target = None;
-            window.dragging = false;
-        }
-        if let Some(target) = window.target {
-            if let Some(block) = blocks.get_mut(&target) {
-                let content_x = window.rect.x + 10.0;
-                let mut content_y = window.rect.y + WINDOW_TITLE_HEIGHT + 20.0;
-                let under_construction = is_under_construction(block);
-                if under_construction {
-                    draw_text(
-                        "En construccion",
-                        content_x,
-                        content_y,
-                        ctx.font_sm,
-                        colors.text_secondary,
-                    );
-                    content_y += 18.0;
-                    let reqs = build_requirements(block.kind);
-                    if reqs.is_empty() {
+        let closed = draw_window_frame(window, ctx, config, colors);
+        if !closed {
+            if let Some(target) = window.target {
+                if let Some(block) = blocks.get_mut(&target) {
+                    let content_x = window.rect.x + 10.0;
+                    let mut content_y = window.rect.y + WINDOW_TITLE_HEIGHT + 20.0;
+                    let under_construction = is_under_construction(block);
+                    if under_construction {
                         draw_text(
-                            "Materiales: gratis",
+                            "Under construction",
                             content_x,
                             content_y,
                             ctx.font_sm,
                             colors.text_secondary,
                         );
                         content_y += 18.0;
-                    } else {
-                        draw_text(
-                            "Materiales:",
-                            content_x,
-                            content_y,
-                            ctx.font_sm,
-                            colors.text_secondary,
-                        );
-                        content_y += 18.0;
-                        for req in reqs {
+                        let reqs = build_requirements(block.kind);
+                        if reqs.is_empty() {
                             draw_text(
-                                &format!("- {}: {}", item_label(req.kind), req.amount),
-                                content_x,
-                                content_y,
-                                ctx.font_sm,
-                                colors.text_secondary,
-                            );
-                            content_y += 16.0;
-                        }
-                        if !block.build_paid {
-                            draw_text(
-                                "Esperando materiales",
+                                "Materials: free",
                                 content_x,
                                 content_y,
                                 ctx.font_sm,
                                 colors.text_secondary,
                             );
                             content_y += 18.0;
-                        }
-                    }
-                    let remaining = (block.build_time - block.build_progress).max(0.0);
-                    draw_text(
-                        &format!("Tiempo restante: {:.1}s", remaining),
-                        content_x,
-                        content_y,
-                        ctx.font_sm,
-                        colors.text_secondary,
-                    );
-                    content_y += 22.0;
-                }
-                match block.kind {
-                    BlockType::Logistica => {
-                        if under_construction {
-                            draw_text(
-                                "Disponible al terminar",
-                                content_x,
-                                content_y,
-                                ctx.font_sm,
-                                colors.text_secondary,
-                            );
                         } else {
-                            let a_text = match station_in {
-                                Some(a) => format!("In: q={} r={}", a.q, a.r),
-                                None => "In: (sin)".to_string(),
-                            };
-                            let b_text = match station_out {
-                                Some(b) => format!("Out: q={} r={}", b.q, b.r),
-                                None => "Out: (sin)".to_string(),
-                            };
-                            draw_text(&a_text, content_x, content_y, ctx.font_sm, colors.text_secondary);
+                            draw_text(
+                                "Materials:",
+                                content_x,
+                                content_y,
+                                ctx.font_sm,
+                                colors.text_secondary,
+                            );
                             content_y += 18.0;
-                            draw_text(&b_text, content_x, content_y, ctx.font_sm, colors.text_secondary);
-                            content_y += 22.0;
-
-                            let rect_set_a = Rect::new(content_x, content_y, 80.0, 26.0);
-                            let rect_set_b = Rect::new(content_x + 90.0, content_y, 80.0, 26.0);
-                            let (clicked_a, _) =
-                                ui_button(rect_set_a, "Set In", ctx.mouse, ctx.font_sm, ctx.button_colors);
-                            let (clicked_b, _) =
-                                ui_button(rect_set_b, "Set Out", ctx.mouse, ctx.font_sm, ctx.button_colors);
-                            if clicked_a {
-                                *station_pick = Some(crate::core::StationPick::In);
-                            }
-                            if clicked_b {
-                                *station_pick = Some(crate::core::StationPick::Out);
-                            }
-                            content_y += 34.0;
-
-                            let rect_spawn = Rect::new(content_x, content_y, 150.0, 28.0);
-                            let (clicked, _) = ui_button(
-                                rect_spawn,
-                                "Crear unidad",
-                                ctx.mouse,
-                                ctx.font_sm,
-                                ctx.button_colors,
-                            );
-                            if clicked {
-                                if let (Some(a), Some(b)) = (*station_in, *station_out) {
-                                    if let Some(path) = find_route_path(a, b, blocks) {
-                                        units.push(crate::core::Unit {
-                                            path,
-                                            index: 0,
-                                            progress: 0.0,
-                                            speed: 3.0,
-                                            forward: true,
-                                            capacity: 20,
-                                            cargo: Vec::new(),
-                                            depot: target,
-                                            station_in: a,
-                                            station_out: b,
-                                        });
-                                    }
-                                }
-                            }
-                            content_y += 34.0;
-
-                            let label = if window.show_units {
-                                "Ocultar lista"
-                            } else {
-                                "Lista unidades"
-                            };
-                            let rect_list = Rect::new(content_x, content_y, 150.0, 26.0);
-                            let (clicked_list, _) = ui_button(
-                                rect_list,
-                                label,
-                                ctx.mouse,
-                                ctx.font_sm,
-                                ctx.button_colors,
-                            );
-                            if clicked_list {
-                                window.show_units = !window.show_units;
-                            }
-                            content_y += 30.0;
-
-                            if window.show_units {
-                                let owned_units: Vec<(usize, &crate::core::Unit)> = units
-                                    .iter()
-                                    .enumerate()
-                                    .filter(|(_, unit)| unit.depot == target)
-                                    .collect();
-                                let total_units = owned_units.len();
+                            for req in reqs {
                                 draw_text(
-                                    &format!("Unidades: {}", total_units),
+                                    &format!("- {}: {}", item_label(req.kind), req.amount),
+                                    content_x,
+                                    content_y,
+                                    ctx.font_sm,
+                                    colors.text_secondary,
+                                );
+                                content_y += 16.0;
+                            }
+                            if !block.build_paid {
+                                draw_text(
+                                    "Waiting for materials",
                                     content_x,
                                     content_y,
                                     ctx.font_sm,
                                     colors.text_secondary,
                                 );
                                 content_y += 18.0;
-                                for (index, unit) in owned_units.iter().take(6) {
-                                    let total = storage_total(&unit.cargo);
-                                    let info = format!(
-                                        "#{} carga {}/{}",
-                                        index + 1,
-                                        total,
-                                        unit.capacity
-                                    );
-                                    draw_text(&info, content_x, content_y, ctx.font_sm, colors.text_secondary);
-                                    content_y += 18.0;
+                            }
+                        }
+                        let remaining = (block.build_time - block.build_progress).max(0.0);
+                        draw_text(
+                            &format!("Time remaining: {:.1}s", remaining),
+                            content_x,
+                            content_y,
+                            ctx.font_sm,
+                            colors.text_secondary,
+                        );
+                        content_y += 22.0;
+                    }
+                    match block.kind {
+                        BuildBlockType::Logistics => {
+                            if under_construction {
+                                draw_text(
+                                    "Available after completion",
+                                    content_x,
+                                    content_y,
+                                    ctx.font_sm,
+                                    colors.text_secondary,
+                                );
+                            } else {
+                                let a_text = match station_in {
+                                    Some(a) => format!("In: q={} r={}", a.q, a.r),
+                                    None => "In: (none)".to_string(),
+                                };
+                                let b_text = match station_out {
+                                    Some(b) => format!("Out: q={} r={}", b.q, b.r),
+                                    None => "Out: (none)".to_string(),
+                                };
+                                draw_text(
+                                    &a_text,
+                                    content_x,
+                                    content_y,
+                                    ctx.font_sm,
+                                    colors.text_secondary,
+                                );
+                                content_y += 18.0;
+                                draw_text(
+                                    &b_text,
+                                    content_x,
+                                    content_y,
+                                    ctx.font_sm,
+                                    colors.text_secondary,
+                                );
+                                content_y += 22.0;
+
+                                let rect_set_a = Rect::new(content_x, content_y, 80.0, 26.0);
+                                let rect_set_b = Rect::new(content_x + 90.0, content_y, 80.0, 26.0);
+                                let (clicked_a, _) = ui_button(
+                                    rect_set_a,
+                                    "Set In",
+                                    ctx.mouse,
+                                    ctx.font_sm,
+                                    ctx.button_colors,
+                                );
+                                let (clicked_b, _) = ui_button(
+                                    rect_set_b,
+                                    "Set Out",
+                                    ctx.mouse,
+                                    ctx.font_sm,
+                                    ctx.button_colors,
+                                );
+                                if clicked_a {
+                                    *station_pick = Some(crate::core::StationPick::In);
                                 }
-                                if total_units > 6 {
+                                if clicked_b {
+                                    *station_pick = Some(crate::core::StationPick::Out);
+                                }
+                                content_y += 34.0;
+
+                                let rect_spawn = Rect::new(content_x, content_y, 150.0, 28.0);
+                                let (clicked, _) = ui_button(
+                                    rect_spawn,
+                                    "Create unit",
+                                    ctx.mouse,
+                                    ctx.font_sm,
+                                    ctx.button_colors,
+                                );
+                                if clicked {
+                                    if let (Some(a), Some(b)) = (*station_in, *station_out) {
+                                        if let Some(path) = find_route_path(a, b, blocks) {
+                                            units.push(crate::core::Unit {
+                                                path,
+                                                index: 0,
+                                                progress: 0.0,
+                                                speed: 3.0,
+                                                forward: true,
+                                                capacity: 20,
+                                                cargo: Vec::new(),
+                                                depot: target,
+                                                station_in: a,
+                                                station_out: b,
+                                            });
+                                        }
+                                    }
+                                }
+                                content_y += 34.0;
+
+                                let label = if window.show_units {
+                                    "Hide list"
+                                } else {
+                                    "Unit list"
+                                };
+                                let rect_list = Rect::new(content_x, content_y, 150.0, 26.0);
+                                let (clicked_list, _) = ui_button(
+                                    rect_list,
+                                    label,
+                                    ctx.mouse,
+                                    ctx.font_sm,
+                                    ctx.button_colors,
+                                );
+                                if clicked_list {
+                                    window.show_units = !window.show_units;
+                                }
+                                content_y += 30.0;
+
+                                if window.show_units {
+                                    let owned_units: Vec<(usize, &crate::core::Unit)> = units
+                                        .iter()
+                                        .enumerate()
+                                        .filter(|(_, unit)| unit.depot == target)
+                                        .collect();
+                                    let total_units = owned_units.len();
                                     draw_text(
-                                        &format!("+{} mas", total_units - 6),
+                                        &format!("Units: {}", total_units),
                                         content_x,
                                         content_y,
                                         ctx.font_sm,
                                         colors.text_secondary,
                                     );
                                     content_y += 18.0;
+                                    for (index, unit) in owned_units.iter().take(6) {
+                                        let total = storage_total(&unit.cargo);
+                                        let info = format!(
+                                            "#{} load {}/{}",
+                                            index + 1,
+                                            total,
+                                            unit.capacity
+                                        );
+                                        draw_text(
+                                            &info,
+                                            content_x,
+                                            content_y,
+                                            ctx.font_sm,
+                                            colors.text_secondary,
+                                        );
+                                        content_y += 18.0;
+                                    }
+                                    if total_units > 6 {
+                                        draw_text(
+                                            &format!("+{} more", total_units - 6),
+                                            content_x,
+                                            content_y,
+                                            ctx.font_sm,
+                                            colors.text_secondary,
+                                        );
+                                        content_y += 18.0;
+                                    }
                                 }
                             }
                         }
-                    }
-                    BlockType::Mina => {
-                        if let Some(tile) = tiles.get(&target) {
-                            let total_remaining = mine_total_remaining(target, block, tiles);
-                            let zones = 1 + block.mine_extra.len();
-                            let txt = format!("Recurso: {}", tile_label(tile.kind));
-                            draw_text(&txt, content_x, content_y, ctx.font_sm, colors.text_secondary);
-                            content_y += 20.0;
+                        BuildBlockType::Mine => {
+                            if let Some(tile) = tiles.get(&target) {
+                                let total_remaining = mine_total_remaining(target, block, tiles);
+                                let zones = 1 + block.mine_extra.len();
+                                let txt = format!("Resource: {}", tile_label(tile.kind));
+                                draw_text(&txt, content_x, content_y, ctx.font_sm, colors.text_secondary);
+                                content_y += 20.0;
+                                draw_text(
+                                    &format!("Zones: {}  Total: {}", zones, total_remaining),
+                                    content_x,
+                                    content_y,
+                                    ctx.font_sm,
+                                    colors.text_secondary,
+                                );
+                                content_y += 20.0;
+                            }
+                            let total = storage_total(&block.stored);
                             draw_text(
-                                &format!("Zonas: {}  Total: {}", zones, total_remaining),
+                                &format!("Stored: {}/{}", total, block.capacity),
+                                content_x,
+                                content_y,
+                                ctx.font_sm,
+                                colors.text_secondary,
+                            );
+                            content_y += 26.0;
+                            if !under_construction {
+                                let rect_expand = Rect::new(content_x, content_y, 150.0, 28.0);
+                                let (clicked, _) = ui_button(
+                                    rect_expand,
+                                    "Expand",
+                                    ctx.mouse,
+                                    ctx.font_sm,
+                                    ctx.button_colors,
+                                );
+                                if clicked {
+                                    if expand_mine_area(target, block, tiles) {
+                                        *dirty = true;
+                                    }
+                                }
+                            }
+                        }
+                        BuildBlockType::Warehouse => {
+                            let total = storage_total(&block.stored);
+                            draw_text(
+                                &format!("Capacity: {}/{}", total, block.capacity),
                                 content_x,
                                 content_y,
                                 ctx.font_sm,
                                 colors.text_secondary,
                             );
                             content_y += 20.0;
-                        }
-                        let total = storage_total(&block.stored);
-                        draw_text(
-                            &format!("Guardado: {}/{}", total, block.capacity),
-                            content_x,
-                            content_y,
-                            ctx.font_sm,
-                            colors.text_secondary,
-                        );
-                        content_y += 26.0;
-                        if !under_construction {
-                            let rect_expand = Rect::new(content_x, content_y, 150.0, 28.0);
-                            let (clicked, _) = ui_button(
-                                rect_expand,
-                                "Expandir",
-                                ctx.mouse,
-                                ctx.font_sm,
-                                ctx.button_colors,
-                            );
-                            if clicked {
-                                if expand_mine_area(target, block, tiles) {
-                                    *dirty = true;
-                                }
+                            for stack in block.stored.iter() {
+                                draw_text(
+                                    &format!("{}: {}", item_label(stack.kind), stack.amount),
+                                    content_x,
+                                    content_y,
+                                    ctx.font_sm,
+                                    colors.text_secondary,
+                                );
+                                content_y += 18.0;
                             }
                         }
+                        _ => {}
                     }
-                    BlockType::Almacen => {
-                        let total = storage_total(&block.stored);
-                        draw_text(
-                            &format!("Capacidad: {}/{}", total, block.capacity),
-                            content_x,
-                            content_y,
-                            ctx.font_sm,
-                            colors.text_secondary,
-                        );
-                        content_y += 20.0;
-                        for stack in block.stored.iter() {
-                            draw_text(
-                                &format!("{}: {}", item_label(stack.kind), stack.amount),
-                                content_x,
-                                content_y,
-                                ctx.font_sm,
-                                colors.text_secondary,
-                            );
-                            content_y += 18.0;
-                        }
-                    }
-                    _ => {}
                 }
             }
         }
     }
 
-    if confirm_window.open {
-        let title_rect = window_title_rect(confirm_window);
-        let close_rect = window_close_rect(confirm_window);
-        if is_mouse_button_pressed(MouseButton::Left)
-            && title_rect.contains(ctx.mouse)
-            && !close_rect.contains(ctx.mouse)
-        {
-            confirm_window.dragging = true;
-            confirm_window.drag_offset = ctx.mouse - vec2(confirm_window.rect.x, confirm_window.rect.y);
-        }
-        if confirm_window.dragging && is_mouse_button_down(MouseButton::Left) {
-            let mut x = ctx.mouse.x - confirm_window.drag_offset.x;
-            let mut y = ctx.mouse.y - confirm_window.drag_offset.y;
-            if x + confirm_window.rect.w > screen_width() {
-                x = screen_width() - confirm_window.rect.w;
+    let confirm_target = confirm_window.target;
+    let confirm_label = confirm_label_for_target(confirm_target, |target| {
+        blocks
+            .get(&target)
+            .map(|block| block_label(block.kind).to_string())
+    });
+    if run_confirm_window(confirm_window, ctx, config, colors, &confirm_label)
+        == ConfirmAction::Confirm
+    {
+        if let Some(target) = confirm_target {
+            if blocks.remove(&target).is_some() {
+                *dirty = true;
             }
-            if y + confirm_window.rect.h > screen_height() {
-                y = screen_height() - confirm_window.rect.h;
-            }
-            if x < 0.0 {
-                x = 0.0;
-            }
-            if y < 0.0 {
-                y = 0.0;
-            }
-            confirm_window.rect.x = x;
-            confirm_window.rect.y = y;
-        }
-        if is_mouse_button_released(MouseButton::Left) {
-            confirm_window.dragging = false;
-        }
-
-        let style = WindowStyle {
-            bg: colors.panel_bg,
-            border: colors.panel_border,
-            title: colors.text_primary,
-            title_bg: colors.button_base,
-        };
-        if draw_window(confirm_window, style, ctx.font_sm, config.line_thickness, ctx.mouse) {
-            confirm_window.open = false;
-            confirm_window.target = None;
-            confirm_window.dragging = false;
-        }
-
-        let content_x = confirm_window.rect.x + 10.0;
-        let mut content_y = confirm_window.rect.y + WINDOW_TITLE_HEIGHT + 20.0;
-        let label = if let Some(target) = confirm_window.target {
-            if let Some(block) = blocks.get(&target) {
-                format!("Deconstruir {}?", block_label(block.kind))
-            } else {
-                "Bloque no encontrado".to_string()
-            }
-        } else {
-            "Bloque no encontrado".to_string()
-        };
-        draw_text(&label, content_x, content_y, ctx.font_sm, colors.text_secondary);
-        content_y += 28.0;
-
-        let rect_cancel = Rect::new(content_x, content_y, 90.0, 26.0);
-        let rect_ok = Rect::new(content_x + 100.0, content_y, 90.0, 26.0);
-        let (clicked_cancel, _) =
-            ui_button(rect_cancel, "Cancelar", ctx.mouse, ctx.font_sm, ctx.button_colors);
-        let (clicked_ok, _) =
-            ui_button(rect_ok, "Eliminar", ctx.mouse, ctx.font_sm, ctx.button_colors);
-        if clicked_cancel {
-            confirm_window.open = false;
-            confirm_window.target = None;
-        }
-        if clicked_ok {
-            if let Some(target) = confirm_window.target {
-                if blocks.remove(&target).is_some() {
-                    *dirty = true;
-                }
-            }
-            confirm_window.open = false;
-            confirm_window.target = None;
         }
     }
 
@@ -1168,3 +1003,5 @@ pub fn run(
         );
     }
 }
+
+

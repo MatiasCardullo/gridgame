@@ -2,7 +2,7 @@ use macroquad::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use crate::core::{
-    block_color, draw_hex_filled, draw_hex_outline, AppColors, Axial, BlockType, ColorRgba,
+    draw_hex_filled, draw_hex_outline, AppColors, Axial, ColorRgba,
     RuntimeColors,
 };
 
@@ -40,15 +40,16 @@ pub struct WindowState {
 pub struct PanelResult {
     pub toggled: bool,
     pub toggle_hovered: bool,
+    #[allow(dead_code)]
     pub selected_changed: bool,
 }
 
 // Result for the build panel content area.
 #[derive(Clone, Debug)]
-pub struct BuildPanelResult {
+pub struct BuildPanelResult<T: Copy> {
     pub toggled: bool,
     pub toggle_hovered: bool,
-    pub clicked_option: Option<Option<BlockType>>,
+    pub clicked_option: Option<Option<T>>,
     pub hovered_tip: Option<&'static str>,
 }
 
@@ -108,19 +109,19 @@ pub fn color_target_name(target: ColorTarget) -> &'static str {
         ColorTarget::PanelBorder => "Panel borde",
         ColorTarget::TooltipBg => "Tooltip fondo",
         ColorTarget::TooltipBorder => "Tooltip borde",
-        ColorTarget::RouteLine => "Ruta linea",
+        ColorTarget::RouteLine => "Route linea",
         ColorTarget::PortIn => "Input",
         ColorTarget::PortOut => "Output",
-        ColorTarget::BlockVivienda => "Vivienda",
-        ColorTarget::BlockFabrica => "Fabrica",
-        ColorTarget::BlockMina => "Mina",
-        ColorTarget::BlockAlmacen => "Almacen",
-        ColorTarget::BlockLogistica => "Logistica",
-        ColorTarget::BlockRuta => "Ruta",
-        ColorTarget::TilePiedra => "Piedra",
-        ColorTarget::TileHierro => "Hierro",
-        ColorTarget::TileCobre => "Cobre",
-        ColorTarget::TileAgua => "Agua",
+        ColorTarget::BlockHousing => "Housing",
+        ColorTarget::BlockFactory => "Factory",
+        ColorTarget::BlockMine => "Mine",
+        ColorTarget::BlockWarehouse => "Warehouse",
+        ColorTarget::BlockLogistics => "Logistics",
+        ColorTarget::BlockRoute => "Route",
+        ColorTarget::TileStone => "Stone",
+        ColorTarget::TileIron => "Iron",
+        ColorTarget::TileCopper => "Copper",
+        ColorTarget::TileWater => "Water",
     }
 }
 
@@ -143,16 +144,16 @@ pub fn color_target_mut(target: ColorTarget, colors: &mut AppColors) -> &mut Col
         ColorTarget::RouteLine => &mut colors.route_line,
         ColorTarget::PortIn => &mut colors.port_in,
         ColorTarget::PortOut => &mut colors.port_out,
-        ColorTarget::BlockVivienda => &mut colors.block_vivienda,
-        ColorTarget::BlockFabrica => &mut colors.block_fabrica,
-        ColorTarget::BlockMina => &mut colors.block_mina,
-        ColorTarget::BlockAlmacen => &mut colors.block_almacen,
-        ColorTarget::BlockLogistica => &mut colors.block_logistica,
-        ColorTarget::BlockRuta => &mut colors.block_ruta,
-        ColorTarget::TilePiedra => &mut colors.tile_piedra,
-        ColorTarget::TileHierro => &mut colors.tile_hierro,
-        ColorTarget::TileCobre => &mut colors.tile_cobre,
-        ColorTarget::TileAgua => &mut colors.tile_agua,
+        ColorTarget::BlockHousing => &mut colors.block_Housing,
+        ColorTarget::BlockFactory => &mut colors.block_Factory,
+        ColorTarget::BlockMine => &mut colors.block_Mine,
+        ColorTarget::BlockWarehouse => &mut colors.block_Warehouse,
+        ColorTarget::BlockLogistics => &mut colors.block_Logistics,
+        ColorTarget::BlockRoute => &mut colors.block_Route,
+        ColorTarget::TileStone => &mut colors.tile_Stone,
+        ColorTarget::TileIron => &mut colors.tile_Iron,
+        ColorTarget::TileCopper => &mut colors.tile_Copper,
+        ColorTarget::TileWater => &mut colors.tile_Water,
     }
 }
 
@@ -188,16 +189,16 @@ pub enum ColorTarget {
     RouteLine,
     PortIn,
     PortOut,
-    BlockVivienda,
-    BlockFabrica,
-    BlockMina,
-    BlockAlmacen,
-    BlockLogistica,
-    BlockRuta,
-    TilePiedra,
-    TileHierro,
-    TileCobre,
-    TileAgua,
+    BlockHousing,
+    BlockFactory,
+    BlockMine,
+    BlockWarehouse,
+    BlockLogistics,
+    BlockRoute,
+    TileStone,
+    TileIron,
+    TileCopper,
+    TileWater,
 }
 
 // Ordered list of selectable color targets.
@@ -219,16 +220,16 @@ pub fn color_target_list() -> [ColorTarget; 26] {
         ColorTarget::RouteLine,
         ColorTarget::PortIn,
         ColorTarget::PortOut,
-        ColorTarget::BlockVivienda,
-        ColorTarget::BlockFabrica,
-        ColorTarget::BlockMina,
-        ColorTarget::BlockAlmacen,
-        ColorTarget::BlockLogistica,
-        ColorTarget::BlockRuta,
-        ColorTarget::TilePiedra,
-        ColorTarget::TileHierro,
-        ColorTarget::TileCobre,
-        ColorTarget::TileAgua,
+        ColorTarget::BlockHousing,
+        ColorTarget::BlockFactory,
+        ColorTarget::BlockMine,
+        ColorTarget::BlockWarehouse,
+        ColorTarget::BlockLogistics,
+        ColorTarget::BlockRoute,
+        ColorTarget::TileStone,
+        ColorTarget::TileIron,
+        ColorTarget::TileCopper,
+        ColorTarget::TileWater,
     ]
 }
 
@@ -288,20 +289,21 @@ pub fn draw_game_panel(
     }
 }
 
-// Draw build panel buttons and return click/hover info.
-pub fn draw_build_panel(
+// Draw build panel buttons and return click/hover info. Generic over block type T.
+pub fn draw_build_panel<T: Copy + PartialEq>(
     panel_pos: Vec2,
     panel_size: Vec2,
     collapsed: bool,
     mouse: Vec2,
     line_thickness: f32,
     colors: &RuntimeColors,
-    buttons: &[(Option<BlockType>, &'static str)],
-    selected: Option<BlockType>,
-) -> BuildPanelResult {
+    buttons: &[(Option<T>, &'static str)],
+    selected: Option<T>,
+    color_fn: impl Fn(T) -> Color,
+) -> BuildPanelResult<T> {
     let panel_result = draw_game_panel(panel_pos, panel_size, mouse, 18.0, line_thickness, colors);
     let mut hovered_tip: Option<&'static str> = None;
-    let mut clicked_option: Option<Option<BlockType>> = None;
+    let mut clicked_option: Option<Option<T>> = None;
 
     if !collapsed {
         let button_size = 52.0;
@@ -334,7 +336,7 @@ pub fn draw_build_panel(
 
             if let Some(kind) = *option {
                 let icon_center = vec2(rect.x + rect.w * 0.5, rect.y + rect.h * 0.5);
-                draw_hex_filled(icon_center, 16.0, block_color(kind, colors));
+                draw_hex_filled(icon_center, 16.0, color_fn(kind));
                 draw_hex_outline(
                     icon_center,
                     16.0,
@@ -432,3 +434,4 @@ pub fn draw_window(
     draw_text("x", close_rect.x + 5.0, close_rect.y + 14.0, font_title, style.title);
     close_rect.contains(mouse) && is_mouse_button_pressed(MouseButton::Left)
 }
+

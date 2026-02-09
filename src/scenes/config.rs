@@ -7,7 +7,7 @@ use crate::core::{
 use crate::core::ui::{
     adjust_color_channel, color_target_list, color_target_mut, color_target_name, ui_button,
 };
-use crate::GRID_RADIUS;
+use crate::TRI_LENGHT;
 use std::collections::HashMap;
 
 // Render and handle input for the config scene.
@@ -169,54 +169,54 @@ pub fn run(
     }
     y += row_gap;
 
-    let (dec, inc) = draw_stepper("Peso Stone", &format!("{:.2}", config.weight_Stone), y);
+    let (dec, inc) = draw_stepper("Peso Stone", &format!("{:.2}", config.weight_stone), y);
     if dec {
         changed = true;
-        config.weight_Stone = (config.weight_Stone - 0.05).max(0.0);
+        config.weight_stone = (config.weight_stone - 0.05).max(0.0);
     }
     if inc {
         changed = true;
-        config.weight_Stone = (config.weight_Stone + 0.05).min(1.0);
+        config.weight_stone = (config.weight_stone + 0.05).min(1.0);
     }
     y += row_gap;
 
-    let (dec, inc) = draw_stepper("Peso Iron", &format!("{:.2}", config.weight_Iron), y);
+    let (dec, inc) = draw_stepper("Peso Iron", &format!("{:.2}", config.weight_iron), y);
     if dec {
         changed = true;
-        config.weight_Iron = (config.weight_Iron - 0.05).max(0.0);
+        config.weight_iron = (config.weight_iron - 0.05).max(0.0);
     }
     if inc {
         changed = true;
-        config.weight_Iron = (config.weight_Iron + 0.05).min(1.0);
+        config.weight_iron = (config.weight_iron + 0.05).min(1.0);
     }
     y += row_gap;
 
-    let (dec, inc) = draw_stepper("Peso Copper", &format!("{:.2}", config.weight_Copper), y);
+    let (dec, inc) = draw_stepper("Peso Copper", &format!("{:.2}", config.weight_copper), y);
     if dec {
         changed = true;
-        config.weight_Copper = (config.weight_Copper - 0.05).max(0.0);
+        config.weight_copper = (config.weight_copper - 0.05).max(0.0);
     }
     if inc {
         changed = true;
-        config.weight_Copper = (config.weight_Copper + 0.05).min(1.0);
+        config.weight_copper = (config.weight_copper + 0.05).min(1.0);
     }
     y += row_gap;
 
-    let (dec, inc) = draw_stepper("Peso Water", &format!("{:.2}", config.weight_Water), y);
+    let (dec, inc) = draw_stepper("Peso Water", &format!("{:.2}", config.weight_water), y);
     if dec {
         changed = true;
-        config.weight_Water = (config.weight_Water - 0.05).max(0.0);
+        config.weight_water = (config.weight_water - 0.05).max(0.0);
     }
     if inc {
         changed = true;
-        config.weight_Water = (config.weight_Water + 0.05).min(1.0);
+        config.weight_water = (config.weight_water + 0.05).min(1.0);
     }
     y += row_gap;
 
     let rect_regen = Rect::new(label_x, y - 16.0, 240.0, 38.0);
     let (regen, _) = ui_button(rect_regen, "Regenerar tiles", ctx.mouse, ctx.font_md, ctx.button_colors);
     if regen {
-        *tiles = generate_tiles(GRID_RADIUS, config);
+        *tiles = generate_tiles(TRI_LENGHT, config);
         *dirty = true;
     }
 

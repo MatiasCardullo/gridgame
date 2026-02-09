@@ -8,7 +8,7 @@ use crate::core::{
     BuildBlockType, FrameContext, ItemType, PlacedBlock, RuntimeColors, Scene, TileData, TileType,
 };
 use crate::core::ui::{ui_button, WindowState, WINDOW_TITLE_HEIGHT};
-use crate::{GRID_RADIUS, HEX_SIZE};
+use crate::{TRI_LENGHT, HEX_SIZE};
 use crate::scenes::map_common::{
     build_panel_layout,
     confirm_label_for_target,
@@ -119,48 +119,69 @@ fn expand_mine_area(
     added
 }
 
-fn available_item_amount(
+fn requirement_sources(target: Axial) -> Vec<Axial> {
+    let mut sources = Vec::with_capacity(7);
+    sources.push(target);
+    sources.extend(axial_neighbors(target));
+    sources
+}
+
+fn available_item_amount_near(
     blocks: &HashMap<Axial, PlacedBlock>,
+    target: Axial,
     kind: ItemType,
 ) -> i32 {
-    blocks
-        .values()
-        .filter(|b| !is_under_construction(b))
-        .flat_map(|b| b.stored.iter())
+    requirement_sources(target)
+        .into_iter()
+        .filter_map(|hex| blocks.get(&hex).map(|b| (hex, b)))
+        .filter(|(hex, block)| *hex == target || !is_under_construction(block))
+        .flat_map(|(_, block)| block.stored.iter())
         .filter(|s| s.kind == kind)
         .map(|s| s.amount)
         .sum()
 }
 
-fn has_requirements(blocks: &HashMap<Axial, PlacedBlock>, reqs: &[crate::core::ItemStack]) -> bool {
-    reqs.iter()
-        .all(|req| available_item_amount(blocks, req.kind) >= req.amount)
-}
-
-fn consume_requirements(
-    blocks: &mut HashMap<Axial, PlacedBlock>,
+fn has_requirements_near(
+    blocks: &HashMap<Axial, PlacedBlock>,
+    target: Axial,
     reqs: &[crate::core::ItemStack],
 ) -> bool {
-    if !has_requirements(blocks, reqs) {
+    reqs.iter()
+        .all(|req| available_item_amount_near(blocks, target, req.kind) >= req.amount)
+}
+
+fn consume_requirements_near(
+    blocks: &mut HashMap<Axial, PlacedBlock>,
+    target: Axial,
+    reqs: &[crate::core::ItemStack],
+) -> bool {
+    if !has_requirements_near(blocks, target, reqs) {
         return false;
     }
+    let sources = requirement_sources(target);
     for req in reqs {
         let mut remaining = req.amount;
-        for block in blocks.values_mut() {
+        for hex in sources.iter().copied() {
             if remaining <= 0 {
                 break;
             }
-            if is_under_construction(block) {
-                continue;
-            }
+            let take_from = match blocks.get_mut(&hex) {
+                Some(block) => {
+                    if hex != target && is_under_construction(block) {
+                        continue;
+                    }
+                    block
+                }
+                None => continue,
+            };
             let mut index = 0usize;
-            while index < block.stored.len() && remaining > 0 {
-                if block.stored[index].kind == req.kind {
-                    let take = block.stored[index].amount.min(remaining);
-                    block.stored[index].amount -= take;
+            while index < take_from.stored.len() && remaining > 0 {
+                if take_from.stored[index].kind == req.kind {
+                    let take = take_from.stored[index].amount.min(remaining);
+                    take_from.stored[index].amount -= take;
                     remaining -= take;
-                    if block.stored[index].amount <= 0 {
-                        block.stored.remove(index);
+                    if take_from.stored[index].amount <= 0 {
+                        take_from.stored.remove(index);
                         continue;
                     }
                 }
@@ -283,6 +304,25 @@ pub fn run(
     colors: &RuntimeColors,
     outline: MapOutline,
 ) {
+    let base_hex = Axial { q: TRI_LENGHT/3, r: TRI_LENGHT/3 };
+    if !blocks.contains_key(&base_hex) || blocks.get(&base_hex).map(|b| b.kind) != Some(BuildBlockType::Warehouse) {
+        let mut base = new_placed_block(BuildBlockType::Warehouse, 0);
+        base.build_time = 0.0;
+        base.build_progress = 0.0;
+        base.build_paid = true;
+        let initial_items = [
+            (ItemType::Stone, 60),
+            (ItemType::Iron, 40),
+            (ItemType::Copper, 30),
+            (ItemType::Water, 20),
+        ];
+        for (kind, amount) in initial_items {
+            add_item(&mut base.stored, kind, amount, base.capacity);
+        }
+        blocks.insert(base_hex, base);
+        *dirty = true;
+    }
+
     handle_cursor_zoom(ctx, cam_offset, cam_zoom, config.zoom_speed);
     handle_camera_drag(ctx, cam_offset, dragging, last_mouse);
 
@@ -390,7 +430,7 @@ pub fn run(
         };
         if needs_pay {
             let reqs = build_requirements(kind);
-            let paid = reqs.is_empty() || consume_requirements(blocks, &reqs);
+            let paid = reqs.is_empty() || consume_requirements_near(blocks, hex, &reqs);
             if paid {
                 if let Some(block) = blocks.get_mut(&hex) {
                     block.build_paid = true;
@@ -476,8 +516,8 @@ pub fn run(
         }
     }
 
-    for r in -GRID_RADIUS..=GRID_RADIUS {
-        for q in -GRID_RADIUS..=GRID_RADIUS {
+    for r in -TRI_LENGHT..=TRI_LENGHT {
+        for q in -TRI_LENGHT..=TRI_LENGHT {
             let hex = Axial { q, r };
             if !in_bounds(hex, outline) {
                 continue;

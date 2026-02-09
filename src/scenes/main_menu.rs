@@ -5,7 +5,7 @@ use crate::core::{
     TileData, Unit,
 };
 use crate::core::ui::ui_button;
-use crate::GRID_RADIUS;
+use crate::TRI_LENGHT;
 use crate::scenes::map_common::{outline_start_offset, MapOutline};
 use std::collections::HashMap;
 
@@ -49,7 +49,7 @@ pub fn run(
             *tiles = loaded_tiles;
             *units = loaded_units;
             if tiles.is_empty() {
-                *tiles = generate_tiles(GRID_RADIUS, config);
+                *tiles = generate_tiles(TRI_LENGHT, config);
                 *dirty = true;
             }
             *cam_offset = outline_start_offset(MapOutline::Triangle, config.zoom_level);
@@ -63,7 +63,7 @@ pub fn run(
     let (clicked_new, _) = ui_button(rect_new, "Planet Sector", ctx.mouse, ctx.font_md, ctx.button_colors);
     if clicked_new {
         blocks.clear();
-        *tiles = generate_tiles(GRID_RADIUS, config);
+        *tiles = generate_tiles(TRI_LENGHT, config);
         units.clear();
         *cam_offset = outline_start_offset(MapOutline::Triangle, config.zoom_level);
         *cam_zoom = config.zoom_level;

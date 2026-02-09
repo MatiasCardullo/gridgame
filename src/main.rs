@@ -11,8 +11,9 @@ use core::{
 };
 use core::ui::{UiButtonColors, WindowState};
 
-const HEX_SIZE: f32 = 16.0;
-const GRID_RADIUS: i32 = 64;
+const HEX_SIZE: f32 = 15.0;
+const HEX_RADIUS: i32 = 64;
+const TRI_LENGHT: i32 = 320;
 const SQRT_3: f32 = 1.732_050_8;
 
 // Entry point and scene dispatcher.

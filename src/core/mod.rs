@@ -200,10 +200,10 @@ pub struct AppConfig {
     pub tile_cluster_max: usize,
     pub tile_neighbor_chance: f32,
     pub tile_center_bonus: f32,
-    pub weight_Stone: f32,
-    pub weight_Iron: f32,
-    pub weight_Copper: f32,
-    pub weight_Water: f32,
+    pub weight_stone: f32,
+    pub weight_iron: f32,
+    pub weight_copper: f32,
+    pub weight_water: f32,
     pub line_thickness: f32,
     pub arrow_scale: f32,
 }
@@ -219,10 +219,10 @@ impl Default for AppConfig {
             tile_cluster_max: 20,
             tile_neighbor_chance: 0.45,
             tile_center_bonus: 0.35,
-            weight_Stone: 0.35,
-            weight_Iron: 0.2,
-            weight_Copper: 0.2,
-            weight_Water: 0.25,
+            weight_stone: 0.35,
+            weight_iron: 0.2,
+            weight_copper: 0.2,
+            weight_water: 0.25,
             line_thickness: 1.0,
             arrow_scale: 1.0,
         }
@@ -264,16 +264,16 @@ pub struct RuntimeColors {
     pub route_line: Color,
     pub port_in: Color,
     pub port_out: Color,
-    pub block_Housing: Color,
-    pub block_Factory: Color,
-    pub block_Mine: Color,
-    pub block_Warehouse: Color,
-    pub block_Logistics: Color,
-    pub block_Route: Color,
-    pub tile_Stone: Color,
-    pub tile_Iron: Color,
-    pub tile_Copper: Color,
-    pub tile_Water: Color,
+    pub block_housing: Color,
+    pub block_factory: Color,
+    pub block_mine: Color,
+    pub block_warehouse: Color,
+    pub block_logistics: Color,
+    pub block_route: Color,
+    pub tile_stone: Color,
+    pub tile_iron: Color,
+    pub tile_copper: Color,
+    pub tile_water: Color,
 }
 
 // Configurable palette stored in config.json.
@@ -296,16 +296,16 @@ pub struct AppColors {
     pub route_line: ColorRgba,
     pub port_in: ColorRgba,
     pub port_out: ColorRgba,
-    pub block_Housing: ColorRgba,
-    pub block_Factory: ColorRgba,
-    pub block_Mine: ColorRgba,
-    pub block_Warehouse: ColorRgba,
-    pub block_Logistics: ColorRgba,
-    pub block_Route: ColorRgba,
-    pub tile_Stone: ColorRgba,
-    pub tile_Iron: ColorRgba,
-    pub tile_Copper: ColorRgba,
-    pub tile_Water: ColorRgba,
+    pub block_housing: ColorRgba,
+    pub block_factory: ColorRgba,
+    pub block_mine: ColorRgba,
+    pub block_warehouse: ColorRgba,
+    pub block_logistics: ColorRgba,
+    pub block_route: ColorRgba,
+    pub tile_stone: ColorRgba,
+    pub tile_iron: ColorRgba,
+    pub tile_copper: ColorRgba,
+    pub tile_water: ColorRgba,
 }
 
 impl Default for AppColors {
@@ -327,16 +327,16 @@ impl Default for AppColors {
             route_line: ColorRgba { r: 120, g: 140, b: 160, a: 200 },
             port_in: ColorRgba { r: 80, g: 160, b: 220, a: 255 },
             port_out: ColorRgba { r: 220, g: 170, b: 90, a: 255 },
-            block_Housing: ColorRgba { r: 120, g: 200, b: 120, a: 255 },
-            block_Factory: ColorRgba { r: 220, g: 140, b: 80, a: 255 },
-            block_Mine: ColorRgba { r: 110, g: 150, b: 200, a: 255 },
-            block_Warehouse: ColorRgba { r: 210, g: 190, b: 90, a: 255 },
-            block_Logistics: ColorRgba { r: 120, g: 140, b: 160, a: 255 },
-            block_Route: ColorRgba { r: 90, g: 100, b: 115, a: 255 },
-            tile_Stone: ColorRgba { r: 110, g: 110, b: 120, a: 255 },
-            tile_Iron: ColorRgba { r: 120, g: 95, b: 85, a: 255 },
-            tile_Copper: ColorRgba { r: 150, g: 95, b: 70, a: 255 },
-            tile_Water: ColorRgba { r: 60, g: 110, b: 160, a: 255 },
+            block_housing: ColorRgba { r: 120, g: 200, b: 120, a: 255 },
+            block_factory: ColorRgba { r: 220, g: 140, b: 80, a: 255 },
+            block_mine: ColorRgba { r: 110, g: 150, b: 200, a: 255 },
+            block_warehouse: ColorRgba { r: 210, g: 190, b: 90, a: 255 },
+            block_logistics: ColorRgba { r: 120, g: 140, b: 160, a: 255 },
+            block_route: ColorRgba { r: 90, g: 100, b: 115, a: 255 },
+            tile_stone: ColorRgba { r: 110, g: 110, b: 120, a: 255 },
+            tile_iron: ColorRgba { r: 120, g: 95, b: 85, a: 255 },
+            tile_copper: ColorRgba { r: 150, g: 95, b: 70, a: 255 },
+            tile_water: ColorRgba { r: 60, g: 110, b: 160, a: 255 },
         }
     }
 }
@@ -361,16 +361,16 @@ impl AppColors {
             route_line: self.route_line.to_color(),
             port_in: self.port_in.to_color(),
             port_out: self.port_out.to_color(),
-            block_Housing: self.block_Housing.to_color(),
-            block_Factory: self.block_Factory.to_color(),
-            block_Mine: self.block_Mine.to_color(),
-            block_Warehouse: self.block_Warehouse.to_color(),
-            block_Logistics: self.block_Logistics.to_color(),
-            block_Route: self.block_Route.to_color(),
-            tile_Stone: self.tile_Stone.to_color(),
-            tile_Iron: self.tile_Iron.to_color(),
-            tile_Copper: self.tile_Copper.to_color(),
-            tile_Water: self.tile_Water.to_color(),
+            block_housing: self.block_housing.to_color(),
+            block_factory: self.block_factory.to_color(),
+            block_mine: self.block_mine.to_color(),
+            block_warehouse: self.block_warehouse.to_color(),
+            block_logistics: self.block_logistics.to_color(),
+            block_route: self.block_route.to_color(),
+            tile_stone: self.tile_stone.to_color(),
+            tile_iron: self.tile_iron.to_color(),
+            tile_copper: self.tile_copper.to_color(),
+            tile_water: self.tile_water.to_color(),
         }
     }
 }
@@ -589,33 +589,33 @@ pub fn load_map(path: &str) -> (
 // Resolve block color from runtime palette.
 pub fn block_color(kind: BuildBlockType, colors: &RuntimeColors) -> Color {
     match kind {
-        BuildBlockType::Housing => colors.block_Housing,
-        BuildBlockType::Factory => colors.block_Factory,
-        BuildBlockType::Mine => colors.block_Mine,
-        BuildBlockType::Warehouse => colors.block_Warehouse,
-        BuildBlockType::Logistics => colors.block_Logistics,
-        BuildBlockType::Route => colors.block_Route,
+        BuildBlockType::Housing => colors.block_housing,
+        BuildBlockType::Factory => colors.block_factory,
+        BuildBlockType::Mine => colors.block_mine,
+        BuildBlockType::Warehouse => colors.block_warehouse,
+        BuildBlockType::Logistics => colors.block_logistics,
+        BuildBlockType::Route => colors.block_route,
     }
 }
 
 // Resolve tile color from runtime palette.
 pub fn tile_color(kind: TileType, colors: &RuntimeColors) -> Color {
     match kind {
-        TileType::Stone => colors.tile_Stone,
-        TileType::Iron => colors.tile_Iron,
-        TileType::Copper => colors.tile_Copper,
-        TileType::Water => colors.tile_Water,
+        TileType::Stone => colors.tile_stone,
+        TileType::Iron => colors.tile_iron,
+        TileType::Copper => colors.tile_copper,
+        TileType::Water => colors.tile_water,
     }
 }
 
 // Default storage capacities.
-pub const DEFAULT_Warehouse_CAPACITY: i32 = 200;
-pub const DEFAULT_MINE_CAPACITY: i32 = 50;
+pub const DEFAULT_WAREHOUSE_CAPACITY: i32 = 2000;
+pub const DEFAULT_MINE_CAPACITY: i32 = 60;
 
 // Default capacity by block type.
 pub fn default_capacity(kind: BuildBlockType) -> i32 {
     match kind {
-        BuildBlockType::Warehouse => DEFAULT_Warehouse_CAPACITY,
+        BuildBlockType::Warehouse => DEFAULT_WAREHOUSE_CAPACITY,
         BuildBlockType::Mine => DEFAULT_MINE_CAPACITY,
         _ => 0,
     }
@@ -702,10 +702,10 @@ pub fn is_under_construction(block: &PlacedBlock) -> bool {
 // Pick a tile type using weighted probabilities and center bias.
 pub fn tile_kind_weighted(dist: i32, radius: i32, config: &AppConfig) -> TileType {
     let center_bias = 1.0 - (dist as f32 / radius as f32).clamp(0.0, 1.0);
-    let w_p = config.weight_Stone.max(0.0);
-    let mut w_h = config.weight_Iron.max(0.0);
-    let mut w_c = config.weight_Copper.max(0.0);
-    let w_a = config.weight_Water.max(0.0);
+    let w_p = config.weight_stone.max(0.0);
+    let mut w_h = config.weight_iron.max(0.0);
+    let mut w_c = config.weight_copper.max(0.0);
+    let w_a = config.weight_water.max(0.0);
     let bonus = center_bias * config.tile_center_bonus.max(0.0);
     w_h += bonus * 0.6;
     w_c += bonus * 0.4;

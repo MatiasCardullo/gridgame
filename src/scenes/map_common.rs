@@ -4,7 +4,7 @@ use crate::core::ui::{
     draw_window, ui_button, window_close_rect, window_title_rect, WindowState, WindowStyle,
     WINDOW_TITLE_HEIGHT,
 };
-use crate::{GRID_RADIUS, HEX_SIZE};
+use crate::{TRI_LENGHT, HEX_RADIUS, HEX_SIZE};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MapOutline {
@@ -28,11 +28,11 @@ pub struct PanelLayout {
 
 pub fn in_bounds(hex: Axial, outline: MapOutline) -> bool {
     match outline {
-        MapOutline::Hexagon => hex_distance(hex, Axial { q: 0, r: 0 }) <= GRID_RADIUS,
+        MapOutline::Hexagon => hex_distance(hex, Axial { q: 0, r: 0 }) <= HEX_RADIUS,
         MapOutline::Triangle => {
             let q = hex.q;
             let r = hex.r;
-            q >= 0 && r >= 0 && q + r <= GRID_RADIUS
+            q >= 0 && r >= 0 && q + r <= TRI_LENGHT
         }
     }
 }
@@ -42,8 +42,8 @@ fn outline_centroid(outline: MapOutline) -> Vec2 {
         MapOutline::Hexagon => Vec2::ZERO,
         MapOutline::Triangle => {
             let a = hex_to_pixel(Axial { q: 0, r: 0 }, HEX_SIZE, Vec2::ZERO);
-            let b = hex_to_pixel(Axial { q: GRID_RADIUS, r: 0 }, HEX_SIZE, Vec2::ZERO);
-            let c = hex_to_pixel(Axial { q: 0, r: GRID_RADIUS }, HEX_SIZE, Vec2::ZERO);
+            let b = hex_to_pixel(Axial { q: TRI_LENGHT, r: 0 }, HEX_SIZE, Vec2::ZERO);
+            let c = hex_to_pixel(Axial { q: 0, r: TRI_LENGHT }, HEX_SIZE, Vec2::ZERO);
             (a + b + c) / 3.0
         }
     }
@@ -69,7 +69,7 @@ pub fn draw_common_hud(
     hover_hex: Axial,
 ) {
     draw_text(
-        "Click: place  |  Wheel: zoom  |  Middle mouse: pan  |  R: rotate  |  Esc: menu",
+        "Right click: place  |  Wheel: zoom  |  Middle mouse: pan  |  R: rotate  |  Esc: menu",
         16.0,
         28.0,
         ctx.font_md,

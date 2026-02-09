@@ -22,7 +22,7 @@ use crate::scenes::map_common::{
     hover_hex_from_mouse,
     in_bounds,
 };
-use crate::{HEX_SIZE, GRID_RADIUS};
+use crate::{HEX_SIZE, HEX_RADIUS};
 
 // Helper function to get friendly label for machine block type
 fn machine_block_label(kind: MachineBlockType) -> &'static str {
@@ -135,8 +135,8 @@ pub fn run(
     }
 
     // Draw hexagonal grid and blocks
-    for r in -GRID_RADIUS..=GRID_RADIUS {
-        for q in -GRID_RADIUS..=GRID_RADIUS {
+    for r in -HEX_RADIUS..=HEX_RADIUS {
+        for q in -HEX_RADIUS..=HEX_RADIUS {
             let hex = Axial { q, r };
             if !in_bounds(hex, outline) {
                 continue;

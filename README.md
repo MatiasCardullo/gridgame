@@ -1,26 +1,27 @@
 # GridGame
 
-Juego de estrategia en grilla hexagonal hecho con Rust y Macroquad. Permite construir edificios, explotar recursos y manejar unidades de logistica en rutas.
+Hex-grid strategy game built with Rust and Macroquad. Build structures, extract resources, and move logistics units along routes.
 
-**Requisitos**
-1. Rust y Cargo instalados.
+**Requirements**
+1. Rust and Cargo installed.
 
-**Ejecutar**
+**Run**
 1. `cargo run`
 
-**Desarrollo**
-1. `cargo check` para validar tipos rapido.
-2. `cargo build` para compilar en modo debug.
-3. `cargo test` para ejecutar pruebas.
+**Development**
+1. `cargo check` for fast type checks.
+2. `cargo build` for a debug build.
+3. `cargo test` to run tests.
+4. `scripts/check.ps1` to run the standard check script.
 
-**Controles**
-1. Click izquierdo: abrir ventana de un bloque.
-2. Click derecho: colocar bloque o iniciar deconstruccion (si esta seleccionado "Deconstruir").
-3. Rueda del mouse: zoom.
-4. Boton medio (arrastrar): mover camara.
-5. `R`: rotar colocacion.
-6. `Esc`: volver al menu (guarda la partida).
+**Controls**
+1. Left click: open a block window.
+2. Right click: place a block or start demolish (when "Demolish" is selected).
+3. Mouse wheel: zoom.
+4. Middle mouse (drag): pan camera.
+5. `R`: rotate placement.
+6. `Esc`: back to menu (saves the game).
 
-**Notas**
-1. Las minas pueden expandir sus zonas anexadas desde la ventana del bloque.
-2. Las unidades de logistica se crean desde la ventana del bloque Logistica y pueden listarse con el boton "Lista unidades".
+**Notes**
+1. Mines can expand their attached zones from the block window.
+2. Logistics units are created from the Logistics block window and can be listed with "Unit list".

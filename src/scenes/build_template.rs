@@ -85,6 +85,7 @@ pub fn run(
     let panel_size = panel_layout.size;
     let panel_rect = panel_layout.rect;
 
+    let mut tooltip: Option<&str> = None;
     let ui_capturing = is_ui_capturing(panel_rect, window, confirm_window, ctx.mouse);
 
     // Handle block placement/deletion
@@ -158,8 +159,9 @@ pub fn run(
             if let Some(block) = blocks.get(&hex) {
                 draw_hex_filled(center, (HEX_SIZE - 2.5) * *cam_zoom, machine_block_color(block.kind));
             }
-
-            draw_hex_outline(center, size, colors.grid, config.line_thickness);
+            if *cam_zoom > 1.2 {
+                draw_hex_outline(center, size, colors.grid, config.line_thickness);
+            }
         }
     }
 
@@ -205,8 +207,41 @@ pub fn run(
     if panel_result.toggled {
         *panel_collapsed = !*panel_collapsed;
     }
+    if let Some(tip) = panel_result.hovered_tip {
+        tooltip = Some(tip);
+    }
     if let Some(option) = panel_result.clicked_option {
         *selected = option;
+    }
+
+    if let Some(tip) = tooltip {
+        let pad = 6.0;
+        let font_size = ctx.font_sm;
+        let dim = measure_text(tip, None, font_size as u16, 1.0);
+        let x = (ctx.mouse.x + 14.0).min(screen_width() - dim.width - 2.0 * pad);
+        let y = (ctx.mouse.y + 16.0).min(screen_height() - dim.height - 2.0 * pad);
+        draw_rectangle(
+            x,
+            y,
+            dim.width + 2.0 * pad,
+            dim.height + 2.0 * pad,
+            colors.tooltip_bg,
+        );
+        draw_rectangle_lines(
+            x,
+            y,
+            dim.width + 2.0 * pad,
+            dim.height + 2.0 * pad,
+            config.line_thickness.max(1.0),
+            colors.tooltip_border,
+        );
+        draw_text(
+            tip,
+            x + pad,
+            y + dim.height + pad - 2.0,
+            font_size,
+            colors.text_primary,
+        );
     }
 
     // Handle window interactions

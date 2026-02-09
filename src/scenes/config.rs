@@ -169,17 +169,6 @@ pub fn run(
     }
     y += row_gap;
 
-    let (dec, inc) = draw_stepper("Peso Stone", &format!("{:.2}", config.weight_stone), y);
-    if dec {
-        changed = true;
-        config.weight_stone = (config.weight_stone - 0.05).max(0.0);
-    }
-    if inc {
-        changed = true;
-        config.weight_stone = (config.weight_stone + 0.05).min(1.0);
-    }
-    y += row_gap;
-
     let (dec, inc) = draw_stepper("Peso Iron", &format!("{:.2}", config.weight_iron), y);
     if dec {
         changed = true;
@@ -199,6 +188,39 @@ pub fn run(
     if inc {
         changed = true;
         config.weight_copper = (config.weight_copper + 0.05).min(1.0);
+    }
+    y += row_gap;
+
+    let (dec, inc) = draw_stepper("Peso Gold", &format!("{:.2}", config.weight_gold), y);
+    if dec {
+        changed = true;
+        config.weight_gold = (config.weight_gold - 0.05).max(0.0);
+    }
+    if inc {
+        changed = true;
+        config.weight_gold = (config.weight_gold + 0.05).min(1.0);
+    }
+    y += row_gap;
+
+    let (dec, inc) = draw_stepper("Peso Zinc", &format!("{:.2}", config.weight_zinc), y);
+    if dec {
+        changed = true;
+        config.weight_zinc = (config.weight_zinc - 0.05).max(0.0);
+    }
+    if inc {
+        changed = true;
+        config.weight_zinc = (config.weight_zinc + 0.05).min(1.0);
+    }
+    y += row_gap;
+
+    let (dec, inc) = draw_stepper("Peso Lead", &format!("{:.2}", config.weight_lead), y);
+    if dec {
+        changed = true;
+        config.weight_lead = (config.weight_lead - 0.05).max(0.0);
+    }
+    if inc {
+        changed = true;
+        config.weight_lead = (config.weight_lead + 0.05).min(1.0);
     }
     y += row_gap;
 
@@ -299,4 +321,3 @@ pub fn run(
         *scene = Scene::MainMenu;
     }
 }
-

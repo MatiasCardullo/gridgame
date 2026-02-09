@@ -29,6 +29,7 @@ use crate::scenes::map_common::{
 // Friendly label for a block type.
 fn block_label(kind: BuildBlockType) -> &'static str {
     match kind {
+        BuildBlockType::Base => "Base",
         BuildBlockType::Housing => "Housing",
         BuildBlockType::Factory => "Factory",
         BuildBlockType::Mine => "Mine",
@@ -41,9 +42,12 @@ fn block_label(kind: BuildBlockType) -> &'static str {
 // Friendly label for an item type.
 fn item_label(kind: ItemType) -> &'static str {
     match kind {
-        ItemType::Stone => "Stone",
+        ItemType::Gangue => "Gangue",
         ItemType::Iron => "Iron",
         ItemType::Copper => "Copper",
+        ItemType::Gold => "Gold",
+        ItemType::Zinc => "Zinc",
+        ItemType::Lead => "Lead",
         ItemType::Water => "Water",
     }
 }
@@ -51,9 +55,11 @@ fn item_label(kind: ItemType) -> &'static str {
 // Friendly label for a tile kind.
 fn tile_label(kind: TileType) -> &'static str {
     match kind {
-        TileType::Stone => "Stone",
         TileType::Iron => "Iron",
         TileType::Copper => "Copper",
+        TileType::Gold => "Gold",
+        TileType::Zinc => "Zinc",
+        TileType::Lead => "Lead",
         TileType::Water => "Water",
     }
 }
@@ -238,6 +244,43 @@ fn unload_unit_to_block(cargo: &mut Vec<crate::core::ItemStack>, block: &mut Pla
     }
 }
 
+// Move only allowed items from a block storage into unit cargo.
+fn load_unit_from_block_filtered(
+    block: &mut PlacedBlock,
+    cargo: &mut Vec<crate::core::ItemStack>,
+    capacity: i32,
+    allowed: &[ItemType],
+) {
+    if allowed.is_empty() {
+        return;
+    }
+    let mut remaining = capacity - storage_total(cargo);
+    if remaining <= 0 {
+        return;
+    }
+    let mut index = 0usize;
+    while index < block.stored.len() && remaining > 0 {
+        let stack = block.stored[index];
+        if !allowed.iter().any(|k| *k == stack.kind) {
+            index += 1;
+            continue;
+        }
+        let take = stack.amount.min(remaining);
+        if take > 0 {
+            let added = add_item(cargo, stack.kind, take, capacity);
+            if added > 0 {
+                block.stored[index].amount -= added;
+                remaining -= added;
+            }
+        }
+        if block.stored[index].amount <= 0 {
+            block.stored.remove(index);
+        } else {
+            index += 1;
+        }
+    }
+}
+
 // Find a path from start to end traveling only along route tiles (plus endpoints).
 fn find_route_path(start: Axial, end: Axial, blocks: &HashMap<Axial, PlacedBlock>) -> Option<Vec<Axial>> {
     if start == end {
@@ -279,6 +322,91 @@ fn find_route_path(start: Axial, end: Axial, blocks: &HashMap<Axial, PlacedBlock
     None
 }
 
+fn find_direct_path(start: Axial, end: Axial) -> Option<Vec<Axial>> {
+    if start == end {
+        return Some(vec![start]);
+    }
+    let mut path = Vec::new();
+    path.push(start);
+    let mut current = start;
+    let mut guard = 0;
+    while current != end && guard < 4096 {
+        let mut best = current;
+        let mut best_dist = crate::core::hex_distance(current, end);
+        for neighbor in axial_neighbors(current) {
+            let dist = crate::core::hex_distance(neighbor, end);
+            if dist < best_dist {
+                best = neighbor;
+                best_dist = dist;
+            }
+        }
+        if best == current {
+            break;
+        }
+        current = best;
+        path.push(current);
+        guard += 1;
+    }
+    if current != end {
+        return None;
+    }
+    Some(path)
+}
+
+fn missing_requirements_near(
+    blocks: &HashMap<Axial, PlacedBlock>,
+    target: Axial,
+    reqs: &[crate::core::ItemStack],
+) -> Vec<ItemType> {
+    let mut missing = Vec::new();
+    for req in reqs {
+        let available = available_item_amount_near(blocks, target, req.kind);
+        if available < req.amount {
+            missing.push(req.kind);
+        }
+    }
+    missing
+}
+
+fn nearest_supply_with_items(
+    blocks: &HashMap<Axial, PlacedBlock>,
+    target: Axial,
+    needed: &[ItemType],
+) -> Option<Axial> {
+    let mut best_warehouse: Option<(i32, Axial)> = None;
+    let mut best_base: Option<(i32, Axial)> = None;
+    for (hex, block) in blocks.iter() {
+        if is_under_construction(block) {
+            continue;
+        }
+        if block.kind != BuildBlockType::Base && block.kind != BuildBlockType::Warehouse {
+            continue;
+        }
+        let has_any = block
+            .stored
+            .iter()
+            .any(|s| s.amount > 0 && needed.iter().any(|k| *k == s.kind));
+        if !has_any {
+            continue;
+        }
+        let dist = crate::core::hex_distance(*hex, target);
+        match block.kind {
+            BuildBlockType::Warehouse => match best_warehouse {
+                Some((best_dist, _)) if dist >= best_dist => {}
+                _ => best_warehouse = Some((dist, *hex)),
+            },
+            BuildBlockType::Base => match best_base {
+                Some((best_dist, _)) if dist >= best_dist => {}
+                _ => best_base = Some((dist, *hex)),
+            },
+            _ => {}
+        }
+    }
+    best_warehouse
+        .or(best_base)
+        .map(|(_, hex)| hex)
+}
+
 // Render and handle input for the game scene.
 pub fn run(
     ctx: &FrameContext,
@@ -305,16 +433,17 @@ pub fn run(
     outline: MapOutline,
 ) {
     let base_hex = Axial { q: TRI_LENGHT/3, r: TRI_LENGHT/3 };
-    if !blocks.contains_key(&base_hex) || blocks.get(&base_hex).map(|b| b.kind) != Some(BuildBlockType::Warehouse) {
-        let mut base = new_placed_block(BuildBlockType::Warehouse, 0);
+    if !blocks.contains_key(&base_hex) || blocks.get(&base_hex).map(|b| b.kind) != Some(BuildBlockType::Base) {
+        let mut base = new_placed_block(BuildBlockType::Base, 0);
         base.build_time = 0.0;
         base.build_progress = 0.0;
         base.build_paid = true;
         let initial_items = [
-            (ItemType::Stone, 60),
-            (ItemType::Iron, 40),
-            (ItemType::Copper, 30),
-            (ItemType::Water, 20),
+            (ItemType::Gangue, 1800),
+            (ItemType::Iron, 80),
+            (ItemType::Copper, 40),
+            (ItemType::Lead, 20),
+            (ItemType::Zinc, 10),
         ];
         for (kind, amount) in initial_items {
             add_item(&mut base.stored, kind, amount, base.capacity);
@@ -375,7 +504,16 @@ pub fn run(
                 if !blocks.contains_key(&hover_hex) {
                     let can_mine = tiles
                         .get(&hover_hex)
-                        .map(|t| matches!(t.kind, TileType::Stone | TileType::Iron | TileType::Copper) && t.amount > 0)
+                        .map(|t| {
+                            matches!(
+                                t.kind,
+                                TileType::Iron
+                                    | TileType::Copper
+                                    | TileType::Gold
+                                    | TileType::Zinc
+                                    | TileType::Lead
+                            ) && t.amount > 0
+                        })
                         .unwrap_or(false);
                     if kind != BuildBlockType::Mine || can_mine {
                         let rotation = if kind == BuildBlockType::Route { 0 } else { *placement_rotation };
@@ -423,7 +561,7 @@ pub fn run(
         .filter(|(_, block)| is_under_construction(block))
         .map(|(hex, _)| *hex)
         .collect();
-    for hex in build_hexes {
+    for hex in build_hexes.iter().copied() {
         let (kind, needs_pay) = match blocks.get(&hex) {
             Some(block) => (block.kind, !block.build_paid),
             None => continue,
@@ -444,6 +582,94 @@ pub fn run(
                     block.build_progress = block.build_time;
                 }
             }
+        }
+    }
+
+    units.retain(|unit| {
+        if !unit.auto_supply {
+            return true;
+        }
+        let needs_supply = blocks
+            .get(&unit.station_out)
+            .map(|block| is_under_construction(block) && !block.build_paid)
+            .unwrap_or(false);
+        if needs_supply {
+            return true;
+        }
+        unit.path.get(unit.index).copied() != Some(base_hex)
+    });
+
+    if !units.iter().any(|unit| unit.auto_supply) {
+        let mut best: Option<(i32, Axial, Axial, Vec<ItemType>, Vec<Axial>)> = None;
+        for target in build_hexes.iter().copied() {
+            let block = match blocks.get(&target) {
+                Some(block) => block,
+                None => continue,
+            };
+            if block.build_paid {
+                continue;
+            }
+            let reqs = build_requirements(block.kind);
+            if reqs.is_empty() {
+                continue;
+            }
+            let missing = missing_requirements_near(blocks, target, &reqs);
+            if missing.is_empty() {
+                continue;
+            }
+            let Some(source) = nearest_supply_with_items(blocks, target, &missing) else {
+                continue;
+            };
+            let path = if source == base_hex {
+                match find_direct_path(base_hex, target) {
+                    Some(path) => path,
+                    None => continue,
+                }
+            } else {
+                let first = match find_direct_path(base_hex, source) {
+                    Some(path) => path,
+                    None => continue,
+                };
+                let second = match find_direct_path(source, target) {
+                    Some(path) => path,
+                    None => continue,
+                };
+                let mut combined = first;
+                combined.extend(second.into_iter().skip(1));
+                combined
+            };
+            let dist = crate::core::hex_distance(source, target);
+            match best {
+                Some((best_dist, _, _, _, _)) if dist >= best_dist => {}
+                _ => best = Some((dist, target, source, missing, path)),
+            }
+        }
+        if let Some((_, target, source, missing, path)) = best {
+            let mut unit = crate::core::Unit {
+                path,
+                index: 0,
+                progress: 0.0,
+                speed: 3.0,
+                forward: true,
+                capacity: 30,
+                cargo: Vec::new(),
+                depot: base_hex,
+                station_in: source,
+                station_out: target,
+                auto_supply: true,
+                supply_types: missing,
+            };
+            if source == base_hex {
+                if let Some(block) = blocks.get_mut(&source) {
+                    load_unit_from_block_filtered(
+                        block,
+                        &mut unit.cargo,
+                        unit.capacity,
+                        &unit.supply_types,
+                    );
+                }
+            }
+            units.push(unit);
         }
     }
     for (hex, block) in blocks.iter_mut() {
@@ -475,6 +701,9 @@ pub fn run(
             if added <= 0 {
                 break;
             }
+            if tile.kind != TileType::Water {
+                let _ = add_item(&mut block.stored, ItemType::Gangue, added * 2, block.capacity);
+            }
             tile.amount -= added;
             block.mine_progress -= added as f32;
         }
@@ -505,7 +734,16 @@ pub fn run(
             let arrived = unit.path[unit.index];
             if arrived == unit.station_in {
                 if let Some(block) = blocks.get_mut(&arrived) {
-                    load_unit_from_block(block, &mut unit.cargo, unit.capacity);
+                    if unit.auto_supply {
+                        load_unit_from_block_filtered(
+                            block,
+                            &mut unit.cargo,
+                            unit.capacity,
+                            &unit.supply_types,
+                        );
+                    } else {
+                        load_unit_from_block(block, &mut unit.cargo, unit.capacity);
+                    }
                 }
             }
             if arrived == unit.station_out {
@@ -568,8 +806,9 @@ pub fn run(
                     }
                 }
             }
-
-            draw_hex_outline(center, size, colors.grid, config.line_thickness);
+            if *cam_zoom > 1.2 {
+                draw_hex_outline(center, size, colors.grid, config.line_thickness);
+            }
         }
     }
 
@@ -643,7 +882,16 @@ pub fn run(
         let empty = !blocks.contains_key(&hover_hex);
         let can_mine = tiles
             .get(&hover_hex)
-            .map(|t| matches!(t.kind, TileType::Stone | TileType::Iron | TileType::Copper) && t.amount > 0)
+            .map(|t| {
+                matches!(
+                    t.kind,
+                    TileType::Iron
+                        | TileType::Copper
+                        | TileType::Gold
+                        | TileType::Zinc
+                        | TileType::Lead
+                ) && t.amount > 0
+            })
             .unwrap_or(false);
         let can_place = within_bounds && empty && (kind != BuildBlockType::Mine || can_mine);
         if can_place {
@@ -678,9 +926,6 @@ pub fn run(
         *selected,
         |kind| block_color(kind, colors),
     );
-    if panel_result.toggle_hovered {
-        // ui_capturing would be updated here but not used after
-    }
     if panel_result.toggled {
         *panel_collapsed = !*panel_collapsed;
     }
@@ -689,6 +934,36 @@ pub fn run(
     }
     if let Some(option) = panel_result.clicked_option {
         *selected = option;
+    }
+
+    if let Some(tip) = tooltip {
+        let pad = 6.0;
+        let font_size = ctx.font_sm;
+        let dim = measure_text(tip, None, font_size as u16, 1.0);
+        let x = (ctx.mouse.x + 14.0).min(screen_width() - dim.width - 2.0 * pad);
+        let y = (ctx.mouse.y + 16.0).min(screen_height() - dim.height - 2.0 * pad);
+        draw_rectangle(
+            x,
+            y,
+            dim.width + 2.0 * pad,
+            dim.height + 2.0 * pad,
+            colors.tooltip_bg,
+        );
+        draw_rectangle_lines(
+            x,
+            y,
+            dim.width + 2.0 * pad,
+            dim.height + 2.0 * pad,
+            config.line_thickness.max(1.0),
+            colors.tooltip_border,
+        );
+        draw_text(
+            tip,
+            x + pad,
+            y + dim.height + pad - 2.0,
+            font_size,
+            colors.text_primary,
+        );
     }
 
     if window.open {
@@ -859,6 +1134,8 @@ pub fn run(
                                                 depot: target,
                                                 station_in: a,
                                                 station_out: b,
+                                                auto_supply: false,
+                                                supply_types: Vec::new(),
                                             });
                                         }
                                     }
@@ -969,7 +1246,7 @@ pub fn run(
                                 }
                             }
                         }
-                        BuildBlockType::Warehouse => {
+                        BuildBlockType::Base | BuildBlockType::Warehouse => {
                             let total = storage_total(&block.stored);
                             draw_text(
                                 &format!("Capacity: {}/{}", total, block.capacity),
@@ -1011,36 +1288,6 @@ pub fn run(
                 *dirty = true;
             }
         }
-    }
-
-    if let Some(tip) = tooltip {
-        let pad = 6.0;
-        let font_size = ctx.font_sm;
-        let dim = measure_text(tip, None, font_size as u16, 1.0);
-        let x = (ctx.mouse.x + 14.0).min(screen_width() - dim.width - 2.0 * pad);
-        let y = (ctx.mouse.y + 16.0).min(screen_height() - dim.height - 2.0 * pad);
-        draw_rectangle(
-            x,
-            y,
-            dim.width + 2.0 * pad,
-            dim.height + 2.0 * pad,
-            colors.tooltip_bg,
-        );
-        draw_rectangle_lines(
-            x,
-            y,
-            dim.width + 2.0 * pad,
-            dim.height + 2.0 * pad,
-            config.line_thickness.max(1.0),
-            colors.tooltip_border,
-        );
-        draw_text(
-            tip,
-            x + pad,
-            y + dim.height + pad - 2.0,
-            font_size,
-            colors.text_primary,
-        );
     }
 }
 

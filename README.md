@@ -24,4 +24,6 @@ Hex-grid strategy game built with Rust and Macroquad. Build structures, extract 
 
 **Notes**
 1. Mines can expand their attached zones from the block window.
-2. Logistics units are created from the Logistics block window and can be listed with "Unit list".
+2. Logistics and Builder units are created from their block windows and can be listed with "Unit list".
+3. Base auto-supply units prioritize non-Route construction and can source from Base or Warehouses.
+4. Builder auto-supply units prioritize Route construction, move faster, and travel only along Routes.

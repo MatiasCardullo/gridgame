@@ -113,6 +113,7 @@ pub fn color_target_name(target: ColorTarget) -> &'static str {
         ColorTarget::PortIn => "Input",
         ColorTarget::PortOut => "Output",
         ColorTarget::BlockBase => "Base",
+        ColorTarget::BlockBuilder => "Builder",
         ColorTarget::BlockHousing => "Housing",
         ColorTarget::BlockFactory => "Factory",
         ColorTarget::BlockMine => "Mine",
@@ -148,6 +149,7 @@ pub fn color_target_mut(target: ColorTarget, colors: &mut AppColors) -> &mut Col
         ColorTarget::PortIn => &mut colors.port_in,
         ColorTarget::PortOut => &mut colors.port_out,
         ColorTarget::BlockBase => &mut colors.block_base,
+        ColorTarget::BlockBuilder => &mut colors.block_builder,
         ColorTarget::BlockHousing => &mut colors.block_housing,
         ColorTarget::BlockFactory => &mut colors.block_factory,
         ColorTarget::BlockMine => &mut colors.block_mine,
@@ -196,6 +198,7 @@ pub enum ColorTarget {
     PortIn,
     PortOut,
     BlockBase,
+    BlockBuilder,
     BlockHousing,
     BlockFactory,
     BlockMine,
@@ -211,7 +214,7 @@ pub enum ColorTarget {
 }
 
 // Ordered list of selectable color targets.
-pub fn color_target_list() -> [ColorTarget; 29] {
+pub fn color_target_list() -> [ColorTarget; 30] {
     [
         ColorTarget::Background,
         ColorTarget::Grid,
@@ -230,6 +233,7 @@ pub fn color_target_list() -> [ColorTarget; 29] {
         ColorTarget::PortIn,
         ColorTarget::PortOut,
         ColorTarget::BlockBase,
+        ColorTarget::BlockBuilder,
         ColorTarget::BlockHousing,
         ColorTarget::BlockFactory,
         ColorTarget::BlockMine,

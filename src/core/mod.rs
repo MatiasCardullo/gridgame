@@ -20,6 +20,7 @@ pub struct Axial {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum BuildBlockType {
     Base,
+    Builder,
     Housing,
     Factory,
     Mine,
@@ -83,6 +84,12 @@ pub struct Block {
     #[serde(default)]
     pub build_paid: bool,
     #[serde(default)]
+    pub build_claimed: bool,
+    #[serde(default)]
+    pub builder_units_desired: i32,
+    #[serde(default)]
+    pub builder_units_created: i32,
+    #[serde(default)]
     pub mine_extra: Vec<Axial>,
 }
 
@@ -120,6 +127,9 @@ pub struct PlacedBlock {
     pub build_progress: f32,
     pub build_time: f32,
     pub build_paid: bool,
+    pub build_claimed: bool,
+    pub builder_units_desired: i32,
+    pub builder_units_created: i32,
     pub mine_extra: Vec<Axial>,
 }
 
@@ -143,8 +153,28 @@ pub struct Unit {
     pub depot: Axial,
     pub station_in: Axial,
     pub station_out: Axial,
+    #[serde(default)]
     pub auto_supply: bool,
+    #[serde(default)]
     pub supply_types: Vec<ItemType>,
+    #[serde(default)]
+    pub auto_supply_role: AutoSupplyRole,
+    #[serde(default)]
+    pub supply_reqs: Vec<ItemStack>,
+    #[serde(default)]
+    pub waiting_for_supply: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AutoSupplyRole {
+    Base,
+    Builder,
+}
+
+impl Default for AutoSupplyRole {
+    fn default() -> Self {
+        AutoSupplyRole::Base
+    }
 }
 
 // Select which endpoint to set for logistics units.
@@ -260,6 +290,7 @@ pub struct RuntimeColors {
     pub block_housing: Color,
     pub block_factory: Color,
     pub block_base: Color,
+    pub block_builder: Color,
     pub block_mine: Color,
     pub block_warehouse: Color,
     pub block_logistics: Color,
@@ -295,6 +326,7 @@ pub struct AppColors {
     pub block_housing: ColorRgba,
     pub block_factory: ColorRgba,
     pub block_base: ColorRgba,
+    pub block_builder: ColorRgba,
     pub block_mine: ColorRgba,
     pub block_warehouse: ColorRgba,
     pub block_logistics: ColorRgba,
@@ -329,6 +361,7 @@ impl Default for AppColors {
             block_housing: ColorRgba { r: 120, g: 200, b: 120, a: 255 },
             block_factory: ColorRgba { r: 220, g: 140, b: 80, a: 255 },
             block_base: ColorRgba { r: 150, g: 170, b: 220, a: 255 },
+            block_builder: ColorRgba { r: 130, g: 200, b: 210, a: 255 },
             block_mine: ColorRgba { r: 110, g: 150, b: 200, a: 255 },
             block_warehouse: ColorRgba { r: 210, g: 190, b: 90, a: 255 },
             block_logistics: ColorRgba { r: 120, g: 140, b: 160, a: 255 },
@@ -366,6 +399,7 @@ impl AppColors {
             block_housing: self.block_housing.to_color(),
             block_factory: self.block_factory.to_color(),
             block_base: self.block_base.to_color(),
+            block_builder: self.block_builder.to_color(),
             block_mine: self.block_mine.to_color(),
             block_warehouse: self.block_warehouse.to_color(),
             block_logistics: self.block_logistics.to_color(),
@@ -513,6 +547,9 @@ pub fn save_map(
                 build_progress: placed.build_progress,
                 build_time: placed.build_time,
                 build_paid: placed.build_paid,
+                build_claimed: placed.build_claimed,
+                builder_units_desired: placed.builder_units_desired,
+                builder_units_created: placed.builder_units_created,
                 mine_extra: placed.mine_extra.clone(),
             })
             .collect(),
@@ -563,14 +600,17 @@ pub fn load_map(path: &str) -> (
                             } else {
                                 b.capacity
                             },
-                            stored: b.stored,
-                            build_progress: b.build_progress,
-                            build_time: b.build_time,
-                            build_paid: b.build_paid,
-                            mine_extra: b.mine_extra,
-                        },
-                    )
-                })
+                              stored: b.stored,
+                              build_progress: b.build_progress,
+                              build_time: b.build_time,
+                              build_paid: b.build_paid,
+                              build_claimed: b.build_claimed,
+                              builder_units_desired: b.builder_units_desired,
+                              builder_units_created: b.builder_units_created,
+                              mine_extra: b.mine_extra,
+                          },
+                      )
+                  })
                 .collect();
             let tiles = data
                 .tiles
@@ -595,6 +635,7 @@ pub fn load_map(path: &str) -> (
 pub fn block_color(kind: BuildBlockType, colors: &RuntimeColors) -> Color {
     match kind {
         BuildBlockType::Base => colors.block_base,
+        BuildBlockType::Builder => colors.block_builder,
         BuildBlockType::Housing => colors.block_housing,
         BuildBlockType::Factory => colors.block_factory,
         BuildBlockType::Mine => colors.block_mine,
@@ -620,11 +661,13 @@ pub fn tile_color(kind: TileType, colors: &RuntimeColors) -> Color {
 pub const DEFAULT_WAREHOUSE_CAPACITY: i32 = 2000;
 pub const DEFAULT_MINE_CAPACITY: i32 = 60;
 pub const DEFAULT_BASE_CAPACITY: i32 = 2000;
+pub const DEFAULT_BUILDER_CAPACITY: i32 = 60;
 
 // Default capacity by block type.
 pub fn default_capacity(kind: BuildBlockType) -> i32 {
     match kind {
         BuildBlockType::Base => DEFAULT_BASE_CAPACITY,
+        BuildBlockType::Builder => DEFAULT_BUILDER_CAPACITY,
         BuildBlockType::Warehouse => DEFAULT_WAREHOUSE_CAPACITY,
         BuildBlockType::Mine => DEFAULT_MINE_CAPACITY,
         _ => 0,
@@ -647,12 +690,13 @@ pub fn item_from_tile(kind: TileType) -> ItemType {
 pub fn build_time(kind: BuildBlockType) -> f32 {
     match kind {
         BuildBlockType::Base => 0.0,
+        BuildBlockType::Builder => 5.0,
         BuildBlockType::Housing => 6.0,
-        BuildBlockType::Factory => 9.0,
-        BuildBlockType::Mine => 0.0,
+        BuildBlockType::Factory => 8.0,
+        BuildBlockType::Mine => 9.0,
         BuildBlockType::Warehouse => 7.0,
         BuildBlockType::Logistics => 8.0,
-        BuildBlockType::Route => 2.0,
+        BuildBlockType::Route => 0.5,
     }
 }
 
@@ -660,6 +704,20 @@ pub fn build_time(kind: BuildBlockType) -> f32 {
 pub fn build_requirements(kind: BuildBlockType) -> Vec<ItemStack> {
     match kind {
         BuildBlockType::Base => vec![],
+        BuildBlockType::Builder => vec![
+            ItemStack {
+                kind: ItemType::Gangue,
+                amount: 8,
+            },
+            ItemStack {
+                kind: ItemType::Iron,
+                amount: 4,
+            },
+            ItemStack {
+                kind: ItemType::Copper,
+                amount: 2,
+            },
+        ],
         BuildBlockType::Housing => vec![
             ItemStack {
                 kind: ItemType::Gangue,
@@ -680,7 +738,20 @@ pub fn build_requirements(kind: BuildBlockType) -> Vec<ItemStack> {
                 amount: 8,
             },
         ],
-        BuildBlockType::Mine => vec![],
+        BuildBlockType::Mine => vec![
+            ItemStack {
+                kind: ItemType::Gangue,
+                amount: 12,
+            },
+            ItemStack {
+                kind: ItemType::Iron,
+                amount: 6,
+            },
+            ItemStack {
+                kind: ItemType::Copper,
+                amount: 4,
+            },
+        ],
         BuildBlockType::Warehouse => vec![
             ItemStack {
                 kind: ItemType::Gangue,
@@ -858,6 +929,9 @@ pub fn new_placed_block(kind: BuildBlockType, rotation: u8) -> PlacedBlock {
         build_progress: 0.0,
         build_time: build_time(kind),
         build_paid: false,
+        build_claimed: false,
+        builder_units_desired: 0,
+        builder_units_created: 0,
         mine_extra: Vec::new(),
     }
 }
@@ -871,6 +945,7 @@ pub fn rotate_dir(dir: i32, rotation: u8) -> i32 {
 pub fn block_ports(kind: BuildBlockType, rotation: u8) -> (Vec<i32>, Vec<i32>) {
     let (inputs, outputs) = match kind {
         BuildBlockType::Base => (vec![0, 3], vec![0, 3]),
+        BuildBlockType::Builder => (vec![0, 3], vec![0, 3]),
         BuildBlockType::Housing => (vec![0, 2, 4], vec![1, 3, 5]),
         BuildBlockType::Factory => (vec![0, 1, 2], vec![3, 4, 5]),
         BuildBlockType::Mine => (vec![], vec![0, 1, 2, 3, 4, 5]),

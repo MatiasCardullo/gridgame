@@ -1,6 +1,16 @@
 use macroquad::prelude::*;
+use std::sync::OnceLock;
 
 use crate::core::Scene;
+
+fn wrap_angle(mut angle: f32) -> f32 {
+    let two_pi = std::f32::consts::PI * 2.0;
+    angle = (angle + std::f32::consts::PI) % two_pi;
+    if angle < 0.0 {
+        angle += two_pi;
+    }
+    angle - std::f32::consts::PI
+}
 
 fn rotate_vec3(v: Vec3, axis: Vec3, angle: f32) -> Vec3 {
     let axis = axis.normalize();
@@ -36,6 +46,88 @@ fn icosahedron_vertices() -> [Vec3; 12] {
         vec3(-1.0, -phi, 0.0),
         vec3( 1.0, -phi, 0.0),
     ]
+}
+
+fn hash2(x: i32, y: i32, seed: u32) -> f32 {
+    let mut n = (x as i64) * 374761393 + (y as i64) * 668265263 + seed as i64 * 69069;
+    n = (n ^ (n >> 13)).wrapping_mul(1274126177);
+    let n = n ^ (n >> 16);
+    (n as u32) as f32 / u32::MAX as f32
+}
+
+fn value_noise(x: f32, y: f32, seed: u32) -> f32 {
+    let x0 = x.floor() as i32;
+    let y0 = y.floor() as i32;
+    let x1 = x0 + 1;
+    let y1 = y0 + 1;
+    let sx = x - x0 as f32;
+    let sy = y - y0 as f32;
+    let u = sx * sx * (3.0 - 2.0 * sx);
+    let v = sy * sy * (3.0 - 2.0 * sy);
+    let n00 = hash2(x0, y0, seed);
+    let n10 = hash2(x1, y0, seed);
+    let n01 = hash2(x0, y1, seed);
+    let n11 = hash2(x1, y1, seed);
+    let nx0 = n00 + (n10 - n00) * u;
+    let nx1 = n01 + (n11 - n01) * u;
+    nx0 + (nx1 - nx0) * v
+}
+
+fn fbm(x: f32, y: f32, seed: u32) -> f32 {
+    let mut sum = 0.0;
+    let mut amp = 0.5;
+    let mut freq = 1.0;
+    for i in 0..5 {
+        sum += value_noise(x * freq, y * freq, seed + i) * amp;
+        freq *= 2.0;
+        amp *= 0.5;
+    }
+    sum.clamp(0.0, 1.0)
+}
+
+fn build_planet_texture(size: u16) -> Texture2D {
+    let mut img = Image::gen_image_color(size, size / 2, Color::new(0.0, 0.0, 0.0, 1.0));
+    let seed = 1337;
+    let width = img.width() as f32;
+    let height = img.height() as f32;
+    for y in 0..img.height() {
+        for x in 0..img.width() {
+            let u = x as f32 / width;
+            let v = y as f32 / height;
+            let lat = (v - 0.5) * std::f32::consts::PI;
+            let lon = (u - 0.5) * std::f32::consts::PI * 2.0;
+            let nx = lon.cos() * lat.cos();
+            let ny = lat.sin();
+            let nz = lon.sin() * lat.cos();
+            let noise = fbm(nx * 2.2 + 3.7, nz * 2.2 - 1.9, seed);
+            let height_val = (noise * 1.1 - 0.25 + ny * 0.15).clamp(0.0, 1.0);
+            let ice = (ny.abs() - 0.65).clamp(0.0, 1.0);
+            let (mut r, mut g, mut b) = if height_val < 0.45 {
+                (0.08, 0.18, 0.42)
+            } else if height_val < 0.6 {
+                (0.12, 0.32, 0.24)
+            } else if height_val < 0.78 {
+                (0.22, 0.44, 0.26)
+            } else {
+                (0.48, 0.46, 0.40)
+            };
+            if ice > 0.0 {
+                let t = ice * ice;
+                r = r * (1.0 - t) + 0.85 * t;
+                g = g * (1.0 - t) + 0.9 * t;
+                b = b * (1.0 - t) + 0.95 * t;
+            }
+            img.set_pixel(x as u32, y as u32, Color::new(r, g, b, 1.0));
+        }
+    }
+    let tex = Texture2D::from_image(&img);
+    tex.set_filter(FilterMode::Linear);
+    tex
+}
+
+fn planet_texture() -> Texture2D {
+    static TEX: OnceLock<Texture2D> = OnceLock::new();
+    TEX.get_or_init(|| build_planet_texture(512)).clone()
 }
 
 fn draw_arc_on_sphere(start: Vec3, end: Vec3, radius: f32, segments: usize, color: Color) {
@@ -173,6 +265,21 @@ fn hovered_face(
     best.map(|(_, idx)| idx)
 }
 
+fn face_normal(vertices: &[Vec3; 12], face: [usize; 3]) -> Vec3 {
+    let a = vertices[face[0]];
+    let b = vertices[face[1]];
+    let c = vertices[face[2]];
+    let mut normal = (b - a).cross(c - a);
+    if normal.length() < 1e-5 {
+        return vec3(0.0, 1.0, 0.0);
+    }
+    normal = normal.normalize();
+    if normal.dot(a) < 0.0 {
+        normal = -normal;
+    }
+    normal
+}
+
 fn align_vertices_to_poles(vertices: [Vec3; 12]) -> [Vec3; 12] {
     let mut max_index = 0usize;
     let mut max_y = vertices[0].y;
@@ -218,6 +325,8 @@ pub fn run(
     pitch: &mut f32,
     distance: &mut f32,
     target_distance: &mut f32,
+    target_yaw: &mut f32,
+    target_pitch: &mut f32,
     dragging: &mut bool,
     last_mouse: &mut Vec2,
     scene: &mut Scene,
@@ -237,6 +346,8 @@ pub fn run(
             *yaw += delta.x * 0.01;
             *pitch += delta.y * 0.01;
             *pitch = pitch.clamp(-1.3, 1.3);
+            *target_yaw = *yaw;
+            *target_pitch = *pitch;
             *last_mouse = mouse;
         }
     } else {
@@ -245,9 +356,12 @@ pub fn run(
 
     let (_wx, wy) = mouse_wheel();
     if wy.abs() > 0.01 {
-        *target_distance = (*target_distance - wy * 0.6).clamp(2.5, 20.0);
+        *target_distance = (*target_distance - wy * 0.01).clamp(2.0, 20.0);
     }
-    *distance += (*target_distance - *distance) * 0.12;
+    *distance += (*target_distance - *distance) * 0.06;
+    let yaw_delta = wrap_angle(*target_yaw - *yaw);
+    *yaw += yaw_delta * 0.12;
+    *pitch += (*target_pitch - *pitch) * 0.12;
 
     let camera_pos = vec3(
         *distance * yaw.cos() * pitch.cos(),
@@ -264,7 +378,9 @@ pub fn run(
     set_camera(&camera);
 
     let radius = 1.6;
-    draw_sphere_wires(vec3(0.0, 0.0, 0.0), radius, None, Color::from_rgba(120, 150, 180, 255));
+    let tex = planet_texture();
+    draw_sphere(vec3(0.0, 0.0, 0.0), radius, Some(&tex), WHITE);
+    draw_sphere_wires(vec3(0.0, 0.0, 0.0), radius, None, Color::from_rgba(120, 150, 180, 180));
 
     let vertices = align_vertices_to_poles(icosahedron_vertices());
     let edges = icosahedron_edges();
@@ -300,6 +416,14 @@ pub fn run(
         draw_arc_on_sphere(a, b, radius, segments, hover_color);
         draw_arc_on_sphere(b, c, radius, segments, hover_color);
         draw_arc_on_sphere(c, a, radius, segments, hover_color);
+    }
+    if let Some(face_index) = hovered {
+        if is_mouse_button_pressed(MouseButton::Left) {
+            let face = faces[face_index];
+            let normal = face_normal(&vertices, face);
+            *target_yaw = normal.z.atan2(normal.x);
+            *target_pitch = normal.y.asin();
+        }
     }
 
     set_default_camera();

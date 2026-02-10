@@ -69,6 +69,11 @@ async fn main() {
     let mut station_in: Option<Axial> = None;
     let mut station_out: Option<Axial> = None;
     let mut station_pick: Option<StationPick> = None;
+    let mut planet_yaw: f32 = 0.0;
+    let mut planet_pitch: f32 = 0.3;
+    let mut planet_distance: f32 = 6.0;
+    let mut planet_dragging = false;
+    let mut planet_last_mouse = Vec2::ZERO;
     let mut dirty = false;
     let mut scene = Scene::MainMenu;
 
@@ -159,6 +164,16 @@ async fn main() {
                     scenes::map_common::MapOutline::Triangle,
                 );
             }
+            Scene::Planet => {
+                scenes::planet::run(
+                    &mut planet_yaw,
+                    &mut planet_pitch,
+                    &mut planet_distance,
+                    &mut planet_dragging,
+                    &mut planet_last_mouse,
+                    &mut scene,
+                );
+            }
             Scene::BuildTemplate => {
                 scenes::build_template::run(
                     &ctx,
@@ -182,4 +197,3 @@ async fn main() {
         next_frame().await;
     }
 }
-

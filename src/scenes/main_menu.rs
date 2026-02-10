@@ -72,6 +72,13 @@ pub fn run(
     }
     y += btn_h + 12.0;
 
+    let rect_planet = Rect::new((screen_width() - btn_w) * 0.5, y, btn_w, btn_h);
+    let (clicked_planet, _) = ui_button(rect_planet, "Planet", ctx.mouse, ctx.font_md, ctx.button_colors);
+    if clicked_planet {
+        *scene = Scene::Planet;
+    }
+    y += btn_h + 12.0;
+
     let rect_cfg = Rect::new((screen_width() - btn_w) * 0.5, y, btn_w, btn_h);
     let (clicked_cfg, _) = ui_button(rect_cfg, "Configuracion", ctx.mouse, ctx.font_md, ctx.button_colors);
     if clicked_cfg {

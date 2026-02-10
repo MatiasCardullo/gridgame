@@ -190,6 +190,7 @@ pub enum Scene {
     MainMenu,
     Config,
     PlanetSector,
+    Planet,
     BuildTemplate,
 }
 

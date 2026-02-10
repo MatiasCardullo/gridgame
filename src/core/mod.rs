@@ -474,6 +474,7 @@ pub fn axial_round(q: f32, r: f32) -> Axial {
     } else {
         z = -x - y;
     }
+    let _ = y;
 
     Axial {
         q: x as i32,

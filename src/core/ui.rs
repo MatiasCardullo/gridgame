@@ -259,7 +259,6 @@ pub fn draw_game_panel(
     colors: &RuntimeColors,
 ) -> PanelResult {
     let mut toggled = false;
-    let mut toggle_hovered = false;
 
     draw_rectangle(panel_pos.x, panel_pos.y, panel_size.x, panel_size.y, colors.panel_bg);
     draw_rectangle_lines(
@@ -272,7 +271,7 @@ pub fn draw_game_panel(
     );
 
     let toggle_rect = Rect::new(panel_pos.x + panel_size.x - 32.0, panel_pos.y + 6.0, 26.0, 24.0);
-    toggle_hovered = toggle_rect.contains(mouse);
+    let toggle_hovered = toggle_rect.contains(mouse);
     let toggle_color = if toggle_hovered { colors.button_hover } else { colors.button_base };
     draw_rectangle(toggle_rect.x, toggle_rect.y, toggle_rect.w, toggle_rect.h, toggle_color);
     draw_rectangle_lines(

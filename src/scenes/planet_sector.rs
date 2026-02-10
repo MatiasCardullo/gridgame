@@ -126,79 +126,6 @@ fn expand_mine_area(
     added
 }
 
-fn requirement_sources(target: Axial) -> Vec<Axial> {
-    let mut sources = Vec::with_capacity(7);
-    sources.push(target);
-    sources.extend(axial_neighbors(target));
-    sources
-}
-
-fn available_item_amount_near(
-    blocks: &HashMap<Axial, PlacedBlock>,
-    target: Axial,
-    kind: ItemType,
-) -> i32 {
-    requirement_sources(target)
-        .into_iter()
-        .filter_map(|hex| blocks.get(&hex).map(|b| (hex, b)))
-        .filter(|(_, block)| !is_under_construction(block))
-        .flat_map(|(_, block)| block.stored.iter())
-        .filter(|s| s.kind == kind)
-        .map(|s| s.amount)
-        .sum()
-}
-
-fn has_requirements_near(
-    blocks: &HashMap<Axial, PlacedBlock>,
-    target: Axial,
-    reqs: &[crate::core::ItemStack],
-) -> bool {
-    reqs.iter()
-        .all(|req| available_item_amount_near(blocks, target, req.kind) >= req.amount)
-}
-
-fn consume_requirements_near(
-    blocks: &mut HashMap<Axial, PlacedBlock>,
-    target: Axial,
-    reqs: &[crate::core::ItemStack],
-) -> bool {
-    if !has_requirements_near(blocks, target, reqs) {
-        return false;
-    }
-    let sources = requirement_sources(target);
-    for req in reqs {
-        let mut remaining = req.amount;
-        for hex in sources.iter().copied() {
-            if remaining <= 0 {
-                break;
-            }
-            let take_from = match blocks.get_mut(&hex) {
-                Some(block) => {
-                    if is_under_construction(block) {
-                        continue;
-                    }
-                    block
-                }
-                None => continue,
-            };
-            let mut index = 0usize;
-            while index < take_from.stored.len() && remaining > 0 {
-                if take_from.stored[index].kind == req.kind {
-                    let take = take_from.stored[index].amount.min(remaining);
-                    take_from.stored[index].amount -= take;
-                    remaining -= take;
-                    if take_from.stored[index].amount <= 0 {
-                        take_from.stored.remove(index);
-                        continue;
-                    }
-                }
-                index += 1;
-            }
-        }
-    }
-    true
-}
-
 // Move items from a block storage into unit cargo.
 fn load_unit_from_block(
     block: &mut PlacedBlock,
@@ -336,42 +263,6 @@ fn take_reqs_from_block(
 }
 
 // Move only allowed items from a block storage into unit cargo.
-fn load_unit_from_block_filtered(
-    block: &mut PlacedBlock,
-    cargo: &mut Vec<crate::core::ItemStack>,
-    capacity: i32,
-    allowed: &[ItemType],
-) {
-    if allowed.is_empty() {
-        return;
-    }
-    let mut remaining = capacity - storage_total(cargo);
-    if remaining <= 0 {
-        return;
-    }
-    let mut index = 0usize;
-    while index < block.stored.len() && remaining > 0 {
-        let stack = block.stored[index];
-        if !allowed.iter().any(|k| *k == stack.kind) {
-            index += 1;
-            continue;
-        }
-        let take = stack.amount.min(remaining);
-        if take > 0 {
-            let added = add_item(cargo, stack.kind, take, capacity);
-            if added > 0 {
-                block.stored[index].amount -= added;
-                remaining -= added;
-            }
-        }
-        if block.stored[index].amount <= 0 {
-            block.stored.remove(index);
-        } else {
-            index += 1;
-        }
-    }
-}
-
 // Find a path from start to end traveling only along route tiles (plus endpoints).
 fn find_route_path(start: Axial, end: Axial, blocks: &HashMap<Axial, PlacedBlock>) -> Option<Vec<Axial>> {
     if start == end {
@@ -456,14 +347,24 @@ fn combine_paths(a: Vec<Axial>, b: Vec<Axial>) -> Vec<Axial> {
     combined
 }
 
-fn missing_requirements_near(
+fn missing_requirements_for_target(
     blocks: &HashMap<Axial, PlacedBlock>,
     target: Axial,
     reqs: &[crate::core::ItemStack],
 ) -> Vec<ItemType> {
     let mut missing = Vec::new();
+    let available_from_target = blocks.get(&target);
     for req in reqs {
-        let available = available_item_amount_near(blocks, target, req.kind);
+        let available = available_from_target
+            .map(|block| {
+                block
+                    .stored
+                    .iter()
+                    .filter(|s| s.kind == req.kind)
+                    .map(|s| s.amount)
+                    .sum::<i32>()
+            })
+            .unwrap_or(0);
         if available < req.amount {
             missing.push(req.kind);
         }
@@ -528,24 +429,6 @@ fn nearest_builder_with_items(
             .iter()
             .any(|s| s.amount > 0 && needed.iter().any(|k| *k == s.kind));
         if !has_any {
-            continue;
-        }
-        let dist = crate::core::hex_distance(*hex, target);
-        match best {
-            Some((best_dist, _)) if dist >= best_dist => {}
-            _ => best = Some((dist, *hex)),
-        }
-    }
-    best.map(|(_, hex)| hex)
-}
-
-fn nearest_builder(blocks: &HashMap<Axial, PlacedBlock>, target: Axial) -> Option<Axial> {
-    let mut best: Option<(i32, Axial)> = None;
-    for (hex, block) in blocks.iter() {
-        if is_under_construction(block) {
-            continue;
-        }
-        if block.kind != BuildBlockType::Builder {
             continue;
         }
         let dist = crate::core::hex_distance(*hex, target);
@@ -708,26 +591,12 @@ pub fn run(
 
     let dt = get_frame_time();
     let mut spawn_request: Option<(Axial, Axial, Axial, BuildBlockType)> = None;
-    let mut force_spawn_builder = false;
     let build_hexes: Vec<Axial> = blocks
         .iter()
         .filter(|(_, block)| is_under_construction(block))
         .map(|(hex, _)| *hex)
         .collect();
     for hex in build_hexes.iter().copied() {
-        let (kind, needs_pay) = match blocks.get(&hex) {
-            Some(block) => (block.kind, !block.build_paid),
-            None => continue,
-        };
-        if needs_pay {
-            let reqs = build_requirements(kind);
-            let paid = reqs.is_empty() || consume_requirements_near(blocks, hex, &reqs);
-            if paid {
-                if let Some(block) = blocks.get_mut(&hex) {
-                    block.build_paid = true;
-                }
-            }
-        }
         if let Some(block) = blocks.get_mut(&hex) {
             if block.build_paid {
                 block.build_progress += dt;
@@ -767,6 +636,9 @@ pub fn run(
     let has_auto_base = units
         .iter()
         .any(|unit| unit.auto_supply && unit.auto_supply_role == AutoSupplyRole::Base);
+    let has_builder = blocks
+        .values()
+        .any(|block| block.kind == BuildBlockType::Builder && !is_under_construction(block));
 
     let mut builder_active: HashMap<Axial, usize> = HashMap::new();
     for unit in units.iter() {
@@ -775,11 +647,7 @@ pub fn run(
         }
     }
 
-    let mut spawn_builder_depot = if force_spawn_builder {
-        window.target
-    } else {
-        None
-    };
+    let mut spawn_builder_depot = None;
 
     for (hex, block) in blocks.iter() {
         if block.kind != BuildBlockType::Builder {
@@ -811,7 +679,7 @@ pub fn run(
             if reqs.is_empty() {
                 continue;
             }
-            let missing = missing_requirements_near(blocks, target, &reqs);
+            let missing = missing_requirements_for_target(blocks, target, &reqs);
             if missing.is_empty() {
                 continue;
             }
@@ -852,7 +720,7 @@ pub fn run(
             };
             let dist = crate::core::hex_distance(depot, target);
             match best {
-                Some((best_prio, best_dist, _, _, _, _)) if priority > best_prio => {}
+                Some((best_prio, _, _, _, _, _)) if priority > best_prio => {}
                 Some((best_prio, best_dist, _, _, _, _)) if priority == best_prio && dist >= best_dist => {}
                 _ => best = Some((priority, dist, target, source, missing, path)),
             }
@@ -913,7 +781,7 @@ pub fn run(
             if reqs.is_empty() {
                 continue;
             }
-            let missing = missing_requirements_near(blocks, target, &reqs);
+            let missing = missing_requirements_for_target(blocks, target, &reqs);
             if missing.is_empty() {
                 continue;
             }
@@ -951,10 +819,22 @@ pub fn run(
                 combine_paths(combine_paths(first, second), third)
             };
             let dist = crate::core::hex_distance(source, target);
-            match best {
-                Some((best_prio, best_dist, _, _, _, _)) if priority > best_prio => {}
-                Some((best_prio, best_dist, _, _, _, _)) if priority == best_prio && dist >= best_dist => {}
-                _ => best = Some((priority, dist, target, source, missing, path)),
+            let better = match best {
+                None => true,
+                Some((best_prio, best_dist, _, _, _, _)) => {
+                    if priority < best_prio {
+                        true
+                    } else if priority > best_prio {
+                        false
+                    } else if has_builder {
+                        dist > best_dist
+                    } else {
+                        dist < best_dist
+                    }
+                }
+            };
+            if better {
+                best = Some((priority, dist, target, source, missing, path));
             }
         }
         if let Some((_, _, target, source, missing, path)) = best {
@@ -1062,12 +942,23 @@ pub fn run(
         if unit.path.len() < 2 {
             continue;
         }
+        let is_logistics = blocks
+            .get(&unit.depot)
+            .map(|block| block.kind == BuildBlockType::Logistics)
+            .unwrap_or(false);
         unit.progress += dt * unit.speed;
         while unit.progress >= 1.0 {
             unit.progress -= 1.0;
-            if unit.auto_supply {
+            if unit.auto_supply || is_logistics {
                 if unit.index + 1 < unit.path.len() {
                     unit.index += 1;
+                } else if is_logistics {
+                    let start = unit.path.first().copied();
+                    if start == Some(unit.depot) {
+                        unit.index = 1.min(unit.path.len() - 1);
+                    } else {
+                        unit.index = 0;
+                    }
                 } else {
                     unit.index = 0;
                 }
@@ -1081,12 +972,22 @@ pub fn run(
             } else {
                 if unit.index > 0 {
                     unit.index -= 1;
-                }
-                if unit.index == 0 {
+                } else {
                     unit.forward = true;
                 }
             }
             let arrived = unit.path[unit.index];
+            if is_logistics
+                && unit.path.len() > 1
+                && unit.path.first().copied() == Some(unit.depot)
+                && arrived == unit.station_in
+            {
+                let arrived_index = unit.index;
+                if arrived_index > 0 {
+                    unit.path.drain(0..arrived_index);
+                }
+                unit.index = 0;
+            }
             if arrived == unit.station_in {
                 if unit.auto_supply {
                     let target_build_paid = blocks
@@ -1117,11 +1018,31 @@ pub fn run(
                             }
                         }
                     }
+                } else if is_logistics {
+                    if unit.cargo.is_empty() {
+                        if let Some(block) = blocks.get_mut(&arrived) {
+                            load_unit_from_block(block, &mut unit.cargo, unit.capacity);
+                        }
+                    }
                 } else if let Some(block) = blocks.get_mut(&arrived) {
                     load_unit_from_block(block, &mut unit.cargo, unit.capacity);
                 }
             }
-            if arrived == unit.station_out {
+            if unit.auto_supply
+                && crate::core::hex_distance(arrived, unit.station_out) <= 1
+            {
+                let under_construction = blocks
+                    .get(&unit.station_out)
+                    .map(|block| is_under_construction(block))
+                    .unwrap_or(false);
+                if under_construction {
+                    apply_cargo_to_construction(blocks, unit.station_out, &mut unit.cargo);
+                }
+            } else if is_logistics && arrived == unit.station_out {
+                if let Some(block) = blocks.get_mut(&arrived) {
+                    unload_unit_to_block(&mut unit.cargo, block);
+                }
+            } else if arrived == unit.station_out {
                 let under_construction = blocks
                     .get(&arrived)
                     .map(|block| is_under_construction(block))
@@ -1167,7 +1088,8 @@ pub fn run(
                     color.a = 0.35;
                 }
                 draw_hex_filled(center, (HEX_SIZE - 2.5) * *cam_zoom, color);
-                if !is_under_construction(placed) {
+                let port_view = false;
+                if port_view && !is_under_construction(placed) {
                     let (inputs, outputs) = block_ports(placed.kind, placed.rotation);
                     for dir in inputs {
                         draw_port_marker(
@@ -1566,7 +1488,6 @@ pub fn run(
                                             ctx.font_sm,
                                             colors.text_secondary,
                                         );
-                                        content_y += 18.0;
                                     }
                                 }
                             }
@@ -1592,7 +1513,6 @@ pub fn run(
                                 if clicked {
                                     block.builder_units_desired = block.builder_units_desired.saturating_add(1);
                                     block.builder_units_created = block.builder_units_created.saturating_add(1);
-                                    force_spawn_builder = true;
                                 }
                                 content_y += 34.0;
 
@@ -1652,7 +1572,6 @@ pub fn run(
                                             ctx.font_sm,
                                             colors.text_secondary,
                                         );
-                                        content_y += 18.0;
                                     }
                                 }
                             }
@@ -1698,7 +1617,7 @@ pub fn run(
                                 }
                             }
                         }
-                        BuildBlockType::Base | BuildBlockType::Builder | BuildBlockType::Warehouse => {
+                        BuildBlockType::Base | BuildBlockType::Warehouse => {
                             let total = storage_total(&block.stored);
                             draw_text(
                                 &format!("Capacity: {}/{}", total, block.capacity),
@@ -1726,7 +1645,36 @@ pub fn run(
         }
     }
     if let Some((depot, a, b, kind)) = spawn_request {
-        if let Some(path) = find_route_path(a, b, blocks) {
+        let path = if kind == BuildBlockType::Logistics {
+            let first = match find_route_path(depot, a, blocks) {
+                Some(path) => path,
+                None => Vec::new(),
+            };
+            let second = match find_route_path(a, b, blocks) {
+                Some(path) => path,
+                None => Vec::new(),
+            };
+            let third = match find_route_path(b, a, blocks) {
+                Some(path) => path,
+                None => Vec::new(),
+            };
+            if first.is_empty() || second.is_empty() || third.is_empty() {
+                Vec::new()
+            } else {
+                let mut combined = combine_paths(combine_paths(first, second), third);
+                // TODO: Smooth station_in dwell without path hacks.
+                if let Some(out_index) = combined.iter().position(|hex| *hex == b) {
+                    combined.insert(out_index + 1, b);
+                }
+                combined
+            }
+        } else {
+            match find_route_path(a, b, blocks) {
+                Some(path) => path,
+                None => Vec::new(),
+            }
+        };
+        if !path.is_empty() {
             let speed = if kind == BuildBlockType::Builder { 4.5 } else { 3.0 };
             units.push(crate::core::Unit {
                 path,

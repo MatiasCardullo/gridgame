@@ -3,3 +3,6 @@ Cargo.lock
 *.json
 *.lnk
 *.ps1
+*.rgba
+*.csv
+*.log

@@ -6,13 +6,16 @@ use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::Arc;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use crate::core::{FrameContext, Scene};
 use crate::core::ui::ui_button;
 
-const HEIGHTMAP_META_PATH: &str = "planet_heightmap_meta.json";
-const HEIGHTMAP_DATA_PATH: &str = "planet_heightmap.rgba";
-const MESH_POINTS_PATH: &str = "planet_mesh_points.csv";
+const PLANET_DATA_DIR: &str = "planet_data";
+const HEIGHTMAP_META_PATH: &str = "planet_data/planet_heightmap_meta.json";
+const HEIGHTMAP_DATA_PATH: &str = "planet_data/planet_heightmap.rgba";
+const MESH_POINTS_PATH: &str = "planet_data/planet_mesh_points.csv";
+const PLANET_NOISE_PATH: &str = "planet_data/planet_noise.json";
 const HEIGHTMAP_SIZE: u16 = 1024;
 
 // Wraps an angle to the [-PI, PI] range for smooth camera interpolation.
@@ -136,6 +139,7 @@ pub struct PlanetNoiseConfig {
     pub sea_level: f32,
     pub ice_start: f32,
     pub ice_strength: f32,
+    #[serde(skip_serializing, default = "default_subdivisions")]
     pub subdivisions: u8,
 }
 
@@ -155,6 +159,10 @@ impl Default for PlanetNoiseConfig {
     }
 }
 
+fn default_subdivisions() -> u8 {
+    4
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct PlanetNoiseSnapshot {
     config: PlanetNoiseConfig,
@@ -167,6 +175,62 @@ struct HeightmapCacheMeta {
     texture_yaw: f32,
     texture_pitch: f32,
     size: u16,
+}
+
+pub struct PlanetBuildData {
+    config: PlanetNoiseConfig,
+    base_vertices: Vec<Vec3>,
+    sector_vertices: Vec<Vec3>,
+    sector_faces: Vec<[usize; 3]>,
+    mesh_data: Vec<MeshData>,
+    face_normals: Vec<Vec3>,
+    sector_values: Vec<f32>,
+    heightmap_pixels: Vec<u8>,
+    texture_yaw: f32,
+    texture_pitch: f32,
+}
+
+fn ensure_planet_data_dir() {
+    let _ = fs::create_dir_all(PLANET_DATA_DIR);
+    let files = [
+        ("planet_heightmap_meta.json", HEIGHTMAP_META_PATH),
+        ("planet_heightmap.rgba", HEIGHTMAP_DATA_PATH),
+        ("planet_mesh_points.csv", MESH_POINTS_PATH),
+        ("planet_noise.json", PLANET_NOISE_PATH),
+    ];
+    for (old_name, new_path) in files.iter() {
+        let old_path = std::path::Path::new(old_name);
+        let new_path = std::path::Path::new(new_path);
+        if old_path.exists() && !new_path.exists() {
+            let _ = fs::rename(old_path, new_path);
+        }
+    }
+}
+
+enum PlanetLoadEvent {
+    StepStart(String),
+    StepDone { name: String, elapsed_ms: u128 },
+    Progress { done: u32, total: u32 },
+    LogLine(String),
+    Done(PlanetBuildData),
+    Error(String),
+}
+
+enum PlanetLoadStatus {
+    Loading,
+    Done,
+    Error,
+}
+
+pub struct PlanetLoader {
+    status: PlanetLoadStatus,
+    progress: f32,
+    current_step: Option<String>,
+    log_entries: Vec<String>,
+    rx: Option<Receiver<PlanetLoadEvent>>,
+    started_at: Instant,
+    pending_data: Option<PlanetBuildData>,
+    error: Option<String>,
 }
 
 pub struct PlanetState {
@@ -202,38 +266,27 @@ pub struct PlanetState {
 impl PlanetState {
     // Creates a fresh planet state with default noise and meshes.
     pub fn new() -> Self {
-        let config = PlanetNoiseConfig::default();
-        let base_vertices = align_vertices_to_poles(&icosahedron_vertices());
-        let base_faces = build_faces(&base_vertices, &icosahedron_edges());
         let texture_yaw = 90.0_f32.to_radians();
         let texture_pitch = 32.0_f32.to_radians();
-        let texture_size = HEIGHTMAP_SIZE;
-        let (sector_vertices, sector_faces) =
-            build_geodesic_sphere(&base_vertices, &base_faces, 4, 0, 1.0);
-        let align = alignment_axis_angle(&icosahedron_vertices());
-        let heightmap_pixels =
-            load_or_build_heightmap(&config, texture_size, align, texture_yaw, texture_pitch);
-        let mut heightmap_texture =
-            Texture2D::from_rgba8(texture_size, texture_size, &heightmap_pixels);
-        heightmap_texture.set_filter(FilterMode::Linear);
-        let (mesh_data, face_normals, sector_values) = build_planet_chunk_data(
-            &sector_vertices,
-            &sector_faces,
-            config.subdivisions as usize,
-            1.6,
-            &config,
-            true,
-            false,
-            align,
-            0.0,
-            0.0,
+        let data = build_planet_data(
+            PlanetNoiseConfig::default(),
+            texture_yaw,
+            texture_pitch,
+            HEIGHTMAP_SIZE,
         );
-        save_mesh_points(&mesh_data);
-        let meshes = mesh_data
+        Self::from_build_data(data)
+    }
+
+    pub fn from_build_data(data: PlanetBuildData) -> Self {
+        let mut heightmap_texture =
+            Texture2D::from_rgba8(HEIGHTMAP_SIZE, HEIGHTMAP_SIZE, &data.heightmap_pixels);
+        heightmap_texture.set_filter(FilterMode::Linear);
+        let meshes = data
+            .mesh_data
             .into_iter()
             .map(mesh_data_to_mesh)
             .collect::<Vec<_>>();
-        let face_centers = build_face_centers(&sector_vertices, &sector_faces);
+        let face_centers = build_face_centers(&data.sector_vertices, &data.sector_faces);
         Self {
             yaw: 0.0,
             pitch: 0.3,
@@ -243,19 +296,19 @@ impl PlanetState {
             target_pitch: 0.3,
             dragging: false,
             last_mouse: Vec2::ZERO,
-            config,
+            config: data.config,
             meshes,
-            face_normals,
+            face_normals: data.face_normals,
             face_centers,
-            base_vertices,
-            sector_vertices,
-            sector_faces,
-            sector_values,
+            base_vertices: data.base_vertices,
+            sector_vertices: data.sector_vertices,
+            sector_faces: data.sector_faces,
+            sector_values: data.sector_values,
             printed_midpoints: false,
             use_texture: false,
             heightmap_texture: Some(heightmap_texture),
-            texture_yaw,
-            texture_pitch,
+            texture_yaw: data.texture_yaw,
+            texture_pitch: data.texture_pitch,
             regen_rx: None,
             regen_in_progress: false,
             regen_pending: false,
@@ -278,6 +331,7 @@ impl PlanetState {
             sector_values: self.sector_values.clone(),
         };
         if let Ok(json) = serde_json::to_string_pretty(&snapshot) {
+            ensure_planet_data_dir();
             let _ = fs::write(path, json);
         }
         let _ = size;
@@ -478,6 +532,297 @@ impl PlanetState {
             }
         }
     }
+}
+
+impl PlanetLoader {
+    pub fn start() -> Self {
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let mut log_file = File::create("loading.log")
+                .ok()
+                .map(BufWriter::new);
+            let total_steps: u32 = 4;
+            let mut done_steps: u32 = 0;
+
+            fn send_log(
+                tx: &mpsc::Sender<PlanetLoadEvent>,
+                log_file: &mut Option<BufWriter<File>>,
+                line: String,
+            ) {
+                if let Some(file) = log_file.as_mut() {
+                    let _ = writeln!(file, "{line}");
+                    let _ = file.flush();
+                }
+                let _ = tx.send(PlanetLoadEvent::LogLine(line));
+            }
+
+            fn step_start(
+                tx: &mpsc::Sender<PlanetLoadEvent>,
+                log_file: &mut Option<BufWriter<File>>,
+                name: &str,
+            ) -> Instant {
+                let line = format!(
+                    "{} Step start: {}",
+                    format_log_timestamp(SystemTime::now()),
+                    name
+                );
+                send_log(tx, log_file, line);
+                let _ = tx.send(PlanetLoadEvent::StepStart(name.to_string()));
+                Instant::now()
+            }
+
+            fn step_done(
+                tx: &mpsc::Sender<PlanetLoadEvent>,
+                log_file: &mut Option<BufWriter<File>>,
+                name: &str,
+                start: Instant,
+                done_steps: &mut u32,
+                total_steps: u32,
+            ) {
+                let elapsed_ms = start.elapsed().as_millis();
+                let line = format!(
+                    "{} Step done: {} ({} ms)",
+                    format_log_timestamp(SystemTime::now()),
+                    name,
+                    elapsed_ms
+                );
+                send_log(tx, log_file, line);
+                let _ = tx.send(PlanetLoadEvent::StepDone {
+                    name: name.to_string(),
+                    elapsed_ms,
+                });
+                *done_steps += 1;
+                let _ = tx.send(PlanetLoadEvent::Progress {
+                    done: *done_steps,
+                    total: total_steps,
+                });
+            }
+
+            let texture_yaw = 90.0_f32.to_radians();
+            let texture_pitch = 32.0_f32.to_radians();
+            let mut config = PlanetNoiseConfig::default();
+            let mut loaded_sector_values: Option<Vec<f32>> = None;
+            if let Ok(contents) = fs::read_to_string(PLANET_NOISE_PATH) {
+                if let Ok(snapshot) = serde_json::from_str::<PlanetNoiseSnapshot>(&contents) {
+                    config = snapshot.config;
+                    loaded_sector_values = Some(snapshot.sector_values);
+                }
+            }
+
+            let geometry_start = step_start(&tx, &mut log_file, "Build geometry");
+            let base_vertices = align_vertices_to_poles(&icosahedron_vertices());
+            let base_faces = build_faces(&base_vertices, &icosahedron_edges());
+            let (sector_vertices, sector_faces) =
+                build_geodesic_sphere(&base_vertices, &base_faces, 4, 0, 1.0);
+            let align = alignment_axis_angle(&icosahedron_vertices());
+            step_done(
+                &tx,
+                &mut log_file,
+                "Build geometry",
+                geometry_start,
+                &mut done_steps,
+                total_steps,
+            );
+
+            let heightmap_start = step_start(&tx, &mut log_file, "Load/build heightmap");
+            ensure_planet_data_dir();
+            let heightmap_pixels =
+                load_or_build_heightmap(&config, HEIGHTMAP_SIZE, align, texture_yaw, texture_pitch);
+            step_done(
+                &tx,
+                &mut log_file,
+                "Load/build heightmap",
+                heightmap_start,
+                &mut done_steps,
+                total_steps,
+            );
+
+            let mesh_start = step_start(&tx, &mut log_file, "Build mesh data");
+            let (mesh_data, face_normals, sector_values) = build_planet_chunk_data(
+                &sector_vertices,
+                &sector_faces,
+                config.subdivisions as usize,
+                1.6,
+                &config,
+                true,
+                false,
+                align,
+                0.0,
+                0.0,
+            );
+            let sector_values = loaded_sector_values.unwrap_or(sector_values);
+            step_done(
+                &tx,
+                &mut log_file,
+                "Build mesh data",
+                mesh_start,
+                &mut done_steps,
+                total_steps,
+            );
+
+            let save_start = step_start(&tx, &mut log_file, "Save mesh points");
+            save_mesh_points(&mesh_data);
+            step_done(
+                &tx,
+                &mut log_file,
+                "Save mesh points",
+                save_start,
+                &mut done_steps,
+                total_steps,
+            );
+
+            let data = PlanetBuildData {
+                config,
+                base_vertices,
+                sector_vertices,
+                sector_faces,
+                mesh_data,
+                face_normals,
+                sector_values,
+                heightmap_pixels,
+                texture_yaw,
+                texture_pitch,
+            };
+
+            let _ = tx.send(PlanetLoadEvent::Done(data));
+        });
+
+        Self {
+            status: PlanetLoadStatus::Loading,
+            progress: 0.0,
+            current_step: None,
+            log_entries: Vec::new(),
+            rx: Some(rx),
+            started_at: Instant::now(),
+            pending_data: None,
+            error: None,
+        }
+    }
+
+    pub fn poll(&mut self) -> Option<PlanetBuildData> {
+        let Some(rx) = self.rx.as_ref() else {
+            return self.pending_data.take();
+        };
+        let mut pending_logs: Vec<String> = Vec::new();
+        while let Ok(message) = rx.try_recv() {
+            match message {
+                PlanetLoadEvent::StepStart(name) => {
+                    self.current_step = Some(name);
+                }
+                PlanetLoadEvent::StepDone { .. } => {}
+                PlanetLoadEvent::Progress { done, total } => {
+                    let total = total.max(1);
+                    self.progress = (done as f32 / total as f32).clamp(0.0, 1.0);
+                }
+                PlanetLoadEvent::LogLine(line) => {
+                    pending_logs.push(line);
+                }
+                PlanetLoadEvent::Done(data) => {
+                    self.status = PlanetLoadStatus::Done;
+                    self.progress = 1.0;
+                    self.pending_data = Some(data);
+                }
+                PlanetLoadEvent::Error(message) => {
+                    self.status = PlanetLoadStatus::Error;
+                    self.error = Some(message);
+                }
+            }
+        }
+        for line in pending_logs {
+            self.push_log(line);
+        }
+        self.pending_data.take()
+    }
+
+    pub fn is_ready(&self) -> bool {
+        matches!(self.status, PlanetLoadStatus::Done)
+    }
+
+    pub fn is_loading(&self) -> bool {
+        matches!(self.status, PlanetLoadStatus::Loading)
+    }
+
+    pub fn progress(&self) -> f32 {
+        self.progress
+    }
+
+    pub fn log_entries(&self) -> &[String] {
+        self.log_entries.as_slice()
+    }
+
+    pub fn error(&self) -> Option<&str> {
+        self.error.as_deref()
+    }
+
+    fn push_log(&mut self, line: String) {
+        const MAX_LINES: usize = 12;
+        self.log_entries.push(line);
+        if self.log_entries.len() > MAX_LINES {
+            let excess = self.log_entries.len() - MAX_LINES;
+            self.log_entries.drain(0..excess);
+        }
+    }
+}
+
+fn build_planet_data(
+    mut config: PlanetNoiseConfig,
+    texture_yaw: f32,
+    texture_pitch: f32,
+    texture_size: u16,
+) -> PlanetBuildData {
+    ensure_planet_data_dir();
+    let mut loaded_sector_values: Option<Vec<f32>> = None;
+    if let Ok(contents) = fs::read_to_string(PLANET_NOISE_PATH) {
+        if let Ok(snapshot) = serde_json::from_str::<PlanetNoiseSnapshot>(&contents) {
+            config = snapshot.config;
+            loaded_sector_values = Some(snapshot.sector_values);
+        }
+    }
+    let base_vertices = align_vertices_to_poles(&icosahedron_vertices());
+    let base_faces = build_faces(&base_vertices, &icosahedron_edges());
+    let (sector_vertices, sector_faces) =
+        build_geodesic_sphere(&base_vertices, &base_faces, 4, 0, 1.0);
+    let align = alignment_axis_angle(&icosahedron_vertices());
+    let heightmap_pixels =
+        load_or_build_heightmap(&config, texture_size, align, texture_yaw, texture_pitch);
+    let (mesh_data, face_normals, sector_values) = build_planet_chunk_data(
+        &sector_vertices,
+        &sector_faces,
+        config.subdivisions as usize,
+        1.6,
+        &config,
+        true,
+        false,
+        align,
+        0.0,
+        0.0,
+    );
+    let sector_values = loaded_sector_values.unwrap_or(sector_values);
+    save_mesh_points(&mesh_data);
+    PlanetBuildData {
+        config,
+        base_vertices,
+        sector_vertices,
+        sector_faces,
+        mesh_data,
+        face_normals,
+        sector_values,
+        heightmap_pixels,
+        texture_yaw,
+        texture_pitch,
+    }
+}
+
+fn format_log_timestamp(now: SystemTime) -> String {
+    let since_epoch = now
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let secs = since_epoch % 86_400;
+    let h = secs / 3600;
+    let m = (secs % 3600) / 60;
+    let s = secs % 60;
+    format!("[{:02}:{:02}:{:02}]", h, m, s)
 }
 
 // Calculates a height value for a given surface normal.
@@ -1234,6 +1579,7 @@ fn load_heightmap_cache(
     texture_yaw: f32,
     texture_pitch: f32,
 ) -> Option<Vec<u8>> {
+    ensure_planet_data_dir();
     let Ok(meta_raw) = fs::read_to_string(HEIGHTMAP_META_PATH) else {
         return None;
     };
@@ -1263,6 +1609,7 @@ fn save_heightmap_cache(
     texture_pitch: f32,
     pixels: &[u8],
 ) {
+    ensure_planet_data_dir();
     let meta = HeightmapCacheMeta {
         config: *config,
         texture_yaw,
@@ -1291,6 +1638,7 @@ fn load_or_build_heightmap(
 }
 
 fn save_mesh_points(meshes: &[MeshData]) {
+    ensure_planet_data_dir();
     let Ok(file) = File::create(MESH_POINTS_PATH) else {
         return;
     };
@@ -1639,10 +1987,10 @@ fn draw_planet_controls(ctx: &FrameContext, state: &mut PlanetState) {
         state.regenerate(512);
     }
     if clicked_load {
-        state.load_heightmap("planet_noise.json");
+        state.load_heightmap(PLANET_NOISE_PATH);
     }
     if clicked_save {
-        state.save_heightmap(512, "planet_noise.json");
+        state.save_heightmap(512, PLANET_NOISE_PATH);
     }
 }
 

@@ -69,11 +69,15 @@ async fn main() {
     let mut station_in: Option<Axial> = None;
     let mut station_out: Option<Axial> = None;
     let mut station_pick: Option<StationPick> = None;
-    let mut planet_state = scenes::planet::PlanetState::new();
+    let mut planet_state: Option<scenes::planet::PlanetState> = None;
+    let mut planet_loader = scenes::planet::PlanetLoader::start();
     let mut dirty = false;
     let mut scene = Scene::MainMenu;
 
     loop {
+        if let Some(data) = planet_loader.poll() {
+            planet_state = Some(scenes::planet::PlanetState::from_build_data(data));
+        }
         let mouse = vec2(mouse_position().0, mouse_position().1);
         let screen_center = vec2(screen_width() * 0.5, screen_height() * 0.5);
         let has_save = Path::new(map_path).exists();
@@ -118,6 +122,11 @@ async fn main() {
                     &mut dirty,
                     map_path,
                     &config,
+                    planet_loader.is_loading(),
+                    planet_loader.is_ready(),
+                    planet_loader.progress(),
+                    planet_loader.log_entries(),
+                    planet_loader.error(),
                 ) {
                     break;
                 }
@@ -161,7 +170,14 @@ async fn main() {
                 );
             }
             Scene::Planet => {
-                scenes::planet::run(&ctx, &mut planet_state, &mut scene);
+                if let Some(state) = planet_state.as_mut() {
+                    scenes::planet::run(&ctx, state, &mut scene);
+                } else {
+                    draw_planet_loading_screen(&ctx, &planet_loader);
+                    if is_key_pressed(KeyCode::Escape) {
+                        scene = Scene::MainMenu;
+                    }
+                }
             }
             Scene::BuildTemplate => {
                 scenes::build_template::run(
@@ -185,4 +201,63 @@ async fn main() {
 
         next_frame().await;
     }
+}
+
+fn draw_planet_loading_screen(ctx: &FrameContext, loader: &scenes::planet::PlanetLoader) {
+    let title = "Cargando planeta";
+    let title_dim = measure_text(title, None, ctx.font_title as u16, 1.0);
+    draw_text(
+        title,
+        (screen_width() - title_dim.width) * 0.5,
+        120.0,
+        ctx.font_title,
+        ctx.colors_rt.text_primary,
+    );
+    let bar_rect = Rect::new(
+        (screen_width() - 420.0) * 0.5,
+        160.0,
+        420.0,
+        18.0,
+    );
+    core::ui::draw_progress_bar(
+        bar_rect,
+        loader.progress(),
+        ctx.colors_rt.button_hover,
+        ctx.colors_rt.button_base,
+    );
+    let log_rect = Rect::new(
+        (screen_width() - 520.0) * 0.5,
+        200.0,
+        520.0,
+        260.0,
+    );
+    if let Some(message) = loader.error() {
+        let lines = vec![message.to_string()];
+        core::ui::draw_log_panel(
+            log_rect,
+            &lines,
+            ctx.font_sm,
+            ctx.colors_rt.tooltip_bg,
+            ctx.colors_rt.tooltip_border,
+            ctx.colors_rt.text_primary,
+        );
+    } else {
+        core::ui::draw_log_panel(
+            log_rect,
+            loader.log_entries(),
+            ctx.font_sm,
+            ctx.colors_rt.tooltip_bg,
+            ctx.colors_rt.tooltip_border,
+            ctx.colors_rt.text_secondary,
+        );
+    }
+    let hint = "ESC para volver al menu";
+    let hint_dim = measure_text(hint, None, ctx.font_sm as u16, 1.0);
+    draw_text(
+        hint,
+        (screen_width() - hint_dim.width) * 0.5,
+        log_rect.y + log_rect.h + 28.0,
+        ctx.font_sm,
+        ctx.colors_rt.text_secondary,
+    );
 }

@@ -93,6 +93,36 @@ pub fn ui_button(
     (hover && is_mouse_button_pressed(MouseButton::Left), hover)
 }
 
+// Draw a horizontal progress bar with background and fill colors.
+pub fn draw_progress_bar(rect: Rect, progress: f32, fg: Color, bg: Color) {
+    let clamped = progress.clamp(0.0, 1.0);
+    draw_rectangle(rect.x, rect.y, rect.w, rect.h, bg);
+    draw_rectangle(rect.x, rect.y, rect.w * clamped, rect.h, fg);
+    draw_rectangle_lines(rect.x, rect.y, rect.w, rect.h, 1.2, fg);
+}
+
+// Draw a simple log panel with a list of lines.
+pub fn draw_log_panel(
+    rect: Rect,
+    lines: &[String],
+    font_size: f32,
+    bg: Color,
+    border: Color,
+    text: Color,
+) {
+    draw_rectangle(rect.x, rect.y, rect.w, rect.h, bg);
+    draw_rectangle_lines(rect.x, rect.y, rect.w, rect.h, 1.2, border);
+    let line_height = font_size + 4.0;
+    let mut y = rect.y + font_size + 6.0;
+    for line in lines.iter() {
+        if y > rect.y + rect.h - 4.0 {
+            break;
+        }
+        draw_text(line, rect.x + 8.0, y, font_size, text);
+        y += line_height;
+    }
+}
+
 // Friendly label for a color target in UI.
 pub fn color_target_name(target: ColorTarget) -> &'static str {
     match target {

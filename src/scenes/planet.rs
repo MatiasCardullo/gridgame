@@ -6,6 +6,7 @@ use std::fs;
 use crate::core::{FrameContext, Scene};
 use crate::core::ui::ui_button;
 
+// Wraps an angle to the [-PI, PI] range for smooth camera interpolation.
 fn wrap_angle(mut angle: f32) -> f32 {
     let two_pi = std::f32::consts::PI * 2.0;
     angle = (angle + std::f32::consts::PI) % two_pi;
@@ -15,6 +16,7 @@ fn wrap_angle(mut angle: f32) -> f32 {
     angle - std::f32::consts::PI
 }
 
+// Rotates a vector around an axis using Rodrigues' rotation formula.
 fn rotate_vec3(v: Vec3, axis: Vec3, angle: f32) -> Vec3 {
     let axis = axis.normalize();
     let cos_theta = angle.cos();
@@ -22,17 +24,27 @@ fn rotate_vec3(v: Vec3, axis: Vec3, angle: f32) -> Vec3 {
     v * cos_theta + axis.cross(v) * sin_theta + axis * (axis.dot(v) * (1.0 - cos_theta))
 }
 
+// Builds the icosahedron edge list used for arcs and face construction.
 fn icosahedron_edges() -> Vec<(usize, usize)> {
-    vec![
-        (0, 1), (0, 2), (0, 3), (0, 4), (0, 5),
-        (5, 1), (1, 2), (2, 3), (3, 4), (4, 5),
-        (5, 6), (1, 6), (1, 7), (2, 7), (2, 8),
-        (3, 8), (3, 9), (4, 9), (4, 10), (5, 10),
-        (10, 6), (6, 7), (7, 8), (8, 9), (9, 10),
-        (11, 6), (11, 7), (11, 8), (11, 9), (11, 10),
-    ]
+    let mut edges: Vec<(usize, usize)> = Vec::new();
+    for i in 2..6 {
+        edges.push((0,i));
+        edges.push((11,4+i));
+    }
+    for i in 1..5 {
+        edges.push((i,i+5));
+        edges.push((i,i+6));
+    }
+    edges.push((1,5));
+    edges.push((5,10));
+    edges.push((10,6));
+    for i in 0..11 {
+        edges.push((i,i+1));
+    }
+    edges
 }
 
+// Returns the 12 vertices of a unit icosahedron.
 fn icosahedron_vertices() -> [Vec3; 12] {
     let phi = (1.0 + 5.0_f32.sqrt()) * 0.5;
     [
@@ -51,6 +63,7 @@ fn icosahedron_vertices() -> [Vec3; 12] {
     ]
 }
 
+// Hashes a 3D integer coordinate to a deterministic [0,1] value.
 fn hash3(x: i32, y: i32, z: i32, seed: u32) -> f32 {
     let mut n = (x as i64) * 374761393
         + (y as i64) * 668265263
@@ -61,6 +74,7 @@ fn hash3(x: i32, y: i32, z: i32, seed: u32) -> f32 {
     (n as u32) as f32 / u32::MAX as f32
 }
 
+// Produces smooth value noise for a 3D position.
 fn value_noise3(x: f32, y: f32, z: f32, seed: u32) -> f32 {
     let x0 = x.floor() as i32;
     let y0 = y.floor() as i32;
@@ -91,6 +105,7 @@ fn value_noise3(x: f32, y: f32, z: f32, seed: u32) -> f32 {
     nxy0 + (nxy1 - nxy0) * w
 }
 
+// Combines multiple octaves of value noise into fBm.
 fn fbm3(x: f32, y: f32, z: f32, seed: u32) -> f32 {
     let mut sum = 0.0;
     let mut amp = 0.5;
@@ -116,6 +131,7 @@ pub struct PlanetNoiseConfig {
 }
 
 impl Default for PlanetNoiseConfig {
+    // Provides a baseline noise configuration for the planet.
     fn default() -> Self {
         Self {
             noise_scale: 2.0,
@@ -148,16 +164,20 @@ pub struct PlanetState {
     pub config: PlanetNoiseConfig,
     pub meshes: Vec<Mesh>,
     pub face_normals: Vec<Vec3>,
-    pub sector_vertices: [Vec3; 12],
+    pub base_vertices: Vec<Vec3>,
+    pub sector_vertices: Vec<Vec3>,
     pub sector_faces: Vec<[usize; 3]>,
     pub sector_values: Vec<f32>,
+    pub printed_midpoints: bool,
 }
 
 impl PlanetState {
+    // Creates a fresh planet state with default noise and meshes.
     pub fn new() -> Self {
         let config = PlanetNoiseConfig::default();
-        let sector_vertices = align_vertices_to_poles(icosahedron_vertices());
-        let sector_faces = build_faces(&sector_vertices, &icosahedron_edges());
+        let base_vertices = align_vertices_to_poles(&icosahedron_vertices());
+        let base_faces = build_faces(&base_vertices, &icosahedron_edges());
+        let (sector_vertices, sector_faces) = subdivide_base_faces(&base_vertices, &base_faces);
         let (meshes, face_normals, sector_values) = build_planet_chunks(
             &sector_vertices,
             &sector_faces,
@@ -177,12 +197,15 @@ impl PlanetState {
             config,
             meshes,
             face_normals,
+            base_vertices,
             sector_vertices,
             sector_faces,
             sector_values,
+            printed_midpoints: false,
         }
     }
 
+    // Rebuilds planet meshes from current noise settings.
     fn regenerate(&mut self, size: u16) {
         let (meshes, face_normals, sector_values) = build_planet_chunks(
             &self.sector_vertices,
@@ -197,6 +220,7 @@ impl PlanetState {
         let _ = size;
     }
 
+    // Persists the current height snapshot to a JSON file.
     fn save_heightmap(&self, size: u16, path: &str) {
         let snapshot = PlanetNoiseSnapshot {
             config: self.config,
@@ -208,6 +232,7 @@ impl PlanetState {
         let _ = size;
     }
 
+    // Loads a height snapshot from JSON and regenerates meshes.
     fn load_heightmap(&mut self, path: &str) {
         let Ok(contents) = fs::read_to_string(path) else {
             return;
@@ -221,6 +246,7 @@ impl PlanetState {
     }
 }
 
+// Calculates a height value for a given surface normal.
 fn height_value(normal: Vec3, config: &PlanetNoiseConfig) -> f32 {
     let noise = fbm3(
         normal.x * config.noise_scale,
@@ -231,6 +257,7 @@ fn height_value(normal: Vec3, config: &PlanetNoiseConfig) -> f32 {
     (noise * config.height_amp + config.height_bias + normal.y * config.lat_bias).clamp(0.0, 1.0)
 }
 
+// Maps height and latitude to a terrain color.
 fn color_from_height(height: f32, normal: Vec3, config: &PlanetNoiseConfig) -> Color {
     let ice = ((normal.y.abs() - config.ice_start) * config.ice_strength).clamp(0.0, 1.0);
     let (mut r, mut g, mut b) = if height < config.sea_level {
@@ -251,6 +278,7 @@ fn color_from_height(height: f32, normal: Vec3, config: &PlanetNoiseConfig) -> C
     Color::new(r, g, b, 1.0)
 }
 
+// Subdivides triangle faces by inserting normalized midpoints.
 fn subdivide_faces(vertices: &mut Vec<Vec3>, faces: &[[usize; 3]]) -> Vec<[usize; 3]> {
     let mut mid_cache: HashMap<(usize, usize), usize> = HashMap::new();
     let mut new_faces = Vec::with_capacity(faces.len() * 4);
@@ -283,8 +311,46 @@ fn subdivide_faces(vertices: &mut Vec<Vec3>, faces: &[[usize; 3]]) -> Vec<[usize
     new_faces
 }
 
+// Subdivides the base icosahedron faces into 4 using shared midpoints.
+fn subdivide_base_faces(
+    vertices: &[Vec3],
+    faces: &[[usize; 3]],
+) -> (Vec<Vec3>, Vec<[usize; 3]>) {
+    let mut out_vertices: Vec<Vec3> = vertices.iter().map(|v| v.normalize()).collect();
+    let mut mid_cache: HashMap<(usize, usize), usize> = HashMap::new();
+    let mut new_faces = Vec::with_capacity(faces.len() * 4);
+
+    let mut midpoint = |a: usize, b: usize, verts: &mut Vec<Vec3>| -> usize {
+        let key = if a < b { (a, b) } else { (b, a) };
+        if let Some(&idx) = mid_cache.get(&key) {
+            return idx;
+        }
+        let mid = (verts[a] + verts[b]) * 0.5;
+        let idx = verts.len();
+        verts.push(mid.normalize());
+        mid_cache.insert(key, idx);
+        idx
+    };
+
+    for face in faces {
+        let a = face[0];
+        let b = face[1];
+        let c = face[2];
+        let ab: usize = midpoint(a, b, &mut out_vertices);
+        let bc = midpoint(b, c, &mut out_vertices);
+        let ca = midpoint(c, a, &mut out_vertices);
+        new_faces.push([a, ab, ca]);
+        new_faces.push([b, bc, ab]);
+        new_faces.push([c, ca, bc]);
+        new_faces.push([ab, bc, ca]);
+    }
+
+    (out_vertices, new_faces)
+}
+
+// Builds meshes for each base triangle face of the icosahedron.
 fn build_planet_chunks(
-    base_vertices: &[Vec3; 12],
+    base_vertices: &[Vec3],
     sector_faces: &[[usize; 3]],
     subdivisions: usize,
     radius: f32,
@@ -345,6 +411,48 @@ fn build_planet_chunks(
     (meshes, face_normals, sector_values)
 }
 
+// Computes a point along the great-circle arc between two directions.
+fn great_circle_point(start: Vec3, end: Vec3, t: f32) -> Vec3 {
+    let start = start.normalize();
+    let end = end.normalize();
+    let dot = start.dot(end).clamp(-1.0, 1.0);
+    let theta = dot.acos();
+    let sin_theta = theta.sin();
+    if sin_theta.abs() < 1e-5 {
+        (start + (end - start) * t).normalize()
+    } else {
+        let w0 = ((1.0 - t) * theta).sin() / sin_theta;
+        let w1 = (t * theta).sin() / sin_theta;
+        (start * w0 + end * w1).normalize()
+    }
+}
+
+// Draws a polyline polygon on the sphere surface around a point.
+fn draw_polygon_on_sphere(center: Vec3, radius: f32, sides: usize, size: f32, color: Color) {
+    if sides < 3 {
+        return;
+    }
+    let normal = center.normalize();
+    let mut tangent = normal.cross(vec3(0.0, 1.0, 0.0));
+    if tangent.length() < 1e-4 {
+        tangent = normal.cross(vec3(1.0, 0.0, 0.0));
+    }
+    tangent = tangent.normalize();
+    let bitangent = normal.cross(tangent).normalize();
+
+    let mut prev = Vec3::ZERO;
+    for i in 0..=sides {
+        let angle = (i as f32 / sides as f32) * std::f32::consts::TAU;
+        let offset = tangent * angle.sin() + bitangent * angle.cos();
+        let point = (normal * radius + offset * size);
+        if i > 0 {
+            draw_line_3d(prev, point, color);
+        }
+        prev = point;
+    }
+}
+
+// Draws a great-circle arc between two points on the sphere.
 fn draw_arc_on_sphere(start: Vec3, end: Vec3, radius: f32, segments: usize, color: Color) {
     let start = start.normalize();
     let end = end.normalize();
@@ -354,25 +462,14 @@ fn draw_arc_on_sphere(start: Vec3, end: Vec3, radius: f32, segments: usize, colo
     for i in 0..segments {
         let t0 = i as f32 / segments as f32;
         let t1 = (i + 1) as f32 / segments as f32;
-        let p0 = if sin_theta.abs() < 1e-5 {
-            (start + (end - start) * t0).normalize()
-        } else {
-            let w0 = ((1.0 - t0) * theta).sin() / sin_theta;
-            let w1 = (t0 * theta).sin() / sin_theta;
-            (start * w0 + end * w1).normalize()
-        } * radius;
-        let p1 = if sin_theta.abs() < 1e-5 {
-            (start + (end - start) * t1).normalize()
-        } else {
-            let w0 = ((1.0 - t1) * theta).sin() / sin_theta;
-            let w1 = (t1 * theta).sin() / sin_theta;
-            (start * w0 + end * w1).normalize()
-        } * radius;
+        let p0 = great_circle_point(start, end, t0) * radius;
+        let p1 = great_circle_point(start, end, t1) * radius;
         draw_line_3d(p0, p1, color);
     }
 }
 
-fn build_faces(vertices: &[Vec3; 12], edges: &[(usize, usize)]) -> Vec<[usize; 3]> {
+// Builds triangle faces from the icosahedron edges via planar checks.
+fn build_faces(vertices: &[Vec3], edges: &[(usize, usize)]) -> Vec<[usize; 3]> {
     let mut connected = [[false; 12]; 12];
     for (a, b) in edges {
         connected[*a][*b] = true;
@@ -419,6 +516,7 @@ fn build_faces(vertices: &[Vec3; 12], edges: &[(usize, usize)]) -> Vec<[usize; 3
     faces
 }
 
+// Builds a ray from screen-space mouse coordinates in world space.
 fn ray_from_mouse(camera: &Camera3D, mouse: Vec2) -> Option<(Vec3, Vec3)> {
     let x = (mouse.x / screen_width()) * 2.0 - 1.0;
     let y = 1.0 - (mouse.y / screen_height()) * 2.0;
@@ -434,6 +532,7 @@ fn ray_from_mouse(camera: &Camera3D, mouse: Vec2) -> Option<(Vec3, Vec3)> {
     Some((p0, dir))
 }
 
+// Intersects a ray with a sphere, returning the nearest hit point.
 fn ray_sphere_intersection(origin: Vec3, dir: Vec3, radius: f32) -> Option<Vec3> {
     let b = 2.0 * origin.dot(dir);
     let c = origin.dot(origin) - radius * radius;
@@ -451,10 +550,11 @@ fn ray_sphere_intersection(origin: Vec3, dir: Vec3, radius: f32) -> Option<Vec3>
     Some(origin + dir * t)
 }
 
+// Finds the face whose normal most aligns with the hit direction.
 fn hovered_face(
     hit_point: Vec3,
     faces: &[[usize; 3]],
-    vertices: &[Vec3; 12],
+    vertices: &[Vec3],
 ) -> Option<usize> {
     let dir = hit_point.normalize();
     let mut best: Option<(f32, usize)> = None;
@@ -480,7 +580,8 @@ fn hovered_face(
     best.map(|(_, idx)| idx)
 }
 
-fn face_normal(vertices: &[Vec3; 12], face: [usize; 3]) -> Vec3 {
+// Computes a consistent outward normal for a face.
+fn face_normal(vertices: &[Vec3], face: [usize; 3]) -> Vec3 {
     let a = vertices[face[0]];
     let b = vertices[face[1]];
     let c = vertices[face[2]];
@@ -495,7 +596,8 @@ fn face_normal(vertices: &[Vec3; 12], face: [usize; 3]) -> Vec3 {
     normal
 }
 
-fn align_vertices_to_poles(vertices: [Vec3; 12]) -> [Vec3; 12] {
+// Rotates vertices so one vertex aligns with the +Y axis.
+fn align_vertices_to_poles(vertices: &[Vec3; 12]) -> Vec<Vec3> {
     let mut max_index = 0usize;
     let mut max_y = vertices[0].y;
     for (index, v) in vertices.iter().enumerate() {
@@ -510,15 +612,16 @@ fn align_vertices_to_poles(vertices: [Vec3; 12]) -> [Vec3; 12] {
     let angle = dot.acos();
     let axis = north.cross(up);
     if axis.length() < 1e-5 || angle.abs() < 1e-5 {
-        return vertices;
+        return vertices.to_vec();
     }
-    let mut out = [Vec3::ZERO; 12];
+    let mut out = vec![Vec3::ZERO; vertices.len()];
     for (index, v) in vertices.iter().enumerate() {
         out[index] = rotate_vec3(*v, axis, angle);
     }
     out
 }
 
+// Projects a 3D point into screen space and clips off-screen points.
 fn project_to_screen(camera: &Camera3D, point: Vec3) -> Option<Vec2> {
     let mat = camera.matrix();
     let clip = mat * vec4(point.x, point.y, point.z, 1.0);
@@ -535,6 +638,7 @@ fn project_to_screen(camera: &Camera3D, point: Vec3) -> Option<Vec2> {
     ))
 }
 
+// Runs the planet scene frame update and rendering.
 pub fn run(ctx: &FrameContext, state: &mut PlanetState, scene: &mut Scene) {
     if is_key_pressed(KeyCode::Escape) {
         *scene = Scene::MainMenu;
@@ -592,39 +696,60 @@ pub fn run(ctx: &FrameContext, state: &mut PlanetState, scene: &mut Scene) {
         }
         draw_mesh(mesh);
     }
-    draw_sphere_wires(vec3(0.0, 0.0, 0.0), radius, None, Color::from_rgba(120, 150, 180, 180));
-
-    let vertices = state.sector_vertices;
+    
+    let vertices = &state.sector_vertices;
+    let base_vertices = &state.base_vertices;
     let edges = icosahedron_edges();
     let faces = state.sector_faces.clone();
     let point_color = Color::from_rgba(240, 240, 255, 255);
     let edge_color = Color::from_rgba(200, 220, 250, 255);
     let hover_color = Color::from_rgba(255, 200, 120, 255);
+    let mid_color = Color::from_rgba(180, 255, 220, 255);
 
-    let mut projected: [Vec3; 12] = [Vec3::ZERO; 12];
-    let mut screen_points: [Option<Vec2>; 12] = [None; 12];
+    let mut projected_base: Vec<Vec3> = vec![Vec3::ZERO; base_vertices.len()];
+    let mut projected_sector: Vec<Vec3> = vec![Vec3::ZERO; vertices.len()];
+    let mut screen_points: Vec<Option<Vec2>> = vec![None; base_vertices.len()];
+    for (index, v) in base_vertices.iter().enumerate() {
+        projected_base[index] = v.normalize() * radius;
+        draw_polygon_on_sphere(projected_base[index], radius, 5, 0.01, point_color);
+        screen_points[index] = project_to_screen(&camera, projected_base[index]);
+        if !state.printed_midpoints {
+            println!(
+                "Vertex pent: ({:.3}, {:.3}, {:.3})",
+                projected_base[index].x, projected_base[index].y, projected_base[index].z
+            );
+        }   
+    }
     for (index, v) in vertices.iter().enumerate() {
-        projected[index] = v.normalize() * radius;
-        draw_sphere(projected[index], 0.06, None, point_color);
-        screen_points[index] = project_to_screen(&camera, projected[index]);
+        projected_sector[index] = v.normalize() * radius;
     }
 
     let segments = 24;
     for (a, b) in edges.iter().copied() {
-        draw_arc_on_sphere(projected[a], projected[b], radius, segments, edge_color);
+        draw_arc_on_sphere(projected_base[a], projected_base[b], radius, segments, edge_color);
+        let mid_dir = great_circle_point(projected_base[a], projected_base[b], 0.5);
+        let mid_point = mid_dir * radius;
+        draw_polygon_on_sphere(mid_point, radius, 6, 0.01, mid_color);
+        if !state.printed_midpoints {
+            println!(
+                "Midpoint hex: ({:.3}, {:.3}, {:.3})",
+                mid_point.x, mid_point.y, mid_point.z
+            );
+        }
     }
+    state.printed_midpoints = true;
 
     let mut hovered: Option<usize> = None;
     if let Some((origin, dir)) = ray_from_mouse(&camera, mouse) {
         if let Some(hit) = ray_sphere_intersection(origin, dir, radius) {
-            hovered = hovered_face(hit, &faces, &vertices);
+            hovered = hovered_face(hit, &faces, vertices);
         }
     }
     if let Some(face_index) = hovered {
         let face = faces[face_index];
-        let a = projected[face[0]];
-        let b = projected[face[1]];
-        let c = projected[face[2]];
+        let a = projected_sector[face[0]];
+        let b = projected_sector[face[1]];
+        let c = projected_sector[face[2]];
         draw_arc_on_sphere(a, b, radius, segments, hover_color);
         draw_arc_on_sphere(b, c, radius, segments, hover_color);
         draw_arc_on_sphere(c, a, radius, segments, hover_color);
@@ -632,7 +757,7 @@ pub fn run(ctx: &FrameContext, state: &mut PlanetState, scene: &mut Scene) {
     if let Some(face_index) = hovered {
         if is_mouse_button_pressed(MouseButton::Left) {
             let face = faces[face_index];
-            let normal = face_normal(&vertices, face);
+            let normal = face_normal(vertices, face);
             state.target_yaw = normal.z.atan2(normal.x);
             state.target_pitch = normal.y.asin();
         }
@@ -653,6 +778,7 @@ pub fn run(ctx: &FrameContext, state: &mut PlanetState, scene: &mut Scene) {
     }
 }
 
+// Draws the planet configuration UI panel.
 fn draw_planet_controls(ctx: &FrameContext, state: &mut PlanetState) {
     let panel = Rect::new(18.0, 18.0, 260.0, 260.0);
     draw_rectangle(panel.x, panel.y, panel.w, panel.h, ctx.colors_rt.panel_bg);
@@ -817,6 +943,7 @@ fn draw_planet_controls(ctx: &FrameContext, state: &mut PlanetState) {
     }
 }
 
+// Draws a labeled +/- row for numeric configuration tweaks.
 fn draw_adjust_row(
     ctx: &FrameContext,
     label: &str,

@@ -1,6 +1,7 @@
 use macroquad::prelude::*;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::sync::mpsc::{self, Receiver};
 use std::fs;
 
 use crate::core::{FrameContext, Scene};
@@ -164,11 +165,16 @@ pub struct PlanetState {
     pub config: PlanetNoiseConfig,
     pub meshes: Vec<Mesh>,
     pub face_normals: Vec<Vec3>,
+    pub face_centers: Vec<Vec3>,
     pub base_vertices: Vec<Vec3>,
     pub sector_vertices: Vec<Vec3>,
     pub sector_faces: Vec<[usize; 3]>,
     pub sector_values: Vec<f32>,
     pub printed_midpoints: bool,
+    pub regen_rx: Option<Receiver<RegenResult>>,
+    pub regen_in_progress: bool,
+    pub regen_pending: bool,
+    pub regen_version: u64,
 }
 
 impl PlanetState {
@@ -177,14 +183,20 @@ impl PlanetState {
         let config = PlanetNoiseConfig::default();
         let base_vertices = align_vertices_to_poles(&icosahedron_vertices());
         let base_faces = build_faces(&base_vertices, &icosahedron_edges());
-        let (sector_vertices, sector_faces) = subdivide_base_faces(&base_vertices, &base_faces);
-        let (meshes, face_normals, sector_values) = build_planet_chunks(
+        let (sector_vertices, sector_faces) =
+            build_geodesic_sphere(&base_vertices, &base_faces, 4, 0, 1.0);
+        let (mesh_data, face_normals, sector_values) = build_planet_chunk_data(
             &sector_vertices,
             &sector_faces,
             config.subdivisions as usize,
             1.6,
             &config,
         );
+        let meshes = mesh_data
+            .into_iter()
+            .map(mesh_data_to_mesh)
+            .collect::<Vec<_>>();
+        let face_centers = build_face_centers(&sector_vertices, &sector_faces);
         Self {
             yaw: 0.0,
             pitch: 0.3,
@@ -197,26 +209,22 @@ impl PlanetState {
             config,
             meshes,
             face_normals,
+            face_centers,
             base_vertices,
             sector_vertices,
             sector_faces,
             sector_values,
             printed_midpoints: false,
+            regen_rx: None,
+            regen_in_progress: false,
+            regen_pending: false,
+            regen_version: 0,
         }
     }
 
     // Rebuilds planet meshes from current noise settings.
     fn regenerate(&mut self, size: u16) {
-        let (meshes, face_normals, sector_values) = build_planet_chunks(
-            &self.sector_vertices,
-            &self.sector_faces,
-            self.config.subdivisions as usize,
-            1.6,
-            &self.config,
-        );
-        self.meshes = meshes;
-        self.face_normals = face_normals;
-        self.sector_values = sector_values;
+        self.request_regen();
         let _ = size;
     }
 
@@ -243,6 +251,66 @@ impl PlanetState {
         self.config = snapshot.config;
         self.sector_values = snapshot.sector_values;
         self.regenerate(512);
+    }
+
+    // Requests a background regeneration of meshes.
+    fn request_regen(&mut self) {
+        self.regen_version = self.regen_version.wrapping_add(1);
+        if self.regen_in_progress {
+            self.regen_pending = true;
+            return;
+        }
+        self.start_regen(self.regen_version);
+    }
+
+    fn start_regen(&mut self, version: u64) {
+        let (tx, rx) = mpsc::channel();
+        let base_vertices = self.sector_vertices.clone();
+        let faces = self.sector_faces.clone();
+        let config = self.config;
+        let subdivisions = self.config.subdivisions as usize;
+        std::thread::spawn(move || {
+            let (mesh_data, face_normals, sector_values) = build_planet_chunk_data(
+                &base_vertices,
+                &faces,
+                subdivisions,
+                1.6,
+                &config,
+            );
+            let _ = tx.send(RegenResult {
+                version,
+                mesh_data,
+                face_normals,
+                sector_values,
+            });
+        });
+        self.regen_rx = Some(rx);
+        self.regen_in_progress = true;
+        self.regen_pending = false;
+    }
+
+    fn poll_regen(&mut self) {
+        let Some(rx) = &self.regen_rx else {
+            return;
+        };
+        let Ok(result) = rx.try_recv() else {
+            return;
+        };
+        if result.version == self.regen_version {
+            self.meshes = result
+                .mesh_data
+                .into_iter()
+                .map(mesh_data_to_mesh)
+                .collect();
+            self.face_normals = result.face_normals;
+            self.sector_values = result.sector_values;
+        }
+        self.regen_rx = None;
+        self.regen_in_progress = false;
+        if self.regen_pending {
+            self.regen_pending = false;
+            self.start_regen(self.regen_version);
+        }
     }
 }
 
@@ -348,15 +416,113 @@ fn subdivide_base_faces(
     (out_vertices, new_faces)
 }
 
-// Builds meshes for each base triangle face of the icosahedron.
-fn build_planet_chunks(
+// Builds a geodesic sphere by subdividing and relaxing vertices on the unit sphere.
+fn build_geodesic_sphere(
+    base_vertices: &[Vec3],
+    base_faces: &[[usize; 3]],
+    subdivisions: usize,
+    relax_iterations: usize,
+    relax_strength: f32,
+) -> (Vec<Vec3>, Vec<[usize; 3]>) {
+    let mut vertices: Vec<Vec3> = base_vertices.iter().map(|v| v.normalize()).collect();
+    let mut faces: Vec<[usize; 3]> = base_faces.to_vec();
+
+    for _ in 0..subdivisions {
+        let (new_vertices, new_faces) = subdivide_base_faces(&vertices, &faces);
+        vertices = new_vertices;
+        faces = new_faces;
+    }
+
+    if relax_iterations > 0 {
+        //relax_sphere(&mut vertices, &faces, relax_iterations, relax_strength);
+    }
+
+    (vertices, faces)
+}
+
+// Relaxes vertex positions along the sphere to reduce edge length variance.
+fn relax_sphere(
+    vertices: &mut [Vec3],
+    faces: &[[usize; 3]],
+    iterations: usize,
+    strength: f32,
+) {
+    let neighbors = build_vertex_neighbors(faces, vertices.len());
+    let strength = strength.clamp(0.0, 1.0);
+
+    for _ in 0..iterations {
+        let mut next = vertices.to_vec();
+        for (index, pos) in vertices.iter().enumerate() {
+            let neighbor_list = &neighbors[index];
+            if neighbor_list.is_empty() {
+                continue;
+            }
+            let mut avg = Vec3::ZERO;
+            for &neighbor in neighbor_list.iter() {
+                avg += vertices[neighbor];
+            }
+            avg /= neighbor_list.len() as f32;
+            let target = avg.normalize();
+            let moved = *pos + (target - *pos) * strength;
+            next[index] = moved.normalize();
+        }
+        vertices.copy_from_slice(&next);
+    }
+}
+
+// Builds adjacency lists for each vertex from face indices.
+fn build_vertex_neighbors(faces: &[[usize; 3]], vertex_count: usize) -> Vec<Vec<usize>> {
+    let mut neighbors: Vec<HashSet<usize>> = (0..vertex_count).map(|_| HashSet::new()).collect();
+
+    for face in faces {
+        let a = face[0];
+        let b = face[1];
+        let c = face[2];
+        neighbors[a].insert(b);
+        neighbors[a].insert(c);
+        neighbors[b].insert(a);
+        neighbors[b].insert(c);
+        neighbors[c].insert(a);
+        neighbors[c].insert(b);
+    }
+
+    neighbors
+        .into_iter()
+        .map(|set| set.into_iter().collect())
+        .collect()
+}
+
+#[derive(Debug)]
+struct MeshData {
+    vertices: Vec<Vertex>,
+    indices: Vec<u16>,
+}
+
+#[derive(Debug)]
+struct RegenResult {
+    version: u64,
+    mesh_data: Vec<MeshData>,
+    face_normals: Vec<Vec3>,
+    sector_values: Vec<f32>,
+}
+
+fn mesh_data_to_mesh(data: MeshData) -> Mesh {
+    Mesh {
+        vertices: data.vertices,
+        indices: data.indices,
+        texture: None,
+    }
+}
+
+// Builds mesh data for each base triangle face of the icosahedron.
+fn build_planet_chunk_data(
     base_vertices: &[Vec3],
     sector_faces: &[[usize; 3]],
     subdivisions: usize,
     radius: f32,
     config: &PlanetNoiseConfig,
-) -> (Vec<Mesh>, Vec<Vec3>, Vec<f32>) {
-    let mut meshes: Vec<Mesh> = Vec::with_capacity(sector_faces.len());
+) -> (Vec<MeshData>, Vec<Vec3>, Vec<f32>) {
+    let mut meshes: Vec<MeshData> = Vec::with_capacity(sector_faces.len());
     let mut face_normals: Vec<Vec3> = Vec::with_capacity(sector_faces.len());
 
     for face in sector_faces.iter().copied() {
@@ -392,10 +558,9 @@ fn build_planet_chunks(
             indices.push(f[2] as u16);
         }
 
-        meshes.push(Mesh {
+        meshes.push(MeshData {
             vertices: mesh_vertices,
             indices,
-            texture: None,
         });
         face_normals.push(face_normal(base_vertices, face).normalize());
     }
@@ -596,6 +761,19 @@ fn face_normal(vertices: &[Vec3], face: [usize; 3]) -> Vec3 {
     normal
 }
 
+// Computes unit face centers for frustum checks and highlighting.
+fn build_face_centers(vertices: &[Vec3], faces: &[[usize; 3]]) -> Vec<Vec3> {
+    faces
+        .iter()
+        .map(|face| {
+            let a = vertices[face[0]];
+            let b = vertices[face[1]];
+            let c = vertices[face[2]];
+            (a + b + c).normalize()
+        })
+        .collect()
+}
+
 // Rotates vertices so one vertex aligns with the +Y axis.
 fn align_vertices_to_poles(vertices: &[Vec3; 12]) -> Vec<Vec3> {
     let mut max_index = 0usize;
@@ -638,6 +816,33 @@ fn project_to_screen(camera: &Camera3D, point: Vec3) -> Option<Vec2> {
     ))
 }
 
+// Checks whether a point lies within the camera frustum (with optional padding).
+fn point_in_frustum(camera: &Camera3D, point: Vec3, pad: f32) -> bool {
+    let mat = camera.matrix();
+    let clip = mat * vec4(point.x, point.y, point.z, 1.0);
+    if clip.w <= 0.0 {
+        return false;
+    }
+    let ndc = vec3(clip.x, clip.y, clip.z) / clip.w;
+    let limit = 1.0 + pad;
+    ndc.x.abs() <= limit && ndc.y.abs() <= limit && ndc.z >= -limit && ndc.z <= limit
+}
+
+// Maps camera distance to mesh subdivision detail levels.
+fn zoom_to_subdivisions(distance: f32) -> u8 {
+    if distance < 4.0 {
+        5
+    } else if distance < 5.0 {
+        4
+    } else if distance < 7.0 {
+        3
+    } else if distance < 9.0 {
+        2
+    } else {
+        1
+    }
+}
+
 // Runs the planet scene frame update and rendering.
 pub fn run(ctx: &FrameContext, state: &mut PlanetState, scene: &mut Scene) {
     if is_key_pressed(KeyCode::Escape) {
@@ -668,6 +873,12 @@ pub fn run(ctx: &FrameContext, state: &mut PlanetState, scene: &mut Scene) {
         state.target_distance = (state.target_distance - wy * 0.01).clamp(2.0, 20.0);
     }
     state.distance += (state.target_distance - state.distance) * 0.06;
+    let desired_subdivisions = zoom_to_subdivisions(state.distance);
+    if desired_subdivisions != state.config.subdivisions {
+        state.config.subdivisions = desired_subdivisions;
+        state.regenerate(512);
+    }
+    state.poll_regen();
     let yaw_delta = wrap_angle(state.target_yaw - state.yaw);
     state.yaw += yaw_delta * 0.12;
     state.pitch += (state.target_pitch - state.pitch) * 0.12;
@@ -687,8 +898,19 @@ pub fn run(ctx: &FrameContext, state: &mut PlanetState, scene: &mut Scene) {
     set_camera(&camera);
 
     let radius = 1.6;
+    let zoom_t = ((state.distance - 2.0) / 18.0).clamp(0.0, 1.0);
+    let segments = ((32.0 - 16.0 * zoom_t).round() as i32).clamp(10, 32) as usize;
+    let pent_size = 0.02 * (1.0 - 0.6 * zoom_t);
+    let hex_size = 0.018 * (1.0 - 0.6 * zoom_t);
+    let show_labels = false;
+    let show_hexes = zoom_t < 0.75;
     let camera_dir = camera_pos.normalize();
     for (index, mesh) in state.meshes.iter().enumerate() {
+        if let Some(center) = state.face_centers.get(index) {
+            if !point_in_frustum(&camera, *center * radius, 0.6) {
+                continue;
+            }
+        }
         if let Some(normal) = state.face_normals.get(index) {
             if normal.dot(camera_dir) <= 0.0 {
                 continue;
@@ -711,7 +933,7 @@ pub fn run(ctx: &FrameContext, state: &mut PlanetState, scene: &mut Scene) {
     let mut screen_points: Vec<Option<Vec2>> = vec![None; base_vertices.len()];
     for (index, v) in base_vertices.iter().enumerate() {
         projected_base[index] = v.normalize() * radius;
-        draw_polygon_on_sphere(projected_base[index], radius, 5, 0.01, point_color);
+        draw_polygon_on_sphere(projected_base[index], radius, 5, pent_size, point_color);
         screen_points[index] = project_to_screen(&camera, projected_base[index]);
         if !state.printed_midpoints {
             println!(
@@ -724,12 +946,13 @@ pub fn run(ctx: &FrameContext, state: &mut PlanetState, scene: &mut Scene) {
         projected_sector[index] = v.normalize() * radius;
     }
 
-    let segments = 24;
     for (a, b) in edges.iter().copied() {
         draw_arc_on_sphere(projected_base[a], projected_base[b], radius, segments, edge_color);
         let mid_dir = great_circle_point(projected_base[a], projected_base[b], 0.5);
         let mid_point = mid_dir * radius;
-        draw_polygon_on_sphere(mid_point, radius, 6, 0.01, mid_color);
+        if show_hexes {
+            draw_polygon_on_sphere(mid_point, radius, 6, hex_size, mid_color);
+        }
         if !state.printed_midpoints {
             println!(
                 "Midpoint hex: ({:.3}, {:.3}, {:.3})",
@@ -765,22 +988,24 @@ pub fn run(ctx: &FrameContext, state: &mut PlanetState, scene: &mut Scene) {
 
     set_default_camera();
     draw_planet_controls(ctx, state);
-    for (index, pos) in screen_points.iter().enumerate() {
-        if let Some(pos) = pos {
-            draw_text(
-                &format!("{}", index),
-                pos.x + 6.0,
-                pos.y - 6.0,
-                18.0,
-                Color::from_rgba(240, 230, 120, 255),
-            );
+    if show_labels {
+        for (index, pos) in screen_points.iter().enumerate() {
+            if let Some(pos) = pos {
+                draw_text(
+                    &format!("{}", index),
+                    pos.x + 6.0,
+                    pos.y - 6.0,
+                    18.0,
+                    Color::from_rgba(240, 230, 120, 255),
+                );
+            }
         }
     }
 }
 
 // Draws the planet configuration UI panel.
 fn draw_planet_controls(ctx: &FrameContext, state: &mut PlanetState) {
-    let panel = Rect::new(18.0, 18.0, 260.0, 260.0);
+    let panel = Rect::new(18.0, 18.0, 260.0, 228.0);
     draw_rectangle(panel.x, panel.y, panel.w, panel.h, ctx.colors_rt.panel_bg);
     draw_rectangle_lines(panel.x, panel.y, panel.w, panel.h, 1.5, ctx.colors_rt.panel_border);
     draw_text(
@@ -882,39 +1107,6 @@ fn draw_planet_controls(ctx: &FrameContext, state: &mut PlanetState) {
     );
     y += step + 6.0;
 
-    let mut detail_changed = false;
-    let (clicked_minus, _) = ui_button(
-        Rect::new(value_x, y - 16.0, 22.0, 20.0),
-        "-",
-        ctx.mouse,
-        ctx.font_sm,
-        ctx.button_colors,
-    );
-    let (clicked_plus, _) = ui_button(
-        Rect::new(value_x + 54.0, y - 16.0, 22.0, 20.0),
-        "+",
-        ctx.mouse,
-        ctx.font_sm,
-        ctx.button_colors,
-    );
-    draw_text("Detail", x, y, ctx.font_sm, ctx.colors_rt.text_secondary);
-    if clicked_minus {
-        state.config.subdivisions = state.config.subdivisions.saturating_sub(1);
-        detail_changed = true;
-    }
-    if clicked_plus {
-        state.config.subdivisions = (state.config.subdivisions + 1).min(5);
-        detail_changed = true;
-    }
-    draw_text(
-        &format!("{}", state.config.subdivisions),
-        value_x + 28.0,
-        y,
-        ctx.font_sm,
-        ctx.colors_rt.text_secondary,
-    );
-    y += step + 6.0;
-
     let rect_load = Rect::new(x, y, 110.0, 26.0);
     let (clicked_load, _) = ui_button(
         rect_load,
@@ -932,7 +1124,7 @@ fn draw_planet_controls(ctx: &FrameContext, state: &mut PlanetState) {
         ctx.button_colors,
     );
 
-    if changed || detail_changed {
+    if changed {
         state.regenerate(512);
     }
     if clicked_load {

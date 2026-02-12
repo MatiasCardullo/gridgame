@@ -39,7 +39,6 @@ pub struct WindowState {
 #[derive(Clone, Copy, Debug)]
 pub struct PanelResult {
     pub toggled: bool,
-    pub toggle_hovered: bool,
     #[allow(dead_code)]
     pub selected_changed: bool,
 }
@@ -48,7 +47,6 @@ pub struct PanelResult {
 #[derive(Clone, Debug)]
 pub struct BuildPanelResult<T: Copy> {
     pub toggled: bool,
-    pub toggle_hovered: bool,
     pub clicked_option: Option<Option<T>>,
     pub hovered_tip: Option<&'static str>,
 }
@@ -329,7 +327,6 @@ pub fn draw_game_panel(
 
     PanelResult {
         toggled,
-        toggle_hovered,
         selected_changed: false,
     }
 }
@@ -425,7 +422,6 @@ pub fn draw_build_panel<T: Copy + PartialEq>(
 
     BuildPanelResult {
         toggled: panel_result.toggled,
-        toggle_hovered: panel_result.toggle_hovered,
         clicked_option,
         hovered_tip,
     }

@@ -210,17 +210,15 @@ fn ensure_planet_data_dir() {
 
 enum PlanetLoadEvent {
     StepStart(String),
-    StepDone { name: String, elapsed_ms: u128 },
+    StepDone,
     Progress { done: u32, total: u32 },
     LogLine(String),
     Done(PlanetBuildData),
-    Error(String),
 }
 
 enum PlanetLoadStatus {
     Loading,
     Done,
-    Error,
 }
 
 pub struct PlanetLoader {
@@ -229,7 +227,6 @@ pub struct PlanetLoader {
     current_step: Option<String>,
     log_entries: Vec<String>,
     rx: Option<Receiver<PlanetLoadEvent>>,
-    started_at: Instant,
     pending_data: Option<PlanetBuildData>,
     error: Option<String>,
 }
@@ -257,7 +254,7 @@ pub struct PlanetState {
     pub heightmap_texture: Option<Texture2D>,
     pub texture_yaw: f32,
     pub texture_pitch: f32,
-    pub regen_rx: Option<Receiver<RegenMessage>>,
+    regen_rx: Option<Receiver<RegenMessage>>,
     pub regen_in_progress: bool,
     pub regen_pending: bool,
     pub regen_version: u64,
@@ -266,21 +263,8 @@ pub struct PlanetState {
 }
 
 impl PlanetState {
-    // Creates a fresh planet state with default noise and meshes.
-    pub fn new() -> Self {
-        let texture_yaw = 90.0_f32.to_radians();
-        let texture_pitch = 32.0_f32.to_radians();
-        let data = build_planet_data(
-            PlanetNoiseConfig::default(),
-            texture_yaw,
-            texture_pitch,
-            HEIGHTMAP_SIZE,
-        );
-        Self::from_build_data(data)
-    }
-
     pub fn from_build_data(data: PlanetBuildData) -> Self {
-        let mut heightmap_texture =
+        let heightmap_texture =
             Texture2D::from_rgba8(HEIGHTMAP_SIZE, HEIGHTMAP_SIZE, &data.heightmap_pixels);
         heightmap_texture.set_filter(FilterMode::Linear);
         let relief_meshes = data
@@ -293,7 +277,7 @@ impl PlanetState {
             .into_iter()
             .map(mesh_data_to_mesh)
             .collect::<Vec<_>>();
-        let mut value = Some(heightmap_texture.clone());
+        let value = Some(heightmap_texture.clone());
         for mesh in base_texture_meshes.iter_mut() {
             mesh.texture = value.clone();
         }
@@ -565,10 +549,7 @@ impl PlanetLoader {
                     elapsed_ms
                 );
                 send_log(tx, log_file, line);
-                let _ = tx.send(PlanetLoadEvent::StepDone {
-                    name: name.to_string(),
-                    elapsed_ms,
-                });
+                let _ = tx.send(PlanetLoadEvent::StepDone);
                 *done_steps += 1;
                 let _ = tx.send(PlanetLoadEvent::Progress {
                     done: *done_steps,
@@ -684,7 +665,6 @@ impl PlanetLoader {
             current_step: None,
             log_entries: Vec::new(),
             rx: Some(rx),
-            started_at: Instant::now(),
             pending_data: None,
             error: None,
         }
@@ -700,7 +680,7 @@ impl PlanetLoader {
                 PlanetLoadEvent::StepStart(name) => {
                     self.current_step = Some(name);
                 }
-                PlanetLoadEvent::StepDone { .. } => {}
+                PlanetLoadEvent::StepDone => {}
                 PlanetLoadEvent::Progress { done, total } => {
                     let total = total.max(1);
                     self.progress = (done as f32 / total as f32).clamp(0.0, 1.0);
@@ -712,10 +692,6 @@ impl PlanetLoader {
                     self.status = PlanetLoadStatus::Done;
                     self.progress = 1.0;
                     self.pending_data = Some(data);
-                }
-                PlanetLoadEvent::Error(message) => {
-                    self.status = PlanetLoadStatus::Error;
-                    self.error = Some(message);
                 }
             }
         }
@@ -752,68 +728,6 @@ impl PlanetLoader {
             let excess = self.log_entries.len() - MAX_LINES;
             self.log_entries.drain(0..excess);
         }
-    }
-}
-
-fn build_planet_data(
-    mut config: PlanetNoiseConfig,
-    texture_yaw: f32,
-    texture_pitch: f32,
-    texture_size: u16,
-) -> PlanetBuildData {
-    ensure_planet_data_dir();
-    let mut loaded_sector_values: Option<Vec<f32>> = None;
-    if let Ok(contents) = fs::read_to_string(PLANET_NOISE_PATH) {
-        if let Ok(snapshot) = serde_json::from_str::<PlanetNoiseSnapshot>(&contents) {
-            config = snapshot.config;
-            loaded_sector_values = Some(snapshot.sector_values);
-        }
-    }
-    let base_vertices = align_vertices_to_poles(&icosahedron_vertices());
-    let base_faces = build_faces(&base_vertices, &icosahedron_edges());
-    let (sector_vertices, sector_faces) =
-        build_geodesic_sphere(&base_vertices, &base_faces, 4, 0, 1.0);
-    let align = alignment_axis_angle(&icosahedron_vertices());
-    let heightmap_pixels =
-        load_or_build_heightmap(&config, texture_size, align, texture_yaw, texture_pitch);
-    let (mesh_data, face_normals, sector_values) = build_planet_chunk_data(
-        &sector_vertices,
-        &sector_faces,
-        config.subdivisions as usize,
-        1.6,
-        &config,
-        true,
-        false,
-        align,
-        0.0,
-        0.0,
-    );
-    let (base_texture_mesh_data, _, _) = build_planet_chunk_data(
-        &sector_vertices,
-        &sector_faces,
-        2,
-        1.6,
-        &config,
-        false,
-        true,
-        align,
-        texture_yaw,
-        texture_pitch,
-    );
-    let sector_values = loaded_sector_values.unwrap_or(sector_values);
-    save_mesh_points(&mesh_data);
-    PlanetBuildData {
-        config,
-        base_vertices,
-        sector_vertices,
-        sector_faces,
-        mesh_data,
-        base_texture_mesh_data,
-        face_normals,
-        sector_values,
-        heightmap_pixels,
-        texture_yaw,
-        texture_pitch,
     }
 }
 
@@ -949,7 +863,7 @@ fn build_geodesic_sphere(
     }
 
     if relax_iterations > 0 {
-        //relax_sphere(&mut vertices, &faces, relax_iterations, relax_strength);
+        relax_sphere(&mut vertices, &faces, relax_iterations, relax_strength);
     }
 
     (vertices, faces)
@@ -1171,81 +1085,6 @@ fn build_planet_chunk_data(
     )
 }
 
-fn build_planet_chunk_data_parallel(
-    base_vertices: Arc<Vec<Vec3>>,
-    faces: Arc<Vec<[usize; 3]>>,
-    subdivisions: usize,
-    radius: f32,
-    config: PlanetNoiseConfig,
-    use_relief: bool,
-    use_texture: bool,
-    align: Option<(Vec3, f32)>,
-    texture_yaw: f32,
-    texture_pitch: f32,
-) -> (Vec<MeshData>, Vec<Vec3>, Vec<f32>) {
-    let face_count = faces.len();
-    if face_count == 0 {
-        return (Vec::new(), Vec::new(), Vec::new());
-    }
-
-    let workers = std::thread::available_parallelism()
-        .map(|v| v.get())
-        .unwrap_or(1)
-        .min(face_count);
-    let chunk_size = (face_count + workers - 1) / workers;
-
-    let mut handles = Vec::with_capacity(workers);
-    for worker in 0..workers {
-        let start = worker * chunk_size;
-        if start >= face_count {
-            break;
-        }
-        let end = (start + chunk_size).min(face_count);
-        let base_vertices = Arc::clone(&base_vertices);
-        let faces = Arc::clone(&faces);
-        let handle = std::thread::spawn(move || {
-            let slice = &faces[start..end];
-            let (meshes, normals, values) = build_planet_chunk_data_for_faces(
-                &base_vertices,
-                slice,
-                subdivisions,
-                radius,
-                &config,
-                use_relief,
-                use_texture,
-                align,
-                texture_yaw,
-                texture_pitch,
-            );
-            (start, meshes, normals, values)
-        });
-        handles.push(handle);
-    }
-
-    let mut meshes: Vec<Option<MeshData>> = (0..face_count).map(|_| None).collect();
-    let mut face_normals: Vec<Option<Vec3>> = vec![None; face_count];
-    let mut sector_values: Vec<Option<f32>> = vec![None; face_count];
-
-    for handle in handles {
-        let (start, chunk_meshes, chunk_normals, chunk_values) =
-            handle.join().unwrap_or((0, Vec::new(), Vec::new(), Vec::new()));
-        for (offset, mesh) in chunk_meshes.into_iter().enumerate() {
-            meshes[start + offset] = Some(mesh);
-        }
-        for (offset, normal) in chunk_normals.into_iter().enumerate() {
-            face_normals[start + offset] = Some(normal);
-        }
-        for (offset, value) in chunk_values.into_iter().enumerate() {
-            sector_values[start + offset] = Some(value);
-        }
-    }
-
-    let meshes = meshes.into_iter().map(|m| m.unwrap()).collect();
-    let face_normals = face_normals.into_iter().map(|n| n.unwrap()).collect();
-    let sector_values = sector_values.into_iter().map(|v| v.unwrap()).collect();
-    (meshes, face_normals, sector_values)
-}
-
 // Computes a point along the great-circle arc between two directions.
 fn great_circle_point(start: Vec3, end: Vec3, t: f32) -> Vec3 {
     let start = start.normalize();
@@ -1279,7 +1118,7 @@ fn draw_polygon_on_sphere(center: Vec3, radius: f32, sides: usize, size: f32, co
     for i in 0..=sides {
         let angle = (i as f32 / sides as f32) * std::f32::consts::TAU;
         let offset = tangent * angle.sin() + bitangent * angle.cos();
-        let point = (normal * radius + offset * size);
+        let point = normal * radius + offset * size;
         if i > 0 {
             draw_line_3d(prev, point, color);
         }
@@ -1291,9 +1130,6 @@ fn draw_polygon_on_sphere(center: Vec3, radius: f32, sides: usize, size: f32, co
 fn draw_arc_on_sphere(start: Vec3, end: Vec3, radius: f32, segments: usize, color: Color) {
     let start = start.normalize();
     let end = end.normalize();
-    let dot = start.dot(end).clamp(-1.0, 1.0);
-    let theta = dot.acos();
-    let sin_theta = theta.sin();
     for i in 0..segments {
         let t0 = i as f32 / segments as f32;
         let t1 = (i + 1) as f32 / segments as f32;

@@ -183,6 +183,7 @@ pub struct PlanetBuildData {
     sector_vertices: Vec<Vec3>,
     sector_faces: Vec<[usize; 3]>,
     mesh_data: Vec<MeshData>,
+    base_texture_mesh_data: Vec<MeshData>,
     face_normals: Vec<Vec3>,
     sector_values: Vec<f32>,
     heightmap_pixels: Vec<u8>,
@@ -243,7 +244,8 @@ pub struct PlanetState {
     pub dragging: bool,
     pub last_mouse: Vec2,
     pub config: PlanetNoiseConfig,
-    pub meshes: Vec<Mesh>,
+    pub relief_meshes: Vec<Mesh>,
+    pub base_texture_meshes: Vec<Mesh>,
     pub face_normals: Vec<Vec3>,
     pub face_centers: Vec<Vec3>,
     pub base_vertices: Vec<Vec3>,
@@ -251,7 +253,7 @@ pub struct PlanetState {
     pub sector_faces: Vec<[usize; 3]>,
     pub sector_values: Vec<f32>,
     pub printed_midpoints: bool,
-    pub use_texture: bool,
+    pub show_relief: bool,
     pub heightmap_texture: Option<Texture2D>,
     pub texture_yaw: f32,
     pub texture_pitch: f32,
@@ -281,11 +283,20 @@ impl PlanetState {
         let mut heightmap_texture =
             Texture2D::from_rgba8(HEIGHTMAP_SIZE, HEIGHTMAP_SIZE, &data.heightmap_pixels);
         heightmap_texture.set_filter(FilterMode::Linear);
-        let meshes = data
+        let relief_meshes = data
             .mesh_data
             .into_iter()
             .map(mesh_data_to_mesh)
             .collect::<Vec<_>>();
+        let mut base_texture_meshes = data
+            .base_texture_mesh_data
+            .into_iter()
+            .map(mesh_data_to_mesh)
+            .collect::<Vec<_>>();
+        let mut value = Some(heightmap_texture.clone());
+        for mesh in base_texture_meshes.iter_mut() {
+            mesh.texture = value.clone();
+        }
         let face_centers = build_face_centers(&data.sector_vertices, &data.sector_faces);
         Self {
             yaw: 0.0,
@@ -297,7 +308,8 @@ impl PlanetState {
             dragging: false,
             last_mouse: Vec2::ZERO,
             config: data.config,
-            meshes,
+            relief_meshes,
+            base_texture_meshes,
             face_normals: data.face_normals,
             face_centers,
             base_vertices: data.base_vertices,
@@ -305,7 +317,7 @@ impl PlanetState {
             sector_faces: data.sector_faces,
             sector_values: data.sector_values,
             printed_midpoints: false,
-            use_texture: false,
+            show_relief: true,
             heightmap_texture: Some(heightmap_texture),
             texture_yaw: data.texture_yaw,
             texture_pitch: data.texture_pitch,
@@ -366,8 +378,6 @@ impl PlanetState {
         let faces = Arc::new(self.sector_faces.clone());
         let config = self.config;
         let subdivisions = self.config.subdivisions as usize;
-        let use_texture = self.use_texture;
-        let use_relief = !use_texture;
         let texture_size = HEIGHTMAP_SIZE;
         let align = alignment_axis_angle(&icosahedron_vertices());
         let texture_yaw = self.texture_yaw;
@@ -379,7 +389,7 @@ impl PlanetState {
             .min(face_count.max(1));
         let chunk_size = (face_count + workers - 1) / workers;
 
-        self.regen_expected_chunks = if use_relief { workers } else { 1 };
+        self.regen_expected_chunks = workers;
         self.regen_received_chunks = 0;
 
         let tx_texture = tx.clone();
@@ -398,58 +408,33 @@ impl PlanetState {
             });
         });
 
-        if use_relief {
-            for worker in 0..workers {
-                let start = worker * chunk_size;
-                if start >= face_count {
-                    break;
-                }
-                let end = (start + chunk_size).min(face_count);
-                let base_vertices = Arc::clone(&base_vertices);
-                let faces = Arc::clone(&faces);
-                let tx = tx.clone();
-                let config = config;
-                std::thread::spawn(move || {
-                    let slice = &faces[start..end];
-                    let (mesh_data, face_normals, sector_values) = build_planet_chunk_data_for_faces(
-                        &base_vertices,
-                        slice,
-                        subdivisions,
-                        1.6,
-                        &config,
-                        use_relief,
-                        use_texture,
-                        align,
-                        texture_yaw,
-                        texture_pitch,
-                    );
-                    let _ = tx.send(RegenMessage::MeshChunk {
-                        version,
-                        start,
-                        mesh_data,
-                        face_normals,
-                        sector_values,
-                    });
-                });
+        for worker in 0..workers {
+            let start = worker * chunk_size;
+            if start >= face_count {
+                break;
             }
-        } else {
+            let end = (start + chunk_size).min(face_count);
+            let base_vertices = Arc::clone(&base_vertices);
+            let faces = Arc::clone(&faces);
             let tx = tx.clone();
+            let config = config;
             std::thread::spawn(move || {
-                let (mesh_data, face_normals, sector_values) = build_planet_chunk_data(
-                    base_vertices.as_slice(),
-                    faces.as_slice(),
+                let slice = &faces[start..end];
+                let (mesh_data, face_normals, sector_values) = build_planet_chunk_data_for_faces(
+                    &base_vertices,
+                    slice,
                     subdivisions,
                     1.6,
                     &config,
-                    use_relief,
-                    use_texture,
+                    true,
+                    false,
                     align,
                     texture_yaw,
                     texture_pitch,
                 );
                 let _ = tx.send(RegenMessage::MeshChunk {
                     version,
-                    start: 0,
+                    start,
                     mesh_data,
                     face_normals,
                     sector_values,
@@ -476,10 +461,8 @@ impl PlanetState {
                     let tex = Texture2D::from_rgba8(size, size, &pixels);
                     tex.set_filter(FilterMode::Linear);
                     self.heightmap_texture = Some(tex);
-                    if self.use_texture {
-                        for mesh in self.meshes.iter_mut() {
-                            mesh.texture = self.heightmap_texture.clone();
-                        }
+                    for mesh in self.base_texture_meshes.iter_mut() {
+                        mesh.texture = self.heightmap_texture.clone();
                     }
                 }
                 RegenMessage::MeshChunk {
@@ -493,12 +476,9 @@ impl PlanetState {
                         continue;
                     }
                     for (offset, data) in mesh_data.into_iter().enumerate() {
-                        let mut mesh = mesh_data_to_mesh(data);
-                        if self.use_texture {
-                            mesh.texture = self.heightmap_texture.clone();
-                        }
-                        if start + offset < self.meshes.len() {
-                            self.meshes[start + offset] = mesh;
+                        let mesh = mesh_data_to_mesh(data);
+                        if start + offset < self.relief_meshes.len() {
+                            self.relief_meshes[start + offset] = mesh;
                         }
                     }
                     for (offset, normal) in face_normals.into_iter().enumerate() {
@@ -520,9 +500,7 @@ impl PlanetState {
             && self.regen_expected_chunks > 0
             && self.regen_received_chunks >= self.regen_expected_chunks
         {
-            if !self.use_texture {
-                save_mesh_points_from_meshes(&self.meshes);
-            }
+            save_mesh_points_from_meshes(&self.relief_meshes);
             self.regen_rx = None;
             self.regen_in_progress = false;
             if self.regen_pending {
@@ -650,6 +628,18 @@ impl PlanetLoader {
                 0.0,
                 0.0,
             );
+            let (base_texture_mesh_data, _, _) = build_planet_chunk_data(
+                &sector_vertices,
+                &sector_faces,
+                2,
+                1.6,
+                &config,
+                false,
+                true,
+                align,
+                texture_yaw,
+                texture_pitch,
+            );
             let sector_values = loaded_sector_values.unwrap_or(sector_values);
             step_done(
                 &tx,
@@ -677,6 +667,7 @@ impl PlanetLoader {
                 sector_vertices,
                 sector_faces,
                 mesh_data,
+                base_texture_mesh_data,
                 face_normals,
                 sector_values,
                 heightmap_pixels,
@@ -797,6 +788,18 @@ fn build_planet_data(
         0.0,
         0.0,
     );
+    let (base_texture_mesh_data, _, _) = build_planet_chunk_data(
+        &sector_vertices,
+        &sector_faces,
+        2,
+        1.6,
+        &config,
+        false,
+        true,
+        align,
+        texture_yaw,
+        texture_pitch,
+    );
     let sector_values = loaded_sector_values.unwrap_or(sector_values);
     save_mesh_points(&mesh_data);
     PlanetBuildData {
@@ -805,6 +808,7 @@ fn build_planet_data(
         sector_vertices,
         sector_faces,
         mesh_data,
+        base_texture_mesh_data,
         face_normals,
         sector_values,
         heightmap_pixels,
@@ -1063,32 +1067,38 @@ fn build_planet_chunk_data_for_faces(
         let mut positions: Vec<Vec3> = Vec::with_capacity(vertices.len());
         let mut normals: Vec<Vec3> = Vec::with_capacity(vertices.len());
         let mut heights: Vec<f32> = Vec::with_capacity(vertices.len());
-        for v in vertices.iter() {
-            let normal = v.normalize();
-            let height = height_value(normal, config);
-            let sea_level = config.sea_level;
-            let elevation = if use_relief {
-                if height < sea_level {
-                    (height - sea_level) * 0.12
-                } else {
-                    (height - sea_level) * 0.28
-                }
-            } else {
+    for v in vertices.iter() {
+        let normal = v.normalize();
+        let height = height_value(normal, config);
+        let sea_level = config.sea_level;
+        let elevation = if use_relief {
+            if height < sea_level {
                 0.0
-            };
-            positions.push(normal * (radius + elevation));
-            normals.push(normal);
-            heights.push(height);
-        }
+            } else {
+                (height - sea_level) * 0.28
+            }
+        } else {
+            0.0
+        };
+        positions.push(normal * (radius + elevation));
+        normals.push(normal);
+        heights.push(height);
+    }
 
-        let mut mesh_vertices: Vec<Vertex> = Vec::with_capacity(faces.len() * 3);
-        let mut indices: Vec<u16> = Vec::with_capacity(faces.len() * 3);
-        for f in faces {
-            let idxs = [f[0], f[1], f[2]];
-            let mut uvs = [
-                uv_from_normal_oriented(normals[idxs[0]], align, texture_yaw, texture_pitch),
-                uv_from_normal_oriented(normals[idxs[1]], align, texture_yaw, texture_pitch),
-                uv_from_normal_oriented(normals[idxs[2]], align, texture_yaw, texture_pitch),
+    let mut mesh_vertices: Vec<Vertex> = Vec::with_capacity(faces.len() * 3);
+    let mut indices: Vec<u16> = Vec::with_capacity(faces.len() * 3);
+    for f in faces {
+        let idxs = [f[0], f[1], f[2]];
+        if use_relief {
+            let avg_height = (heights[idxs[0]] + heights[idxs[1]] + heights[idxs[2]]) / 3.0;
+            if avg_height < config.sea_level {
+                continue;
+            }
+        }
+        let mut uvs = [
+            uv_from_normal_oriented(normals[idxs[0]], align, texture_yaw, texture_pitch),
+            uv_from_normal_oriented(normals[idxs[1]], align, texture_yaw, texture_pitch),
+            uv_from_normal_oriented(normals[idxs[2]], align, texture_yaw, texture_pitch),
             ];
             if use_texture {
                 let min_u = uvs[0].x.min(uvs[1].x.min(uvs[2].x));
@@ -1709,11 +1719,7 @@ pub fn run(ctx: &FrameContext, state: &mut PlanetState, scene: &mut Scene) {
         state.target_distance = (state.target_distance - wy * 0.01).clamp(2.0, 20.0);
     }
     state.distance += (state.target_distance - state.distance) * 0.06;
-    let desired_subdivisions = if state.use_texture {
-        1
-    } else {
-        zoom_to_subdivisions(state.distance)
-    };
+    let desired_subdivisions = zoom_to_subdivisions(state.distance);
     if desired_subdivisions != state.config.subdivisions {
         state.config.subdivisions = desired_subdivisions;
         state.regenerate(512);
@@ -1738,6 +1744,7 @@ pub fn run(ctx: &FrameContext, state: &mut PlanetState, scene: &mut Scene) {
     set_camera(&camera);
 
     let radius = 1.6;
+    let line_radius = radius * 1.04;
     let zoom_t = ((state.distance - 2.0) / 18.0).clamp(0.0, 1.0);
     let segments = ((32.0 - 16.0 * zoom_t).round() as i32).clamp(10, 32) as usize;
     let pent_size = 0.02 * (1.0 - 0.6 * zoom_t);
@@ -1745,7 +1752,17 @@ pub fn run(ctx: &FrameContext, state: &mut PlanetState, scene: &mut Scene) {
     let show_labels = false;
     let show_hexes = zoom_t < 0.75;
     let camera_dir = camera_pos.normalize();
-    for (index, mesh) in state.meshes.iter().enumerate() {
+    for mesh in state.base_texture_meshes.iter() {
+        if mesh.vertices.is_empty() {
+            continue;
+        }
+        draw_mesh(mesh);
+    }
+    if state.show_relief {
+        for (index, mesh) in state.relief_meshes.iter().enumerate() {
+            if mesh.vertices.is_empty() {
+                continue;
+            }
         if let Some(center) = state.face_centers.get(index) {
             if !point_in_frustum(&camera, *center * radius, 0.6) {
                 continue;
@@ -1757,6 +1774,7 @@ pub fn run(ctx: &FrameContext, state: &mut PlanetState, scene: &mut Scene) {
             }
         }
         draw_mesh(mesh);
+        }
     }
     
     let vertices = &state.sector_vertices;
@@ -1772,8 +1790,8 @@ pub fn run(ctx: &FrameContext, state: &mut PlanetState, scene: &mut Scene) {
     let mut projected_sector: Vec<Vec3> = vec![Vec3::ZERO; vertices.len()];
     let mut screen_points: Vec<Option<Vec2>> = vec![None; base_vertices.len()];
     for (index, v) in base_vertices.iter().enumerate() {
-        projected_base[index] = v.normalize() * radius;
-        draw_polygon_on_sphere(projected_base[index], radius, 5, pent_size, point_color);
+        projected_base[index] = v.normalize() * line_radius;
+        draw_polygon_on_sphere(projected_base[index], line_radius, 5, pent_size, point_color);
         screen_points[index] = project_to_screen(&camera, projected_base[index]);
         if !state.printed_midpoints {
             println!(
@@ -1783,15 +1801,15 @@ pub fn run(ctx: &FrameContext, state: &mut PlanetState, scene: &mut Scene) {
         }   
     }
     for (index, v) in vertices.iter().enumerate() {
-        projected_sector[index] = v.normalize() * radius;
+        projected_sector[index] = v.normalize() * line_radius;
     }
 
     for (a, b) in edges.iter().copied() {
-        draw_arc_on_sphere(projected_base[a], projected_base[b], radius, segments, edge_color);
+        draw_arc_on_sphere(projected_base[a], projected_base[b], line_radius, segments, edge_color);
         let mid_dir = great_circle_point(projected_base[a], projected_base[b], 0.5);
-        let mid_point = mid_dir * radius;
+        let mid_point = mid_dir * line_radius;
         if show_hexes {
-            draw_polygon_on_sphere(mid_point, radius, 6, hex_size, mid_color);
+            draw_polygon_on_sphere(mid_point, line_radius, 6, hex_size, mid_color);
         }
         if !state.printed_midpoints {
             println!(
@@ -1813,9 +1831,9 @@ pub fn run(ctx: &FrameContext, state: &mut PlanetState, scene: &mut Scene) {
         let a = projected_sector[face[0]];
         let b = projected_sector[face[1]];
         let c = projected_sector[face[2]];
-        draw_arc_on_sphere(a, b, radius, segments, hover_color);
-        draw_arc_on_sphere(b, c, radius, segments, hover_color);
-        draw_arc_on_sphere(c, a, radius, segments, hover_color);
+        draw_arc_on_sphere(a, b, line_radius, segments, hover_color);
+        draw_arc_on_sphere(b, c, line_radius, segments, hover_color);
+        draw_arc_on_sphere(c, a, line_radius, segments, hover_color);
     }
     if let Some(face_index) = hovered {
         if is_mouse_button_pressed(MouseButton::Left) {
@@ -1950,18 +1968,13 @@ fn draw_planet_controls(ctx: &FrameContext, state: &mut PlanetState) {
     let rect_toggle = Rect::new(x, y, 230.0, 26.0);
     let (clicked_toggle, _) = ui_button(
         rect_toggle,
-        if state.use_texture {
-            "Surface: Texture"
-        } else {
-            "Surface: Mesh"
-        },
+        if state.show_relief { "Relief: On" } else { "Relief: Off" },
         ctx.mouse,
         ctx.font_sm,
         ctx.button_colors,
     );
     if clicked_toggle {
-        state.use_texture = !state.use_texture;
-        state.regenerate(512);
+        state.show_relief = !state.show_relief;
     }
     y += step;
 

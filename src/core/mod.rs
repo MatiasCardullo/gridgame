@@ -5,6 +5,7 @@ use macroquad::prelude::*;
 use serde::{Deserialize, Serialize};
 
 pub mod ui;
+pub mod debug;
 
 use crate::SQRT_3;
 use crate::core::ui::UiButtonColors;

@@ -6,10 +6,13 @@ use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::Arc;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime};
 
 use crate::core::{FrameContext, Scene};
-use crate::core::ui::ui_button;
+use crate::core::debug::{
+    draw_planet_controls, format_log_timestamp, planet_perf_log, PLANET_DEBUG_UI_ENABLED_DEFAULT,
+    SAVE_MESH_POINTS_RUNTIME,
+};
 
 const PLANET_DATA_DIR: &str = "planet_data";
 const HEIGHTMAP_META_PATH: &str = "planet_data/planet_heightmap_meta.json";
@@ -17,6 +20,9 @@ const HEIGHTMAP_DATA_PATH: &str = "planet_data/planet_heightmap.rgba";
 const MESH_POINTS_PATH: &str = "planet_data/planet_mesh_points.csv";
 const PLANET_NOISE_PATH: &str = "planet_data/planet_noise.json";
 const HEIGHTMAP_SIZE: u16 = 1024;
+const TEXTURE_BASE_SUBDIVISIONS: usize = 2;
+const TEXTURE_LAYER_OFFSET: f32 = 0.004;
+const SUBDIVISION_HYSTERESIS: f32 = 0.25;
 
 // Wraps an angle to the [-PI, PI] range for smooth camera interpolation.
 fn wrap_angle(mut angle: f32) -> f32 {
@@ -139,7 +145,6 @@ pub struct PlanetNoiseConfig {
     pub sea_level: f32,
     pub ice_start: f32,
     pub ice_strength: f32,
-    #[serde(skip_serializing, default = "default_subdivisions")]
     pub subdivisions: u8,
 }
 
@@ -157,10 +162,6 @@ impl Default for PlanetNoiseConfig {
             subdivisions: 4,
         }
     }
-}
-
-fn default_subdivisions() -> u8 {
-    4
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -251,29 +252,46 @@ pub struct PlanetState {
     pub sector_values: Vec<f32>,
     pub printed_midpoints: bool,
     pub show_relief: bool,
+    pub debug_enabled: bool,
     pub heightmap_texture: Option<Texture2D>,
+    pub texture_config: PlanetNoiseConfig,
     pub texture_yaw: f32,
     pub texture_pitch: f32,
+    relief_cache: HashMap<ReliefCacheKey, ReliefCacheEntry>,
+    pending_relief_key: Option<ReliefCacheKey>,
     regen_rx: Option<Receiver<RegenMessage>>,
     pub regen_in_progress: bool,
     pub regen_pending: bool,
     pub regen_version: u64,
     pub regen_expected_chunks: usize,
     pub regen_received_chunks: usize,
+    last_hitch_log_at: f64,
 }
 
 impl PlanetState {
     pub fn from_build_data(data: PlanetBuildData) -> Self {
+        let PlanetBuildData {
+            config,
+            base_vertices,
+            sector_vertices,
+            sector_faces,
+            mesh_data,
+            base_texture_mesh_data,
+            face_normals,
+            sector_values,
+            heightmap_pixels,
+            texture_yaw,
+            texture_pitch,
+        } = data;
         let heightmap_texture =
-            Texture2D::from_rgba8(HEIGHTMAP_SIZE, HEIGHTMAP_SIZE, &data.heightmap_pixels);
+            Texture2D::from_rgba8(HEIGHTMAP_SIZE, HEIGHTMAP_SIZE, &heightmap_pixels);
         heightmap_texture.set_filter(FilterMode::Linear);
-        let relief_meshes = data
-            .mesh_data
-            .into_iter()
+        let relief_meshes = mesh_data
+            .iter()
+            .cloned()
             .map(mesh_data_to_mesh)
             .collect::<Vec<_>>();
-        let mut base_texture_meshes = data
-            .base_texture_mesh_data
+        let mut base_texture_meshes = base_texture_mesh_data
             .into_iter()
             .map(mesh_data_to_mesh)
             .collect::<Vec<_>>();
@@ -281,7 +299,16 @@ impl PlanetState {
         for mesh in base_texture_meshes.iter_mut() {
             mesh.texture = value.clone();
         }
-        let face_centers = build_face_centers(&data.sector_vertices, &data.sector_faces);
+        let face_centers = build_face_centers(&sector_vertices, &sector_faces);
+        let mut relief_cache = HashMap::new();
+        relief_cache.insert(
+            ReliefCacheKey::from_config(&config, config.subdivisions),
+            ReliefCacheEntry {
+                meshes: clone_meshes(&relief_meshes),
+                face_normals: face_normals.clone(),
+                sector_values: sector_values.clone(),
+            },
+        );
         Self {
             yaw: 0.0,
             pitch: 0.3,
@@ -291,26 +318,31 @@ impl PlanetState {
             target_pitch: 0.3,
             dragging: false,
             last_mouse: Vec2::ZERO,
-            config: data.config,
+            config,
             relief_meshes,
             base_texture_meshes,
-            face_normals: data.face_normals,
+            face_normals,
             face_centers,
-            base_vertices: data.base_vertices,
-            sector_vertices: data.sector_vertices,
-            sector_faces: data.sector_faces,
-            sector_values: data.sector_values,
+            base_vertices,
+            sector_vertices,
+            sector_faces,
+            sector_values,
             printed_midpoints: false,
             show_relief: true,
+            debug_enabled: PLANET_DEBUG_UI_ENABLED_DEFAULT,
             heightmap_texture: Some(heightmap_texture),
-            texture_yaw: data.texture_yaw,
-            texture_pitch: data.texture_pitch,
+            texture_config: config,
+            texture_yaw,
+            texture_pitch,
+            relief_cache,
+            pending_relief_key: None,
             regen_rx: None,
             regen_in_progress: false,
             regen_pending: false,
             regen_version: 0,
             regen_expected_chunks: 0,
             regen_received_chunks: 0,
+            last_hitch_log_at: 0.0,
         }
     }
 
@@ -318,6 +350,24 @@ impl PlanetState {
     fn regenerate(&mut self, size: u16) {
         self.request_regen();
         let _ = size;
+    }
+
+    fn apply_relief_cache_entry(&mut self, key: ReliefCacheKey) -> bool {
+        let t0 = Instant::now();
+        let Some(mut entry) = self.relief_cache.remove(&key) else {
+            return false;
+        };
+        std::mem::swap(&mut self.relief_meshes, &mut entry.meshes);
+        std::mem::swap(&mut self.face_normals, &mut entry.face_normals);
+        std::mem::swap(&mut self.sector_values, &mut entry.sector_values);
+        self.relief_cache.insert(key, entry);
+        planet_perf_log(&format!(
+            "apply cache entry subdiv={} meshes={} took_ms={}",
+            self.config.subdivisions,
+            self.relief_meshes.len(),
+            t0.elapsed().as_millis()
+        ));
+        true
     }
 
     // Persists the current height snapshot to a JSON file.
@@ -343,29 +393,96 @@ impl PlanetState {
         };
         self.config = snapshot.config;
         self.sector_values = snapshot.sector_values;
+        self.relief_cache.clear();
+        self.pending_relief_key = None;
         self.regenerate(512);
+    }
+
+    pub(crate) fn debug_on_controls_changed(&mut self) {
+        self.relief_cache.clear();
+        self.pending_relief_key = None;
+        self.regenerate(512);
+    }
+
+    pub(crate) fn debug_load_heightmap(&mut self, path: &str) {
+        self.load_heightmap(path);
+    }
+
+    pub(crate) fn debug_save_heightmap(&self, path: &str) {
+        self.save_heightmap(512, path);
     }
 
     // Requests a background regeneration of meshes.
     fn request_regen(&mut self) {
         if self.regen_in_progress {
             self.regen_pending = true;
+            planet_perf_log(&format!(
+                "regen queued version={} subdiv={} pending=true",
+                self.regen_version, self.config.subdivisions
+            ));
             return;
         }
         self.regen_version = self.regen_version.wrapping_add(1);
+        planet_perf_log(&format!(
+            "regen start version={} subdiv={}",
+            self.regen_version, self.config.subdivisions
+        ));
         self.start_regen(self.regen_version);
     }
 
     fn start_regen(&mut self, version: u64) {
-        let (tx, rx) = mpsc::channel();
-        let base_vertices = Arc::new(self.sector_vertices.clone());
-        let faces = Arc::new(self.sector_faces.clone());
         let config = self.config;
         let subdivisions = self.config.subdivisions as usize;
+        let relief_key = ReliefCacheKey::from_config(&config, self.config.subdivisions);
         let texture_size = HEIGHTMAP_SIZE;
         let align = alignment_axis_angle(&icosahedron_vertices());
         let texture_yaw = self.texture_yaw;
         let texture_pitch = self.texture_pitch;
+        let refresh_texture =
+            !texture_params_match(&self.texture_config, &config) || self.heightmap_texture.is_none();
+
+        if self.relief_cache.contains_key(&relief_key) {
+            planet_perf_log(&format!(
+                "regen cache hit version={} subdiv={} refresh_texture={}",
+                version, self.config.subdivisions, refresh_texture
+            ));
+            let _ = self.apply_relief_cache_entry(relief_key);
+            if !refresh_texture {
+                self.regen_rx = None;
+                self.regen_in_progress = false;
+                self.regen_pending = false;
+                self.regen_expected_chunks = 0;
+                self.regen_received_chunks = 0;
+                return;
+            }
+            let (tx, rx) = mpsc::channel();
+            self.regen_expected_chunks = 1;
+            self.regen_received_chunks = 0;
+            self.pending_relief_key = None;
+            let tx_texture = tx.clone();
+            std::thread::spawn(move || {
+                let pixels = load_or_build_heightmap(
+                    &config,
+                    texture_size,
+                    align,
+                    texture_yaw,
+                    texture_pitch,
+                );
+                let _ = tx_texture.send(RegenMessage::Texture {
+                    version,
+                    pixels,
+                    size: texture_size,
+                });
+            });
+            self.regen_rx = Some(rx);
+            self.regen_in_progress = true;
+            self.regen_pending = false;
+            return;
+        }
+
+        let (tx, rx) = mpsc::channel();
+        let base_vertices = Arc::new(self.sector_vertices.clone());
+        let faces = Arc::new(self.sector_faces.clone());
         let face_count = faces.len();
         let workers = std::thread::available_parallelism()
             .map(|v| v.get())
@@ -373,24 +490,31 @@ impl PlanetState {
             .min(face_count.max(1));
         let chunk_size = (face_count + workers - 1) / workers;
 
-        self.regen_expected_chunks = workers;
+        self.regen_expected_chunks = workers + if refresh_texture { 1 } else { 0 };
         self.regen_received_chunks = 0;
+        self.pending_relief_key = Some(relief_key);
+        planet_perf_log(&format!(
+            "regen cache miss version={} subdiv={} workers={} chunks={} refresh_texture={}",
+            version, self.config.subdivisions, workers, self.regen_expected_chunks, refresh_texture
+        ));
 
-        let tx_texture = tx.clone();
-        std::thread::spawn(move || {
-            let pixels = load_or_build_heightmap(
-                &config,
-                texture_size,
-                align,
-                texture_yaw,
-                texture_pitch,
-            );
-            let _ = tx_texture.send(RegenMessage::Texture {
-                version,
-                pixels,
-                size: texture_size,
+        if refresh_texture {
+            let tx_texture = tx.clone();
+            std::thread::spawn(move || {
+                let pixels = load_or_build_heightmap(
+                    &config,
+                    texture_size,
+                    align,
+                    texture_yaw,
+                    texture_pitch,
+                );
+                let _ = tx_texture.send(RegenMessage::Texture {
+                    version,
+                    pixels,
+                    size: texture_size,
+                });
             });
-        });
+        }
 
         for worker in 0..workers {
             let start = worker * chunk_size;
@@ -448,6 +572,8 @@ impl PlanetState {
                     for mesh in self.base_texture_meshes.iter_mut() {
                         mesh.texture = self.heightmap_texture.clone();
                     }
+                    self.texture_config = self.config;
+                    self.regen_received_chunks += 1;
                 }
                 RegenMessage::MeshChunk {
                     version,
@@ -460,9 +586,10 @@ impl PlanetState {
                         continue;
                     }
                     for (offset, data) in mesh_data.into_iter().enumerate() {
+                        let mesh_index = start + offset;
                         let mesh = mesh_data_to_mesh(data);
-                        if start + offset < self.relief_meshes.len() {
-                            self.relief_meshes[start + offset] = mesh;
+                        if mesh_index < self.relief_meshes.len() {
+                            self.relief_meshes[mesh_index] = mesh;
                         }
                     }
                     for (offset, normal) in face_normals.into_iter().enumerate() {
@@ -484,7 +611,32 @@ impl PlanetState {
             && self.regen_expected_chunks > 0
             && self.regen_received_chunks >= self.regen_expected_chunks
         {
-            save_mesh_points_from_meshes(&self.relief_meshes);
+            let finalize_t0 = Instant::now();
+            if let Some(cache_key) = self.pending_relief_key.take() {
+                self.relief_cache.insert(
+                    cache_key,
+                    ReliefCacheEntry {
+                        meshes: clone_meshes(&self.relief_meshes),
+                        face_normals: self.face_normals.clone(),
+                        sector_values: self.sector_values.clone(),
+                    },
+                );
+            }
+            if SAVE_MESH_POINTS_RUNTIME {
+                let save_t0 = Instant::now();
+                save_mesh_points_from_meshes(&self.relief_meshes);
+                planet_perf_log(&format!(
+                    "save mesh points on regen took_ms={}",
+                    save_t0.elapsed().as_millis()
+                ));
+            }
+            planet_perf_log(&format!(
+                "regen completed version={} subdiv={} took_finalize_ms={} cache_size={}",
+                self.regen_version,
+                self.config.subdivisions,
+                finalize_t0.elapsed().as_millis(),
+                self.relief_cache.len()
+            ));
             self.regen_rx = None;
             self.regen_in_progress = false;
             if self.regen_pending {
@@ -572,7 +724,7 @@ impl PlanetLoader {
             let base_vertices = align_vertices_to_poles(&icosahedron_vertices());
             let base_faces = build_faces(&base_vertices, &icosahedron_edges());
             let (sector_vertices, sector_faces) =
-                build_geodesic_sphere(&base_vertices, &base_faces, 4, 0, 1.0);
+                build_geodesic_sphere(&base_vertices, &base_faces, 4, 10, 1.0);
             let align = alignment_axis_angle(&icosahedron_vertices());
             step_done(
                 &tx,
@@ -612,8 +764,8 @@ impl PlanetLoader {
             let (base_texture_mesh_data, _, _) = build_planet_chunk_data(
                 &sector_vertices,
                 &sector_faces,
-                2,
-                1.6,
+                TEXTURE_BASE_SUBDIVISIONS,
+                1.6 + TEXTURE_LAYER_OFFSET,
                 &config,
                 false,
                 true,
@@ -731,17 +883,6 @@ impl PlanetLoader {
     }
 }
 
-fn format_log_timestamp(now: SystemTime) -> String {
-    let since_epoch = now
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    let secs = since_epoch % 86_400;
-    let h = secs / 3600;
-    let m = (secs % 3600) / 60;
-    let s = secs % 60;
-    format!("[{:02}:{:02}:{:02}]", h, m, s)
-}
 
 // Calculates a height value for a given surface normal.
 fn height_value(normal: Vec3, config: &PlanetNoiseConfig) -> f32 {
@@ -921,10 +1062,43 @@ fn build_vertex_neighbors(faces: &[[usize; 3]], vertex_count: usize) -> Vec<Vec<
         .collect()
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct MeshData {
     vertices: Vec<Vertex>,
     indices: Vec<u16>,
+}
+
+struct ReliefCacheEntry {
+    meshes: Vec<Mesh>,
+    face_normals: Vec<Vec3>,
+    sector_values: Vec<f32>,
+}
+
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+struct ReliefCacheKey {
+    subdivisions: u8,
+    noise_scale: u32,
+    height_amp: u32,
+    height_bias: u32,
+    lat_bias: u32,
+    sea_level: u32,
+    ice_start: u32,
+    ice_strength: u32,
+}
+
+impl ReliefCacheKey {
+    fn from_config(config: &PlanetNoiseConfig, subdivisions: u8) -> Self {
+        Self {
+            subdivisions,
+            noise_scale: config.noise_scale.to_bits(),
+            height_amp: config.height_amp.to_bits(),
+            height_bias: config.height_bias.to_bits(),
+            lat_bias: config.lat_bias.to_bits(),
+            sea_level: config.sea_level.to_bits(),
+            ice_start: config.ice_start.to_bits(),
+            ice_strength: config.ice_strength.to_bits(),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -950,6 +1124,19 @@ fn mesh_data_to_mesh(data: MeshData) -> Mesh {
         texture: None,
     }
 }
+
+fn clone_mesh(mesh: &Mesh) -> Mesh {
+    Mesh {
+        vertices: mesh.vertices.clone(),
+        indices: mesh.indices.clone(),
+        texture: mesh.texture.clone(),
+    }
+}
+
+fn clone_meshes(meshes: &[Mesh]) -> Vec<Mesh> {
+    meshes.iter().map(clone_mesh).collect()
+}
+
 
 // Builds mesh data for a set of triangle faces.
 fn build_planet_chunk_data_for_faces(
@@ -1407,7 +1594,7 @@ fn build_heightmap_pixels(
     pixels
 }
 
-fn config_matches(a: &PlanetNoiseConfig, b: &PlanetNoiseConfig) -> bool {
+fn texture_params_match(a: &PlanetNoiseConfig, b: &PlanetNoiseConfig) -> bool {
     let eps = 1e-4;
     (a.noise_scale - b.noise_scale).abs() < eps
         && (a.height_amp - b.height_amp).abs() < eps
@@ -1416,7 +1603,6 @@ fn config_matches(a: &PlanetNoiseConfig, b: &PlanetNoiseConfig) -> bool {
         && (a.sea_level - b.sea_level).abs() < eps
         && (a.ice_start - b.ice_start).abs() < eps
         && (a.ice_strength - b.ice_strength).abs() < eps
-        && a.subdivisions == b.subdivisions
 }
 
 fn load_heightmap_cache(
@@ -1433,7 +1619,7 @@ fn load_heightmap_cache(
         return None;
     };
     if meta.size != size
-        || !config_matches(&meta.config, config)
+        || !texture_params_match(&meta.config, config)
         || (meta.texture_yaw - texture_yaw).abs() > 1e-4
         || (meta.texture_pitch - texture_pitch).abs() > 1e-4
     {
@@ -1525,6 +1711,46 @@ fn zoom_to_subdivisions(distance: f32) -> u8 {
     }
 }
 
+fn zoom_to_subdivisions_hysteresis(distance: f32, current: u8) -> u8 {
+    let h = SUBDIVISION_HYSTERESIS;
+    match current {
+        5 => {
+            if distance > 4.0 + h { 4 } else { 5 }
+        }
+        4 => {
+            if distance < 4.0 - h {
+                5
+            } else if distance > 5.0 + h {
+                3
+            } else {
+                4
+            }
+        }
+        3 => {
+            if distance < 5.0 - h {
+                4
+            } else if distance > 7.0 + h {
+                2
+            } else {
+                3
+            }
+        }
+        2 => {
+            if distance < 7.0 - h {
+                3
+            } else if distance > 9.0 + h {
+                1
+            } else {
+                2
+            }
+        }
+        1 => {
+            if distance < 9.0 - h { 2 } else { 1 }
+        }
+        _ => zoom_to_subdivisions(distance),
+    }
+}
+
 // Runs the planet scene frame update and rendering.
 pub fn run(ctx: &FrameContext, state: &mut PlanetState, scene: &mut Scene) {
     if is_key_pressed(KeyCode::Escape) {
@@ -1555,12 +1781,34 @@ pub fn run(ctx: &FrameContext, state: &mut PlanetState, scene: &mut Scene) {
         state.target_distance = (state.target_distance - wy * 0.01).clamp(2.0, 20.0);
     }
     state.distance += (state.target_distance - state.distance) * 0.06;
-    let desired_subdivisions = zoom_to_subdivisions(state.distance);
-    if desired_subdivisions != state.config.subdivisions {
+    let desired_subdivisions =
+        zoom_to_subdivisions_hysteresis(state.distance, state.config.subdivisions);
+    if state.show_relief && desired_subdivisions != state.config.subdivisions {
+        planet_perf_log(&format!(
+            "lod switch distance={:.3} old={} new={}",
+            state.distance, state.config.subdivisions, desired_subdivisions
+        ));
         state.config.subdivisions = desired_subdivisions;
         state.regenerate(512);
     }
     state.poll_regen();
+    let frame_time = get_frame_time();
+    if frame_time > 0.04 {
+        let now = get_time();
+        if now - state.last_hitch_log_at > 0.2 {
+            state.last_hitch_log_at = now;
+            planet_perf_log(&format!(
+                "hitch frame_ms={:.2} distance={:.3} subdiv={} regen_in_progress={} pending={} expected={} received={}",
+                frame_time * 1000.0,
+                state.distance,
+                state.config.subdivisions,
+                state.regen_in_progress,
+                state.regen_pending,
+                state.regen_expected_chunks,
+                state.regen_received_chunks
+            ));
+        }
+    }
     let yaw_delta = wrap_angle(state.target_yaw - state.yaw);
     state.yaw += yaw_delta * 0.12;
     state.pitch += (state.target_pitch - state.pitch) * 0.12;
@@ -1599,17 +1847,17 @@ pub fn run(ctx: &FrameContext, state: &mut PlanetState, scene: &mut Scene) {
             if mesh.vertices.is_empty() {
                 continue;
             }
-        if let Some(center) = state.face_centers.get(index) {
-            if !point_in_frustum(&camera, *center * radius, 0.6) {
-                continue;
+            if let Some(center) = state.face_centers.get(index) {
+                if !point_in_frustum(&camera, *center * radius, 0.6) {
+                    continue;
+                }
             }
-        }
-        if let Some(normal) = state.face_normals.get(index) {
-            if normal.dot(camera_dir) <= 0.0 {
-                continue;
+            if let Some(normal) = state.face_normals.get(index) {
+                if normal.dot(camera_dir) <= 0.0 {
+                    continue;
+                }
             }
-        }
-        draw_mesh(mesh);
+            draw_mesh(mesh);
         }
     }
     
@@ -1681,7 +1929,9 @@ pub fn run(ctx: &FrameContext, state: &mut PlanetState, scene: &mut Scene) {
     }
 
     set_default_camera();
-    draw_planet_controls(ctx, state);
+    if state.debug_enabled {
+        draw_planet_controls(ctx, state, PLANET_NOISE_PATH);
+    }
     if show_labels {
         for (index, pos) in screen_points.iter().enumerate() {
             if let Some(pos) = pos {
@@ -1697,193 +1947,3 @@ pub fn run(ctx: &FrameContext, state: &mut PlanetState, scene: &mut Scene) {
     }
 }
 
-// Draws the planet configuration UI panel.
-fn draw_planet_controls(ctx: &FrameContext, state: &mut PlanetState) {
-    let panel = Rect::new(18.0, 18.0, 260.0, 254.0);
-    draw_rectangle(panel.x, panel.y, panel.w, panel.h, ctx.colors_rt.panel_bg);
-    draw_rectangle_lines(panel.x, panel.y, panel.w, panel.h, 1.5, ctx.colors_rt.panel_border);
-    draw_text(
-        "Planet Terrain",
-        panel.x + 12.0,
-        panel.y + 24.0,
-        ctx.font_md,
-        ctx.colors_rt.text_primary,
-    );
-
-    let mut y = panel.y + 54.0;
-    let x = panel.x + 12.0;
-    let value_x = panel.x + panel.w - 90.0;
-    let step = 26.0;
-
-    let mut changed = false;
-    changed |= draw_adjust_row(
-        ctx,
-        "Noise",
-        &mut state.config.noise_scale,
-        0.2,
-        0.5,
-        5.0,
-        x,
-        value_x,
-        y,
-    );
-    y += step;
-    changed |= draw_adjust_row(
-        ctx,
-        "Amp",
-        &mut state.config.height_amp,
-        0.1,
-        0.5,
-        2.5,
-        x,
-        value_x,
-        y,
-    );
-    y += step;
-    changed |= draw_adjust_row(
-        ctx,
-        "Bias",
-        &mut state.config.height_bias,
-        0.05,
-        -1.0,
-        1.0,
-        x,
-        value_x,
-        y,
-    );
-    y += step;
-    changed |= draw_adjust_row(
-        ctx,
-        "Lat",
-        &mut state.config.lat_bias,
-        0.05,
-        -0.5,
-        0.5,
-        x,
-        value_x,
-        y,
-    );
-    y += step;
-    changed |= draw_adjust_row(
-        ctx,
-        "Sea",
-        &mut state.config.sea_level,
-        0.02,
-        0.2,
-        0.9,
-        x,
-        value_x,
-        y,
-    );
-    y += step;
-    changed |= draw_adjust_row(
-        ctx,
-        "Ice",
-        &mut state.config.ice_start,
-        0.02,
-        0.2,
-        0.9,
-        x,
-        value_x,
-        y,
-    );
-    y += step;
-    changed |= draw_adjust_row(
-        ctx,
-        "IcePow",
-        &mut state.config.ice_strength,
-        0.1,
-        0.5,
-        3.0,
-        x,
-        value_x,
-        y,
-    );
-    y += step + 6.0;
-
-    let rect_toggle = Rect::new(x, y, 230.0, 26.0);
-    let (clicked_toggle, _) = ui_button(
-        rect_toggle,
-        if state.show_relief { "Relief: On" } else { "Relief: Off" },
-        ctx.mouse,
-        ctx.font_sm,
-        ctx.button_colors,
-    );
-    if clicked_toggle {
-        state.show_relief = !state.show_relief;
-    }
-    y += step;
-
-
-    let rect_load = Rect::new(x, y, 110.0, 26.0);
-    let (clicked_load, _) = ui_button(
-        rect_load,
-        "Load JSON",
-        ctx.mouse,
-        ctx.font_sm,
-        ctx.button_colors,
-    );
-    let rect_save = Rect::new(x + 120.0, y, 110.0, 26.0);
-    let (clicked_save, _) = ui_button(
-        rect_save,
-        "Save JSON",
-        ctx.mouse,
-        ctx.font_sm,
-        ctx.button_colors,
-    );
-
-    if changed {
-        state.regenerate(512);
-    }
-    if clicked_load {
-        state.load_heightmap(PLANET_NOISE_PATH);
-    }
-    if clicked_save {
-        state.save_heightmap(512, PLANET_NOISE_PATH);
-    }
-}
-
-// Draws a labeled +/- row for numeric configuration tweaks.
-fn draw_adjust_row(
-    ctx: &FrameContext,
-    label: &str,
-    value: &mut f32,
-    step: f32,
-    min: f32,
-    max: f32,
-    x: f32,
-    value_x: f32,
-    y: f32,
-) -> bool {
-    draw_text(label, x, y, ctx.font_sm, ctx.colors_rt.text_secondary);
-    let rect_minus = Rect::new(value_x, y - 16.0, 22.0, 20.0);
-    let rect_plus = Rect::new(value_x + 54.0, y - 16.0, 22.0, 20.0);
-    let (clicked_minus, _) = ui_button(
-        rect_minus,
-        "-",
-        ctx.mouse,
-        ctx.font_sm,
-        ctx.button_colors,
-    );
-    let (clicked_plus, _) = ui_button(
-        rect_plus,
-        "+",
-        ctx.mouse,
-        ctx.font_sm,
-        ctx.button_colors,
-    );
-    if clicked_minus {
-        *value = (*value - step).max(min);
-    }
-    if clicked_plus {
-        *value = (*value + step).min(max);
-    }
-    draw_text(
-        &format!("{:.2}", *value),
-        value_x + 26.0,
-        y,
-        ctx.font_sm,
-        ctx.colors_rt.text_secondary,
-    );
-    clicked_minus || clicked_plus
-}

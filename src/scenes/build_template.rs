@@ -89,20 +89,16 @@ pub fn run(
     let ui_capturing = is_ui_capturing(panel_rect, window, confirm_window, ctx.mouse);
 
     // Handle block placement/deletion
-    if is_mouse_button_pressed(MouseButton::Left) && !ui_capturing {
-        if in_bounds(hover_hex, outline) {
-            match selected {
-                Some(block_type) => {
-                    if !blocks.contains_key(&hover_hex) {
-                        blocks.insert(hover_hex, MachineBlock {
-                            kind: *block_type,
-                            rotation: *placement_rotation,
-                        });
-                    }
-                }
-                None => {
-                    blocks.remove(&hover_hex);
-                }
+    if is_mouse_button_pressed(MouseButton::Left) && !ui_capturing && in_bounds(hover_hex, outline) {
+        match selected {
+            Some(block_type) => {
+                blocks.entry(hover_hex).or_insert(MachineBlock {
+                        kind: *block_type,
+                        rotation: *placement_rotation,
+                    });
+            }
+            None => {
+                blocks.remove(&hover_hex);
             }
         }
     }
@@ -202,7 +198,7 @@ pub fn run(
         colors,
         &buttons,
         *selected,
-        |kind| machine_block_color(kind),
+        machine_block_color,
     );
     if panel_result.toggled {
         *panel_collapsed = !*panel_collapsed;

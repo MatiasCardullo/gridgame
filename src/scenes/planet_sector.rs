@@ -389,7 +389,7 @@ fn nearest_supply_with_items(
         let has_any = block
             .stored
             .iter()
-            .any(|s| s.amount > 0 && needed.iter().any(|k| *k == s.kind));
+            .any(|s| s.amount > 0 && needed.contains(&s.kind));
         if !has_any {
             continue;
         }
@@ -427,7 +427,7 @@ fn nearest_builder_with_items(
         let has_any = block
             .stored
             .iter()
-            .any(|s| s.amount > 0 && needed.iter().any(|k| *k == s.kind));
+            .any(|s| s.amount > 0 && needed.contains(&s.kind));
         if !has_any {
             continue;
         }
@@ -532,39 +532,37 @@ pub fn run(
         }
     }
 
-    if is_mouse_button_pressed(MouseButton::Right) && !ui_capturing {
-        if in_bounds(hover_hex, outline) {
-            if let Some(kind) = *selected {
-                if !blocks.contains_key(&hover_hex) {
-                    let can_mine = tiles
-                        .get(&hover_hex)
-                        .map(|t| {
-                            matches!(
-                                t.kind,
-                                TileType::Iron
-                                    | TileType::Copper
-                                    | TileType::Gold
-                                    | TileType::Zinc
-                                    | TileType::Lead
-                            ) && t.amount > 0
-                        })
-                        .unwrap_or(false);
-                    if kind != BuildBlockType::Mine || can_mine {
-                        let rotation = if kind == BuildBlockType::Route { 0 } else { *placement_rotation };
-                        blocks.insert(hover_hex, new_placed_block(kind, rotation));
-                        *dirty = true;
-                    }
+    if is_mouse_button_pressed(MouseButton::Right) && !ui_capturing && in_bounds(hover_hex, outline) {
+        if let Some(kind) = *selected {
+            if let std::collections::hash_map::Entry::Vacant(e) = blocks.entry(hover_hex) {
+                let can_mine = tiles
+                    .get(&hover_hex)
+                    .map(|t| {
+                        matches!(
+                            t.kind,
+                            TileType::Iron
+                                | TileType::Copper
+                                | TileType::Gold
+                                | TileType::Zinc
+                                | TileType::Lead
+                        ) && t.amount > 0
+                    })
+                    .unwrap_or(false);
+                if kind != BuildBlockType::Mine || can_mine {
+                    let rotation = if kind == BuildBlockType::Route { 0 } else { *placement_rotation };
+                    e.insert(new_placed_block(kind, rotation));
+                    *dirty = true;
                 }
-            } else if blocks.contains_key(&hover_hex) {
-                let win_w = 240.0;
-                let win_h = 120.0;
-                let rect = popup_rect_near_mouse(ctx.mouse, win_w, win_h);
-                confirm_window.title = "Confirm".to_string();
-                confirm_window.rect = rect;
-                confirm_window.open = true;
-                confirm_window.target = Some(hover_hex);
-                confirm_window.dragging = false;
             }
+        } else if blocks.contains_key(&hover_hex) {
+            let win_w = 240.0;
+            let win_h = 120.0;
+            let rect = popup_rect_near_mouse(ctx.mouse, win_w, win_h);
+            confirm_window.title = "Confirm".to_string();
+            confirm_window.rect = rect;
+            confirm_window.open = true;
+            confirm_window.target = Some(hover_hex);
+            confirm_window.dragging = false;
         }
     }
 
@@ -596,8 +594,8 @@ pub fn run(
         .filter(|(_, block)| is_under_construction(block))
         .map(|(hex, _)| *hex)
         .collect();
-    for hex in build_hexes.iter().copied() {
-        if let Some(block) = blocks.get_mut(&hex) {
+    for hex in build_hexes.iter() {
+        if let Some(block) = blocks.get_mut(hex) {
             if block.build_paid {
                 block.build_progress += dt;
                 if block.build_progress > block.build_time {
@@ -969,12 +967,10 @@ pub fn run(
                 if unit.index >= unit.path.len() - 1 {
                     unit.forward = false;
                 }
+            } else if unit.index > 0 {
+                unit.index -= 1;
             } else {
-                if unit.index > 0 {
-                    unit.index -= 1;
-                } else {
-                    unit.forward = true;
-                }
+                unit.forward = true;
             }
             let arrived = unit.path[unit.index];
             if is_logistics
@@ -1007,15 +1003,13 @@ pub fn run(
                         if target_build_paid && !unit.cargo.is_empty() {
                             unload_unit_to_block(&mut unit.cargo, block);
                         }
-                        if unit.cargo.is_empty() && target_needs {
-                            if !take_reqs_from_block(
+                        if unit.cargo.is_empty() && target_needs && !take_reqs_from_block(
                                 block,
                                 &mut unit.cargo,
                                 unit.capacity,
                                 &unit.supply_reqs,
                             ) {
-                                unit.waiting_for_supply = true;
-                            }
+                            unit.waiting_for_supply = true;
                         }
                     }
                 } else if is_logistics {
@@ -1033,7 +1027,7 @@ pub fn run(
             {
                 let under_construction = blocks
                     .get(&unit.station_out)
-                    .map(|block| is_under_construction(block))
+                    .map(is_under_construction)
                     .unwrap_or(false);
                 if under_construction {
                     apply_cargo_to_construction(blocks, unit.station_out, &mut unit.cargo);
@@ -1045,7 +1039,7 @@ pub fn run(
             } else if arrived == unit.station_out {
                 let under_construction = blocks
                     .get(&arrived)
-                    .map(|block| is_under_construction(block))
+                    .map(is_under_construction)
                     .unwrap_or(false);
                 if under_construction {
                     apply_cargo_to_construction(blocks, arrived, &mut unit.cargo);
@@ -1610,10 +1604,8 @@ pub fn run(
                                     ctx.font_sm,
                                     ctx.button_colors,
                                 );
-                                if clicked {
-                                    if expand_mine_area(target, block, tiles) {
-                                        *dirty = true;
-                                    }
+                                if clicked && expand_mine_area(target, block, tiles) {
+                                    *dirty = true;
                                 }
                             }
                         }
@@ -1646,18 +1638,9 @@ pub fn run(
     }
     if let Some((depot, a, b, kind)) = spawn_request {
         let path = if kind == BuildBlockType::Logistics {
-            let first = match find_route_path(depot, a, blocks) {
-                Some(path) => path,
-                None => Vec::new(),
-            };
-            let second = match find_route_path(a, b, blocks) {
-                Some(path) => path,
-                None => Vec::new(),
-            };
-            let third = match find_route_path(b, a, blocks) {
-                Some(path) => path,
-                None => Vec::new(),
-            };
+            let first = find_route_path(depot, a, blocks).unwrap_or_default();
+            let second = find_route_path(a, b, blocks).unwrap_or_default();
+            let third = find_route_path(b, a, blocks).unwrap_or_default();
             if first.is_empty() || second.is_empty() || third.is_empty() {
                 Vec::new()
             } else {
@@ -1669,10 +1652,7 @@ pub fn run(
                 combined
             }
         } else {
-            match find_route_path(a, b, blocks) {
-                Some(path) => path,
-                None => Vec::new(),
-            }
+            find_route_path(a, b, blocks).unwrap_or_default()
         };
         if !path.is_empty() {
             let speed = if kind == BuildBlockType::Builder { 4.5 } else { 3.0 };

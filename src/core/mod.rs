@@ -167,16 +167,13 @@ pub struct Unit {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Default)]
 pub enum AutoSupplyRole {
+    #[default]
     Base,
     Builder,
 }
 
-impl Default for AutoSupplyRole {
-    fn default() -> Self {
-        AutoSupplyRole::Base
-    }
-}
 
 // Select which endpoint to set for logistics units.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -426,6 +423,7 @@ struct MapData {
 }
 
 #[derive(Serialize, Deserialize)]
+#[derive(Default)]
 pub struct ConfigData {
     #[serde(default)]
     pub config: AppConfig,
@@ -433,14 +431,6 @@ pub struct ConfigData {
     pub colors: AppColors,
 }
 
-impl Default for ConfigData {
-    fn default() -> Self {
-        Self {
-            config: AppConfig::default(),
-            colors: AppColors::default(),
-        }
-    }
-}
 
 // Convert axial hex coords to pixel space.
 pub fn hex_to_pixel(hex: Axial, size: f32, origin: Vec2) -> Vec2 {

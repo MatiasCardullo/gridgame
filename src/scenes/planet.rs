@@ -328,7 +328,7 @@ impl PlanetState {
             sector_faces,
             sector_values,
             printed_midpoints: false,
-            show_relief: true,
+            show_relief: false,
             debug_enabled: PLANET_DEBUG_UI_ENABLED_DEFAULT,
             heightmap_texture: Some(heightmap_texture),
             texture_config: config,
@@ -488,7 +488,7 @@ impl PlanetState {
             .map(|v| v.get())
             .unwrap_or(1)
             .min(face_count.max(1));
-        let chunk_size = (face_count + workers - 1) / workers;
+        let chunk_size = face_count.div_ceil(workers);
 
         self.regen_expected_chunks = workers + if refresh_texture { 1 } else { 0 };
         self.regen_received_chunks = 0;

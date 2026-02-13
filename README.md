@@ -27,3 +27,10 @@ Hex-grid strategy game built with Rust and Macroquad. Build structures, extract 
 2. Logistics and Builder units are created from their block windows and can be listed with "Unit list".
 3. Base auto-supply units prioritize non-Route construction and can source from Base or Warehouses.
 4. Builder auto-supply units prioritize Route construction, move faster, and travel only along Routes.
+
+**Planet Scene Data**
+1. Terrain parameters and sector values are saved in `planet_data/planet_noise.json`.
+2. The 2D heightmap texture is regenerated from that JSON when needed (no separate texture cache files).
+3. Optional runtime artifacts:
+4. `planet_data/planet_perf.log` for perf/hitch logging.
+5. `planet_data/planet_mesh_points.csv` only when mesh-point export is enabled.

@@ -11,6 +11,7 @@ pub const PLANET_DEBUG_UI_ENABLED_DEFAULT: bool = false;
 pub const PLANET_PERF_LOG_PATH: &str = "planet_data/planet_perf.log";
 pub const SAVE_MESH_POINTS_RUNTIME: bool = false;
 
+// Formats timestamps in `[HH:MM:SS]` for debug/perf logs.
 pub fn format_log_timestamp(now: SystemTime) -> String {
     let since_epoch = now
         .duration_since(UNIX_EPOCH)
@@ -23,6 +24,7 @@ pub fn format_log_timestamp(now: SystemTime) -> String {
     format!("[{:02}:{:02}:{:02}]", h, m, s)
 }
 
+// Appends one line to the planet performance log.
 pub fn planet_perf_log(line: &str) {
     let _ = fs::create_dir_all("planet_data");
     let Ok(mut file) = OpenOptions::new()
@@ -35,6 +37,7 @@ pub fn planet_perf_log(line: &str) {
     let _ = writeln!(file, "{} {}", format_log_timestamp(SystemTime::now()), line);
 }
 
+// Draws the debug controls panel and routes UI actions to planet state handlers.
 pub fn draw_planet_controls(ctx: &FrameContext, state: &mut PlanetState, noise_path: &str) {
     let panel = Rect::new(18.0, 18.0, 260.0, 254.0);
     draw_rectangle(panel.x, panel.y, panel.w, panel.h, ctx.colors_rt.panel_bg);
@@ -173,6 +176,7 @@ pub fn draw_planet_controls(ctx: &FrameContext, state: &mut PlanetState, noise_p
     }
 }
 
+// Draws one numeric row (`- value +`) and returns true when it changed.
 fn draw_adjust_row(
     ctx: &FrameContext,
     label: &str,

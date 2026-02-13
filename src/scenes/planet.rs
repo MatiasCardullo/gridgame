@@ -5,6 +5,7 @@ use std::fs;
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::sync::mpsc::{self, Receiver};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Instant, SystemTime};
 
@@ -15,14 +16,14 @@ use crate::core::debug::{
 };
 
 const PLANET_DATA_DIR: &str = "planet_data";
-const HEIGHTMAP_META_PATH: &str = "planet_data/planet_heightmap_meta.json";
-const HEIGHTMAP_DATA_PATH: &str = "planet_data/planet_heightmap.rgba";
 const MESH_POINTS_PATH: &str = "planet_data/planet_mesh_points.csv";
 const PLANET_NOISE_PATH: &str = "planet_data/planet_noise.json";
-const HEIGHTMAP_SIZE: u16 = 1024;
+const HEIGHTMAP_SIZE: u16 = 2048;
 const TEXTURE_BASE_SUBDIVISIONS: usize = 2;
 const TEXTURE_LAYER_OFFSET: f32 = 0.004;
 const SUBDIVISION_HYSTERESIS: f32 = 0.25;
+const FALLBACK_RELIEF_SUBDIVISIONS: usize = 1;
+const REGEN_FACE_GRAIN: usize = 12;
 
 // Wraps an angle to the [-PI, PI] range for smooth camera interpolation.
 fn wrap_angle(mut angle: f32) -> f32 {
@@ -170,14 +171,6 @@ struct PlanetNoiseSnapshot {
     sector_values: Vec<f32>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-struct HeightmapCacheMeta {
-    config: PlanetNoiseConfig,
-    texture_yaw: f32,
-    texture_pitch: f32,
-    size: u16,
-}
-
 pub struct PlanetBuildData {
     config: PlanetNoiseConfig,
     base_vertices: Vec<Vec3>,
@@ -188,15 +181,12 @@ pub struct PlanetBuildData {
     face_normals: Vec<Vec3>,
     sector_values: Vec<f32>,
     heightmap_pixels: Vec<u8>,
-    texture_yaw: f32,
-    texture_pitch: f32,
 }
 
+// Ensures the planet data folder exists and migrates legacy files into it.
 fn ensure_planet_data_dir() {
     let _ = fs::create_dir_all(PLANET_DATA_DIR);
     let files = [
-        ("planet_heightmap_meta.json", HEIGHTMAP_META_PATH),
-        ("planet_heightmap.rgba", HEIGHTMAP_DATA_PATH),
         ("planet_mesh_points.csv", MESH_POINTS_PATH),
         ("planet_noise.json", PLANET_NOISE_PATH),
     ];
@@ -243,6 +233,7 @@ pub struct PlanetState {
     pub last_mouse: Vec2,
     pub config: PlanetNoiseConfig,
     pub relief_meshes: Vec<Mesh>,
+    pub fallback_relief_meshes: Vec<Mesh>,
     pub base_texture_meshes: Vec<Mesh>,
     pub face_normals: Vec<Vec3>,
     pub face_centers: Vec<Vec3>,
@@ -255,8 +246,6 @@ pub struct PlanetState {
     pub debug_enabled: bool,
     pub heightmap_texture: Option<Texture2D>,
     pub texture_config: PlanetNoiseConfig,
-    pub texture_yaw: f32,
-    pub texture_pitch: f32,
     relief_cache: HashMap<ReliefCacheKey, ReliefCacheEntry>,
     pending_relief_key: Option<ReliefCacheKey>,
     regen_rx: Option<Receiver<RegenMessage>>,
@@ -266,6 +255,7 @@ pub struct PlanetState {
     pub regen_expected_chunks: usize,
     pub regen_received_chunks: usize,
     last_hitch_log_at: f64,
+    regen_generation: Arc<AtomicU64>,
 }
 
 impl PlanetState {
@@ -280,8 +270,6 @@ impl PlanetState {
             face_normals,
             sector_values,
             heightmap_pixels,
-            texture_yaw,
-            texture_pitch,
         } = data;
         let heightmap_texture =
             Texture2D::from_rgba8(HEIGHTMAP_SIZE, HEIGHTMAP_SIZE, &heightmap_pixels);
@@ -291,12 +279,28 @@ impl PlanetState {
             .cloned()
             .map(mesh_data_to_mesh)
             .collect::<Vec<_>>();
+        let (fallback_mesh_data, _, _) = build_planet_chunk_data(
+            &sector_vertices,
+            &sector_faces,
+            FALLBACK_RELIEF_SUBDIVISIONS,
+            1.6,
+            &config,
+            true,
+            true,
+        );
+        let mut fallback_relief_meshes = fallback_mesh_data
+            .into_iter()
+            .map(mesh_data_to_mesh)
+            .collect::<Vec<_>>();
         let mut base_texture_meshes = base_texture_mesh_data
             .into_iter()
             .map(mesh_data_to_mesh)
             .collect::<Vec<_>>();
         let value = Some(heightmap_texture.clone());
         for mesh in base_texture_meshes.iter_mut() {
+            mesh.texture = value.clone();
+        }
+        for mesh in fallback_relief_meshes.iter_mut() {
             mesh.texture = value.clone();
         }
         let face_centers = build_face_centers(&sector_vertices, &sector_faces);
@@ -320,6 +324,7 @@ impl PlanetState {
             last_mouse: Vec2::ZERO,
             config,
             relief_meshes,
+            fallback_relief_meshes,
             base_texture_meshes,
             face_normals,
             face_centers,
@@ -328,12 +333,10 @@ impl PlanetState {
             sector_faces,
             sector_values,
             printed_midpoints: false,
-            show_relief: false,
+            show_relief: true,
             debug_enabled: PLANET_DEBUG_UI_ENABLED_DEFAULT,
             heightmap_texture: Some(heightmap_texture),
             texture_config: config,
-            texture_yaw,
-            texture_pitch,
             relief_cache,
             pending_relief_key: None,
             regen_rx: None,
@@ -343,6 +346,7 @@ impl PlanetState {
             regen_expected_chunks: 0,
             regen_received_chunks: 0,
             last_hitch_log_at: 0.0,
+            regen_generation: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -395,12 +399,14 @@ impl PlanetState {
         self.sector_values = snapshot.sector_values;
         self.relief_cache.clear();
         self.pending_relief_key = None;
+        self.rebuild_fallback_relief_meshes();
         self.regenerate(512);
     }
 
     pub(crate) fn debug_on_controls_changed(&mut self) {
         self.relief_cache.clear();
         self.pending_relief_key = None;
+        self.rebuild_fallback_relief_meshes();
         self.regenerate(512);
     }
 
@@ -412,17 +418,37 @@ impl PlanetState {
         self.save_heightmap(512, path);
     }
 
+    // Rebuilds the low-detail fallback relief mesh and reapplies current texture.
+    fn rebuild_fallback_relief_meshes(&mut self) {
+        let (fallback_mesh_data, _, _) = build_planet_chunk_data(
+            &self.sector_vertices,
+            &self.sector_faces,
+            FALLBACK_RELIEF_SUBDIVISIONS,
+            1.6,
+            &self.config,
+            true,
+            true,
+        );
+        self.fallback_relief_meshes = fallback_mesh_data
+            .into_iter()
+            .map(mesh_data_to_mesh)
+            .collect();
+        for mesh in self.fallback_relief_meshes.iter_mut() {
+            mesh.texture = self.heightmap_texture.clone();
+        }
+    }
+
     // Requests a background regeneration of meshes.
     fn request_regen(&mut self) {
         if self.regen_in_progress {
-            self.regen_pending = true;
             planet_perf_log(&format!(
-                "regen queued version={} subdiv={} pending=true",
+                "regen preempt old_version={} new_subdiv={}",
                 self.regen_version, self.config.subdivisions
             ));
-            return;
         }
         self.regen_version = self.regen_version.wrapping_add(1);
+        self.regen_generation
+            .store(self.regen_version, Ordering::Relaxed);
         planet_perf_log(&format!(
             "regen start version={} subdiv={}",
             self.regen_version, self.config.subdivisions
@@ -430,14 +456,13 @@ impl PlanetState {
         self.start_regen(self.regen_version);
     }
 
+    // Starts async regeneration jobs for relief chunks and (when needed) texture.
     fn start_regen(&mut self, version: u64) {
         let config = self.config;
         let subdivisions = self.config.subdivisions as usize;
         let relief_key = ReliefCacheKey::from_config(&config, self.config.subdivisions);
         let texture_size = HEIGHTMAP_SIZE;
-        let align = alignment_axis_angle(&icosahedron_vertices());
-        let texture_yaw = self.texture_yaw;
-        let texture_pitch = self.texture_pitch;
+        let regen_generation = Arc::clone(&self.regen_generation);
         let refresh_texture =
             !texture_params_match(&self.texture_config, &config) || self.heightmap_texture.is_none();
 
@@ -461,13 +486,7 @@ impl PlanetState {
             self.pending_relief_key = None;
             let tx_texture = tx.clone();
             std::thread::spawn(move || {
-                let pixels = load_or_build_heightmap(
-                    &config,
-                    texture_size,
-                    align,
-                    texture_yaw,
-                    texture_pitch,
-                );
+                let pixels = load_or_build_heightmap(&config, texture_size);
                 let _ = tx_texture.send(RegenMessage::Texture {
                     version,
                     pixels,
@@ -489,8 +508,17 @@ impl PlanetState {
             .unwrap_or(1)
             .min(face_count.max(1));
         let chunk_size = face_count.div_ceil(workers);
+        let mut mesh_chunks = 0usize;
+        for worker in 0..workers {
+            let start = worker * chunk_size;
+            if start >= face_count {
+                break;
+            }
+            let end = (start + chunk_size).min(face_count);
+            mesh_chunks += (end - start).div_ceil(REGEN_FACE_GRAIN);
+        }
 
-        self.regen_expected_chunks = workers + if refresh_texture { 1 } else { 0 };
+        self.regen_expected_chunks = mesh_chunks + if refresh_texture { 1 } else { 0 };
         self.regen_received_chunks = 0;
         self.pending_relief_key = Some(relief_key);
         planet_perf_log(&format!(
@@ -500,14 +528,15 @@ impl PlanetState {
 
         if refresh_texture {
             let tx_texture = tx.clone();
+            let regen_generation = Arc::clone(&regen_generation);
             std::thread::spawn(move || {
-                let pixels = load_or_build_heightmap(
-                    &config,
-                    texture_size,
-                    align,
-                    texture_yaw,
-                    texture_pitch,
-                );
+                if regen_generation.load(Ordering::Relaxed) != version {
+                    return;
+                }
+                let pixels = load_or_build_heightmap(&config, texture_size);
+                if regen_generation.load(Ordering::Relaxed) != version {
+                    return;
+                }
                 let _ = tx_texture.send(RegenMessage::Texture {
                     version,
                     pixels,
@@ -526,27 +555,36 @@ impl PlanetState {
             let faces = Arc::clone(&faces);
             let tx = tx.clone();
             let config = config;
+            let regen_generation = Arc::clone(&regen_generation);
             std::thread::spawn(move || {
-                let slice = &faces[start..end];
-                let (mesh_data, face_normals, sector_values) = build_planet_chunk_data_for_faces(
-                    &base_vertices,
-                    slice,
-                    subdivisions,
-                    1.6,
-                    &config,
-                    true,
-                    false,
-                    align,
-                    texture_yaw,
-                    texture_pitch,
-                );
-                let _ = tx.send(RegenMessage::MeshChunk {
-                    version,
-                    start,
-                    mesh_data,
-                    face_normals,
-                    sector_values,
-                });
+                let mut local_start = start;
+                while local_start < end {
+                    if regen_generation.load(Ordering::Relaxed) != version {
+                        return;
+                    }
+                    let local_end = (local_start + REGEN_FACE_GRAIN).min(end);
+                    let slice = &faces[local_start..local_end];
+                    let (mesh_data, face_normals, sector_values) = build_planet_chunk_data_for_faces(
+                        &base_vertices,
+                        slice,
+                        subdivisions,
+                        1.6,
+                        &config,
+                        true,
+                        false,
+                    );
+                    if regen_generation.load(Ordering::Relaxed) != version {
+                        return;
+                    }
+                    let _ = tx.send(RegenMessage::MeshChunk {
+                        version,
+                        start: local_start,
+                        mesh_data,
+                        face_normals,
+                        sector_values,
+                    });
+                    local_start = local_end;
+                }
             });
         }
         self.regen_rx = Some(rx);
@@ -554,6 +592,7 @@ impl PlanetState {
         self.regen_pending = false;
     }
 
+    // Polls finished async jobs and swaps generated data into active meshes/texture.
     fn poll_regen(&mut self) {
         let Some(rx) = &self.regen_rx else {
             return;
@@ -570,6 +609,9 @@ impl PlanetState {
                     tex.set_filter(FilterMode::Linear);
                     self.heightmap_texture = Some(tex);
                     for mesh in self.base_texture_meshes.iter_mut() {
+                        mesh.texture = self.heightmap_texture.clone();
+                    }
+                    for mesh in self.fallback_relief_meshes.iter_mut() {
                         mesh.texture = self.heightmap_texture.clone();
                     }
                     self.texture_config = self.config;
@@ -709,8 +751,6 @@ impl PlanetLoader {
                 });
             }
 
-            let texture_yaw = 90.0_f32.to_radians();
-            let texture_pitch = 32.0_f32.to_radians();
             let mut config = PlanetNoiseConfig::default();
             let mut loaded_sector_values: Option<Vec<f32>> = None;
             if let Ok(contents) = fs::read_to_string(PLANET_NOISE_PATH) {
@@ -725,7 +765,6 @@ impl PlanetLoader {
             let base_faces = build_faces(&base_vertices, &icosahedron_edges());
             let (sector_vertices, sector_faces) =
                 build_geodesic_sphere(&base_vertices, &base_faces, 4, 10, 1.0);
-            let align = alignment_axis_angle(&icosahedron_vertices());
             step_done(
                 &tx,
                 &mut log_file,
@@ -737,8 +776,7 @@ impl PlanetLoader {
 
             let heightmap_start = step_start(&tx, &mut log_file, "Load/build heightmap");
             ensure_planet_data_dir();
-            let heightmap_pixels =
-                load_or_build_heightmap(&config, HEIGHTMAP_SIZE, align, texture_yaw, texture_pitch);
+            let heightmap_pixels = load_or_build_heightmap(&config, HEIGHTMAP_SIZE);
             step_done(
                 &tx,
                 &mut log_file,
@@ -757,9 +795,6 @@ impl PlanetLoader {
                 &config,
                 true,
                 false,
-                align,
-                0.0,
-                0.0,
             );
             let (base_texture_mesh_data, _, _) = build_planet_chunk_data(
                 &sector_vertices,
@@ -769,9 +804,6 @@ impl PlanetLoader {
                 &config,
                 false,
                 true,
-                align,
-                texture_yaw,
-                texture_pitch,
             );
             let sector_values = loaded_sector_values.unwrap_or(sector_values);
             step_done(
@@ -804,8 +836,6 @@ impl PlanetLoader {
                 face_normals,
                 sector_values,
                 heightmap_pixels,
-                texture_yaw,
-                texture_pitch,
             };
 
             let _ = tx.send(PlanetLoadEvent::Done(data));
@@ -1147,9 +1177,6 @@ fn build_planet_chunk_data_for_faces(
     config: &PlanetNoiseConfig,
     use_relief: bool,
     use_texture: bool,
-    align: Option<(Vec3, f32)>,
-    texture_yaw: f32,
-    texture_pitch: f32,
 ) -> (Vec<MeshData>, Vec<Vec3>, Vec<f32>) {
     let mut meshes: Vec<MeshData> = Vec::with_capacity(faces_in.len());
     let mut face_normals: Vec<Vec3> = Vec::with_capacity(faces_in.len());
@@ -1168,38 +1195,38 @@ fn build_planet_chunk_data_for_faces(
         let mut positions: Vec<Vec3> = Vec::with_capacity(vertices.len());
         let mut normals: Vec<Vec3> = Vec::with_capacity(vertices.len());
         let mut heights: Vec<f32> = Vec::with_capacity(vertices.len());
-    for v in vertices.iter() {
-        let normal = v.normalize();
-        let height = height_value(normal, config);
-        let sea_level = config.sea_level;
-        let elevation = if use_relief {
-            if height < sea_level {
-                0.0
+        for v in vertices.iter() {
+            let normal = v.normalize();
+            let height = height_value(normal, config);
+            let sea_level = config.sea_level;
+            let elevation = if use_relief {
+                if height < sea_level {
+                    0.0
+                } else {
+                    (height - sea_level) * 0.28
+                }
             } else {
-                (height - sea_level) * 0.28
-            }
-        } else {
-            0.0
-        };
-        positions.push(normal * (radius + elevation));
-        normals.push(normal);
-        heights.push(height);
-    }
-
-    let mut mesh_vertices: Vec<Vertex> = Vec::with_capacity(faces.len() * 3);
-    let mut indices: Vec<u16> = Vec::with_capacity(faces.len() * 3);
-    for f in faces {
-        let idxs = [f[0], f[1], f[2]];
-        if use_relief {
-            let avg_height = (heights[idxs[0]] + heights[idxs[1]] + heights[idxs[2]]) / 3.0;
-            if avg_height < config.sea_level {
-                continue;
-            }
+                0.0
+            };
+            positions.push(normal * (radius + elevation));
+            normals.push(normal);
+            heights.push(height);
         }
-        let mut uvs = [
-            uv_from_normal_oriented(normals[idxs[0]], align, texture_yaw, texture_pitch),
-            uv_from_normal_oriented(normals[idxs[1]], align, texture_yaw, texture_pitch),
-            uv_from_normal_oriented(normals[idxs[2]], align, texture_yaw, texture_pitch),
+
+        let mut mesh_vertices: Vec<Vertex> = Vec::with_capacity(faces.len() * 3);
+        let mut indices: Vec<u16> = Vec::with_capacity(faces.len() * 3);
+        for f in faces {
+            let idxs = [f[0], f[1], f[2]];
+            if use_relief {
+                let avg_height = (heights[idxs[0]] + heights[idxs[1]] + heights[idxs[2]]) / 3.0;
+                if avg_height < config.sea_level {
+                    continue;
+                }
+            }
+            let mut uvs = [
+                uv_from_normal(normals[idxs[0]]),
+                uv_from_normal(normals[idxs[1]]),
+                uv_from_normal(normals[idxs[2]]),
             ];
             if use_texture {
                 let min_u = uvs[0].x.min(uvs[1].x.min(uvs[2].x));
@@ -1254,9 +1281,6 @@ fn build_planet_chunk_data(
     config: &PlanetNoiseConfig,
     use_relief: bool,
     use_texture: bool,
-    align: Option<(Vec3, f32)>,
-    texture_yaw: f32,
-    texture_pitch: f32,
 ) -> (Vec<MeshData>, Vec<Vec3>, Vec<f32>) {
     build_planet_chunk_data_for_faces(
         base_vertices,
@@ -1266,9 +1290,6 @@ fn build_planet_chunk_data(
         config,
         use_relief,
         use_texture,
-        align,
-        texture_yaw,
-        texture_pitch,
     )
 }
 
@@ -1536,34 +1557,10 @@ fn uv_from_normal(normal: Vec3) -> Vec2 {
     vec2(u, v)
 }
 
-fn apply_align(normal: Vec3, align: Option<(Vec3, f32)>) -> Vec3 {
-    if let Some((axis, angle)) = align {
-        rotate_vec3(normal, axis, angle)
-    } else {
-        normal
-    }
-}
-
-fn uv_from_normal_oriented(
-    normal: Vec3,
-    align: Option<(Vec3, f32)>,
-    texture_yaw: f32,
-    texture_pitch: f32,
-) -> Vec2 {
-    let n = apply_align(normal.normalize(), align);
-    let pole_axis = rotate_vec3(vec3(0.0, 1.0, 0.0), vec3(1.0, 0.0, 0.0), texture_pitch);
-    let n = rotate_vec3(n, vec3(1.0, 0.0, 0.0), texture_pitch);
-    let n = rotate_vec3(n, pole_axis, texture_yaw);
-    uv_from_normal(n)
-}
-
 // Builds an RGBA heightmap texture using equirectangular sampling.
 fn build_heightmap_pixels(
     config: &PlanetNoiseConfig,
     size: u16,
-    align: Option<(Vec3, f32)>,
-    texture_yaw: f32,
-    texture_pitch: f32,
 ) -> Vec<u8> {
     let size = size as usize;
     let mut pixels = vec![0u8; size * size * 4];
@@ -1574,14 +1571,9 @@ fn build_heightmap_pixels(
         let cos_phi = phi.cos();
         for x in 0..size {
             let u = x as f32 / (size - 1) as f32;
-            let theta = u * std::f32::consts::TAU;
-            let mut normal = vec3(sin_phi * theta.cos(), cos_phi, sin_phi * theta.sin());
-            if let Some((axis, angle)) = align {
-                normal = rotate_vec3(normal, axis, angle);
-            }
-            let pole_axis = rotate_vec3(vec3(0.0, 1.0, 0.0), vec3(1.0, 0.0, 0.0), texture_pitch);
-            normal = rotate_vec3(normal, vec3(1.0, 0.0, 0.0), texture_pitch);
-            normal = rotate_vec3(normal, pole_axis, texture_yaw);
+            // Match uv_from_normal(): u = 0.5 + atan2(z, x) / TAU
+            let theta = (u - 0.5) * std::f32::consts::TAU;
+            let normal = vec3(sin_phi * theta.cos(), cos_phi, sin_phi * theta.sin());
             let height = height_value(normal, config);
             let color = color_from_height(height, normal, config);
             let idx = (y * size + x) * 4;
@@ -1594,6 +1586,7 @@ fn build_heightmap_pixels(
     pixels
 }
 
+// Checks if texture-relevant noise parameters changed.
 fn texture_params_match(a: &PlanetNoiseConfig, b: &PlanetNoiseConfig) -> bool {
     let eps = 1e-4;
     (a.noise_scale - b.noise_scale).abs() < eps
@@ -1605,68 +1598,12 @@ fn texture_params_match(a: &PlanetNoiseConfig, b: &PlanetNoiseConfig) -> bool {
         && (a.ice_strength - b.ice_strength).abs() < eps
 }
 
-fn load_heightmap_cache(
-    config: &PlanetNoiseConfig,
-    size: u16,
-    texture_yaw: f32,
-    texture_pitch: f32,
-) -> Option<Vec<u8>> {
-    ensure_planet_data_dir();
-    let Ok(meta_raw) = fs::read_to_string(HEIGHTMAP_META_PATH) else {
-        return None;
-    };
-    let Ok(meta) = serde_json::from_str::<HeightmapCacheMeta>(&meta_raw) else {
-        return None;
-    };
-    if meta.size != size
-        || !texture_params_match(&meta.config, config)
-        || (meta.texture_yaw - texture_yaw).abs() > 1e-4
-        || (meta.texture_pitch - texture_pitch).abs() > 1e-4
-    {
-        return None;
-    }
-    let Ok(pixels) = fs::read(HEIGHTMAP_DATA_PATH) else {
-        return None;
-    };
-    if pixels.len() != size as usize * size as usize * 4 {
-        return None;
-    }
-    Some(pixels)
-}
-
-fn save_heightmap_cache(
-    config: &PlanetNoiseConfig,
-    size: u16,
-    texture_yaw: f32,
-    texture_pitch: f32,
-    pixels: &[u8],
-) {
-    ensure_planet_data_dir();
-    let meta = HeightmapCacheMeta {
-        config: *config,
-        texture_yaw,
-        texture_pitch,
-        size,
-    };
-    if let Ok(json) = serde_json::to_string_pretty(&meta) {
-        let _ = fs::write(HEIGHTMAP_META_PATH, json);
-    }
-    let _ = fs::write(HEIGHTMAP_DATA_PATH, pixels);
-}
-
-fn load_or_build_heightmap(
-    config: &PlanetNoiseConfig,
-    size: u16,
-    align: Option<(Vec3, f32)>,
-    texture_yaw: f32,
-    texture_pitch: f32,
-) -> Vec<u8> {
-    if let Some(pixels) = load_heightmap_cache(config, size, texture_yaw, texture_pitch) {
-        return pixels;
-    }
-    let pixels = build_heightmap_pixels(config, size, align, texture_yaw, texture_pitch);
-    save_heightmap_cache(config, size, texture_yaw, texture_pitch, &pixels);
-    pixels
+// Builds heightmap pixels from current noise parameters.
+//
+// We keep a single persisted JSON (`planet_noise.json`) for terrain state and
+// regenerate this texture when needed, avoiding extra cache files.
+fn load_or_build_heightmap(config: &PlanetNoiseConfig, size: u16) -> Vec<u8> {
+    build_heightmap_pixels(config, size)
 }
 
 fn save_mesh_points(meshes: &[MeshData]) {
@@ -1812,6 +1749,12 @@ pub fn run(ctx: &FrameContext, state: &mut PlanetState, scene: &mut Scene) {
     let yaw_delta = wrap_angle(state.target_yaw - state.yaw);
     state.yaw += yaw_delta * 0.12;
     state.pitch += (state.target_pitch - state.pitch) * 0.12;
+    let camera_animating =
+        state.dragging
+            || wy.abs() > 0.01
+            || (state.target_distance - state.distance).abs() > 0.02
+            || yaw_delta.abs() > 0.01
+            || (state.target_pitch - state.pitch).abs() > 0.01;
 
     let camera_pos = vec3(
         state.distance * state.yaw.cos() * state.pitch.cos(),
@@ -1836,6 +1779,7 @@ pub fn run(ctx: &FrameContext, state: &mut PlanetState, scene: &mut Scene) {
     let show_labels = false;
     let show_hexes = zoom_t < 0.75;
     let camera_dir = camera_pos.normalize();
+    let use_fallback_relief = camera_animating || state.regen_in_progress;
     for mesh in state.base_texture_meshes.iter() {
         if mesh.vertices.is_empty() {
             continue;
@@ -1843,7 +1787,12 @@ pub fn run(ctx: &FrameContext, state: &mut PlanetState, scene: &mut Scene) {
         draw_mesh(mesh);
     }
     if state.show_relief {
-        for (index, mesh) in state.relief_meshes.iter().enumerate() {
+        let relief_to_draw = if use_fallback_relief {
+            &state.fallback_relief_meshes
+        } else {
+            &state.relief_meshes
+        };
+        for (index, mesh) in relief_to_draw.iter().enumerate() {
             if mesh.vertices.is_empty() {
                 continue;
             }

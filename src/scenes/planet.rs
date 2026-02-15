@@ -26,6 +26,7 @@ const SUBDIVISION_HYSTERESIS: f32 = 0.25;
 const FALLBACK_RELIEF_SUBDIVISIONS: usize = 1;
 const REGEN_FACE_GRAIN: usize = 12;
 const ICOSAHEDRON_FACE_COUNT: usize = 20;
+const SUBFACE_HOVER_MAX_DISTANCE: f32 = 5.6;
 
 // Wraps an angle to the [-PI, PI] range for smooth camera interpolation.
 fn wrap_angle(mut angle: f32) -> f32 {
@@ -1535,17 +1536,8 @@ fn hovered_face(
     best.map(|(_, idx)| idx)
 }
 
-// Converts a face index into "Letter+Number", where Letter is the base
-// icosahedron face and Number is the subface index within that base face.
-fn face_name(face_index: usize, total_faces: usize) -> String {
-    if total_faces == 0 {
-        return "?0".to_string();
-    }
-    let base_face_count = ICOSAHEDRON_FACE_COUNT.min(total_faces);
-    let subfaces_per_base = (total_faces / base_face_count).max(1);
-    let base_index: usize = (face_index / subfaces_per_base).min(base_face_count.saturating_sub(1))+1;
-    let subface_number = face_index % subfaces_per_base;
-    let letter = match base_index {
+fn greek_face_letter(face_index: usize) -> char {
+    match face_index {
         0 => 'α',
         1 => 'β',
         2 => 'γ',
@@ -1560,16 +1552,39 @@ fn face_name(face_index: usize, total_faces: usize) -> String {
         11 => 'μ',
         12 => 'ν',
         13 => 'ξ',
-        14 => 'π',
-        15 => 'ς',
-        16 => 'σ',
-        17 => 'τ',
-        18 => 'υ',
-        19 => 'φ',
-        20 => 'ψ',
+        14 => 'ο',
+        15 => 'π',
+        16 => 'ς',
+        17 => 'σ',
+        18 => 'τ',
+        19 => 'υ',
+        20 => 'φ',
+        21 => 'ψ',
         _ => 'Ω'
-    };
-    format!("Sector_{}{:02x}", letter, subface_number)
+    }
+}
+
+fn face_group_info(face_index: usize, total_faces: usize) -> (usize, usize) {
+    if total_faces == 0 {
+        return (0, 0);
+    }
+    let base_face_count = ICOSAHEDRON_FACE_COUNT.min(total_faces);
+    let subfaces_per_base = (total_faces / base_face_count).max(1);
+    let base_index = (face_index / subfaces_per_base).min(base_face_count.saturating_sub(1)) + 1;
+    let subface_number = face_index % subfaces_per_base;
+    (base_index, subface_number)
+}
+
+// For base-face mode this returns only the Greek letter.
+// For close mode this returns "Letter+subface".
+fn face_name(face_index: usize, total_faces: usize, include_subface: bool) -> String {
+    let (base_index, subface_number) = face_group_info(face_index, total_faces);
+    let letter = greek_face_letter(base_index);
+    if include_subface {
+        format!("{}{:02x}", letter, subface_number)
+    } else {
+        letter.to_string()
+    }
 }
 
 // Computes a consistent outward normal for a face.
@@ -2002,6 +2017,7 @@ pub fn run(
     let base_vertices = &state.base_vertices;
     let edges = icosahedron_edges();
     let faces = state.sector_faces.clone();
+    let base_faces = build_faces(base_vertices, &edges);
     let point_color = Color::from_rgba(240, 240, 255, 255);
     let edge_color = Color::from_rgba(200, 220, 250, 255);
     let hover_color = Color::from_rgba(255, 200, 120, 255);
@@ -2041,13 +2057,28 @@ pub fn run(
     }
     state.printed_midpoints = true;
 
-    let mut hovered: Option<usize> = None;
+    let use_subface_hover = state.distance <= SUBFACE_HOVER_MAX_DISTANCE;
+    let mut hovered_subface: Option<usize> = None;
+    let mut hovered_base_face: Option<usize> = None;
     if let Some((origin, dir)) = ray_from_mouse(&camera, mouse) {
         if let Some(hit) = ray_sphere_intersection(origin, dir, radius) {
-            hovered = hovered_face(hit, &faces, vertices);
+            if use_subface_hover {
+                hovered_subface = hovered_face(hit, &faces, vertices);
+            } else {
+                hovered_base_face = hovered_face(hit, &base_faces, base_vertices);
+            }
         }
     }
-    if let Some(face_index) = hovered {
+    if let Some(face_index) = hovered_base_face {
+        let face = base_faces[face_index];
+        let a = projected_base[face[0]];
+        let b = projected_base[face[1]];
+        let c = projected_base[face[2]];
+        draw_arc_on_sphere(a, b, line_radius, segments, hover_color);
+        draw_arc_on_sphere(b, c, line_radius, segments, hover_color);
+        draw_arc_on_sphere(c, a, line_radius, segments, hover_color);
+    }
+    if let Some(face_index) = hovered_subface {
         let face = faces[face_index];
         let a = projected_sector[face[0]];
         let b = projected_sector[face[1]];
@@ -2056,10 +2087,15 @@ pub fn run(
         draw_arc_on_sphere(b, c, line_radius, segments, hover_color);
         draw_arc_on_sphere(c, a, line_radius, segments, hover_color);
     }
-    if let Some(face_index) = hovered {
-        if is_mouse_button_pressed(MouseButton::Left) {
+    if is_mouse_button_pressed(MouseButton::Left) {
+        if let Some(face_index) = hovered_subface {
             let face = faces[face_index];
             let normal = face_normal(vertices, face);
+            state.target_yaw = normal.z.atan2(normal.x);
+            state.target_pitch = normal.y.asin();
+        } else if let Some(face_index) = hovered_base_face {
+            let face = base_faces[face_index];
+            let normal = face_normal(base_vertices, face);
             state.target_yaw = normal.z.atan2(normal.x);
             state.target_pitch = normal.y.asin();
         }
@@ -2082,10 +2118,23 @@ pub fn run(
             }
         }
     }
-    if let Some(face_index) = hovered {
-        let name = face_name(face_index, faces.len());
+    if let Some(face_index) = hovered_subface {
+        let name = face_name(face_index, faces.len(), true);
         draw_text_ex(
-            &format!("Hovered: {} (idx {})", name, face_index),
+            &format!("Sector {}", name),
+            20.0,
+            32.0,
+            TextParams {
+                font: greek_font,
+                font_size: 30,
+                color: Color::from_rgba(255, 235, 180, 255),
+                ..Default::default()
+            },
+        );
+    } else if let Some(face_index) = hovered_base_face {
+        let name = face_name(face_index, base_faces.len(), false);
+        draw_text_ex(
+            &format!("Hovered Zone {}", name),
             20.0,
             32.0,
             TextParams {

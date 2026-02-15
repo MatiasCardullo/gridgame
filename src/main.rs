@@ -71,12 +71,22 @@ async fn main() {
     let mut station_pick: Option<StationPick> = None;
     let mut planet_state: Option<scenes::planet::PlanetState> = None;
     let mut planet_loader = scenes::planet::PlanetLoader::start();
+    let greek_font = load_ttf_font("C:/Windows/Fonts/CascadiaMono.ttf").await.ok();
     let mut dirty = false;
     let mut scene = Scene::MainMenu;
 
     loop {
         if let Some(data) = planet_loader.poll() {
-            planet_state = Some(scenes::planet::PlanetState::from_build_data(data));
+            if let Some(state) = planet_state.as_mut() {
+                state.apply_relief_build_data(data);
+            } else {
+                planet_state = Some(scenes::planet::PlanetState::from_build_data(data));
+            }
+        }
+        if let Some(texture_data) = planet_loader.take_texture_data() {
+            if planet_state.is_none() {
+                planet_state = Some(scenes::planet::PlanetState::from_texture_data(texture_data));
+            }
         }
         let mouse = vec2(mouse_position().0, mouse_position().1);
         let screen_center = vec2(screen_width() * 0.5, screen_height() * 0.5);
@@ -171,7 +181,7 @@ async fn main() {
             }
             Scene::Planet => {
                 if let Some(state) = planet_state.as_mut() {
-                    scenes::planet::run(&ctx, state, &mut scene);
+                    scenes::planet::run(&ctx, state, &mut scene, greek_font.as_ref());
                 } else {
                     draw_planet_loading_screen(&ctx, &planet_loader);
                     if is_key_pressed(KeyCode::Escape) {

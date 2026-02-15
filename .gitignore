@@ -6,3 +6,4 @@ Cargo.lock
 *.rgba
 *.csv
 *.log
+*.png

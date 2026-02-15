@@ -142,18 +142,21 @@ pub fn draw_planet_controls(ctx: &FrameContext, state: &mut PlanetState, noise_p
     y += step + 6.0;
 
     let rect_toggle = Rect::new(x, y, 230.0, 26.0);
+    let relief_label = if !state.relief_available {
+        "Relief: Locked (loading)"
+    } else if state.show_relief {
+        "Relief: On"
+    } else {
+        "Relief: Off"
+    };
     let (clicked_toggle, _) = ui_button(
         rect_toggle,
-        if state.show_relief {
-            "Relief: On"
-        } else {
-            "Relief: Off"
-        },
+        relief_label,
         ctx.mouse,
         ctx.font_sm,
         ctx.button_colors,
     );
-    if clicked_toggle {
+    if clicked_toggle && state.relief_available {
         state.show_relief = !state.show_relief;
     }
     y += step;

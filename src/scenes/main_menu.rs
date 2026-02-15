@@ -87,7 +87,7 @@ pub fn run(
     };
     let (clicked_planet, _) =
         ui_button(rect_planet, planet_label, ctx.mouse, ctx.font_md, ctx.button_colors);
-    if clicked_planet && planet_ready {
+    if clicked_planet {
         *scene = Scene::Planet;
     }
     y += btn_h + 12.0;

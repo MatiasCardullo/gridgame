@@ -30,6 +30,8 @@ const ICOSAHEDRON_FACE_COUNT: usize = 20;
 const SUBFACE_HOVER_MAX_DISTANCE: f32 = 5.6;
 const NEAR_GRID_DISTANCE: f32 = 2.4;
 const HOVER_GRID_HEXES_ACROSS: i32 = 20;
+const HOVER_GRID_CELL_BASE_LIFT: f32 = 0.006;
+const HOVER_GRID_CELL_MID_EXTRA_LIFT: f32 = 0.003;
 
 // Wraps an angle to the [-PI, PI] range for smooth camera interpolation.
 fn wrap_angle(mut angle: f32) -> f32 {
@@ -258,7 +260,6 @@ pub struct PlanetState {
     pub sector_vertices: Vec<Vec3>,
     pub sector_faces: Vec<[usize; 3]>,
     pub sector_values: Vec<f32>,
-    pub printed_midpoints: bool,
     pub show_relief: bool,
     pub relief_available: bool,
     pub debug_enabled: bool,
@@ -347,7 +348,6 @@ impl PlanetState {
             sector_vertices,
             sector_faces,
             sector_values: Vec::new(),
-            printed_midpoints: false,
             show_relief: false,
             relief_available: false,
             debug_enabled: PLANET_DEBUG_UI_ENABLED_DEFAULT,
@@ -1419,40 +1419,16 @@ fn barycentric_coords_2d(p: Vec2, a: Vec2, b: Vec2, c: Vec2) -> Option<(f32, f32
     Some((wa, wb, wc))
 }
 
-// Draws a polyline polygon on the sphere surface around a point.
-fn draw_polygon_on_sphere(center: Vec3, radius: f32, sides: usize, size: f32, color: Color) {
-    if sides < 3 {
-        return;
-    }
-    let normal = center.normalize();
-    let mut tangent = normal.cross(vec3(0.0, 1.0, 0.0));
-    if tangent.length() < 1e-4 {
-        tangent = normal.cross(vec3(1.0, 0.0, 0.0));
-    }
-    tangent = tangent.normalize();
-    let bitangent = normal.cross(tangent).normalize();
-
-    let mut prev = Vec3::ZERO;
-    for i in 0..=sides {
-        let angle = (i as f32 / sides as f32) * std::f32::consts::TAU;
-        let offset = tangent * angle.sin() + bitangent * angle.cos();
-        let point = normal * radius + offset * size;
-        if i > 0 {
-            draw_line_3d(prev, point, color);
-        }
-        prev = point;
-    }
-}
-
 // Draws a flat hex grid on the hovered face using planet-relative axes.
 fn draw_flat_hex_grid_on_face(
     face_vertices: [Vec3; 3],
+    global_vertices: &[Vec3],
     camera: &Camera3D,
     color: Color,
     line_thickness: f32,
     hexes_across: i32,
 ) {
-    if hexes_across < 2 {
+    if hexes_across < 2 || global_vertices.is_empty() {
         return;
     }
     // Reorder so AB is the shortest side; this becomes the density baseline.
@@ -1526,6 +1502,8 @@ fn draw_flat_hex_grid_on_face(
         }
     }
 
+    let global_edges = icosahedron_edges();
+    let pent_step = std::f32::consts::TAU / 5.0;
     let mut dedupe: HashSet<(i32, i32)> = HashSet::new();
     for center_ref in centers_ref {
         let key_scale = (size * 0.2).max(1e-5);
@@ -1537,29 +1515,146 @@ fn draw_flat_hex_grid_on_face(
             continue;
         }
 
-        let mut corners_screen: [Option<Vec2>; 6] = [None; 6];
+        let Some((wa, wb, wc)) = barycentric_coords_2d(center_ref, ref_a, ref_b, ref_c) else {
+            continue;
+        };
+        let center_dst = a2 * wa + b2 * wb + c2 * wc;
+        let center_surface =
+            (center + u * center_dst.x + v * center_dst.y).normalize() * radius;
+        let normal = center_surface.normalize();
+        let mut tangent_x = u - normal * normal.dot(u);
+        if tangent_x.length() < 1e-5 {
+            tangent_x = vec3(0.0, 1.0, 0.0) - normal * normal.dot(vec3(0.0, 1.0, 0.0));
+        }
+        if tangent_x.length() < 1e-5 {
+            tangent_x = vec3(1.0, 0.0, 0.0) - normal * normal.dot(vec3(1.0, 0.0, 0.0));
+        }
+        if tangent_x.length() < 1e-5 {
+            continue;
+        }
+        tangent_x = tangent_x.normalize();
+        let tangent_y = normal.cross(tangent_x).normalize();
+        if tangent_y.length() < 1e-5 {
+            continue;
+        }
+
+        let center_factor = (wa.min(wb).min(wc) / (1.0 / 3.0)).clamp(0.0, 1.0);
+        let cell_lift =
+            radius * (HOVER_GRID_CELL_BASE_LIFT + HOVER_GRID_CELL_MID_EXTRA_LIFT * center_factor);
+        let center_world = center_surface + normal * cell_lift;
+
+        let Some((u_wa, u_wb, u_wc)) =
+            barycentric_coords_2d(center_ref + vec2(size, 0.0), ref_a, ref_b, ref_c)
+        else {
+            continue;
+        };
+        let sample_u_dst = a2 * u_wa + b2 * u_wb + c2 * u_wc;
+        let sample_u_surface =
+            (center + u * sample_u_dst.x + v * sample_u_dst.y).normalize() * radius;
+
+        let Some((v_wa, v_wb, v_wc)) =
+            barycentric_coords_2d(center_ref + vec2(0.0, size), ref_a, ref_b, ref_c)
+        else {
+            continue;
+        };
+        let sample_v_dst = a2 * v_wa + b2 * v_wb + c2 * v_wc;
+        let sample_v_surface =
+            (center + u * sample_v_dst.x + v * sample_v_dst.y).normalize() * radius;
+
+        let cell_step_world = ((sample_u_surface - center_surface).length()
+            + (sample_v_surface - center_surface).length())
+            * 0.5;
+        let vertex_snap_threshold = (cell_step_world * 0.35).max(1e-4);
+
+        let mut matched_global_vertex: Option<usize> = None;
+        let mut best_dist = f32::MAX;
+        for (idx, vertex) in global_vertices.iter().enumerate() {
+            let dist = (*vertex - center_surface).length();
+            if dist < best_dist {
+                best_dist = dist;
+                matched_global_vertex = Some(idx);
+            }
+        }
+        let use_pentagon = best_dist <= vertex_snap_threshold;
+        let sides = if use_pentagon { 5usize } else { 6usize };
+        let draw_radius = size * 0.95;
+
+        let mut angle_offset = -std::f32::consts::PI / 6.0;
+        if use_pentagon {
+            angle_offset = -std::f32::consts::FRAC_PI_2;
+            if let Some(vertex_index) = matched_global_vertex {
+                let vertex_pos = global_vertices[vertex_index];
+                let mut neighbor_angles: Vec<f32> = Vec::new();
+                for (ea, eb) in global_edges.iter().copied() {
+                    let neighbor_index = if ea == vertex_index {
+                        Some(eb)
+                    } else if eb == vertex_index {
+                        Some(ea)
+                    } else {
+                        None
+                    };
+                    let Some(neighbor_index) = neighbor_index else {
+                        continue;
+                    };
+                    let dir_world = (global_vertices[neighbor_index] - vertex_pos).normalize();
+                    let tangent_dir = dir_world - normal * normal.dot(dir_world);
+                    if tangent_dir.length() < 1e-5 {
+                        continue;
+                    }
+                    let tangent_dir = tangent_dir.normalize();
+                    let x = tangent_dir.dot(tangent_x);
+                    let y = tangent_dir.dot(tangent_y);
+                    neighbor_angles.push(y.atan2(x));
+                }
+                if !neighbor_angles.is_empty() {
+                    neighbor_angles
+                        .sort_by(|lhs, rhs| lhs.partial_cmp(rhs).unwrap_or(std::cmp::Ordering::Equal));
+                    let mut best_error = f32::MAX;
+                    let mut best_offset = angle_offset;
+                    for start in 0..neighbor_angles.len() {
+                        let candidate = neighbor_angles[start] - 0.5 * pent_step;
+                        let mut error = 0.0;
+                        for i in 0..neighbor_angles.len() {
+                            let idx = (start + i) % neighbor_angles.len();
+                            let expected = candidate + pent_step * (i as f32 + 0.5);
+                            error += wrap_angle(neighbor_angles[idx] - expected).abs();
+                        }
+                        if error < best_error {
+                            best_error = error;
+                            best_offset = candidate;
+                        }
+                    }
+                    angle_offset = best_offset;
+                }
+            }
+        }
+
+        let mut corners_screen: Vec<Vec2> = Vec::with_capacity(sides);
         let mut all_visible = true;
-        for i in 0..6 {
-            let angle = (60.0 * i as f32 - 30.0).to_radians();
-            let corner_ref = center_ref + vec2(size * angle.cos(), size * angle.sin());
-            let Some((cwa, cwb, cwc)) = barycentric_coords_2d(corner_ref, ref_a, ref_b, ref_c) else {
+        for i in 0..sides {
+            let angle = angle_offset + (i as f32 / sides as f32) * std::f32::consts::TAU;
+            let corner_ref =
+                center_ref + vec2(draw_radius * angle.cos(), draw_radius * angle.sin());
+            let Some((cwa, cwb, cwc)) = barycentric_coords_2d(corner_ref, ref_a, ref_b, ref_c)
+            else {
                 all_visible = false;
                 break;
             };
             let corner_dst = a2 * cwa + b2 * cwb + c2 * cwc;
-            let world_corner = (center + u * corner_dst.x + v * corner_dst.y).normalize() * radius;
-            corners_screen[i] = project_to_screen(camera, world_corner);
-            if corners_screen[i].is_none() {
+            let corner_delta = corner_dst - center_dst;
+            let world_corner = center_world + tangent_x * corner_delta.x + tangent_y * corner_delta.y;
+            let Some(screen_corner) = project_to_screen(camera, world_corner) else {
                 all_visible = false;
                 break;
-            }
+            };
+            corners_screen.push(screen_corner);
         }
         if !all_visible {
             continue;
         }
-        for i in 0..6 {
-            let p0 = corners_screen[i].unwrap();
-            let p1 = corners_screen[(i + 1) % 6].unwrap();
+        for i in 0..sides {
+            let p0 = corners_screen[i];
+            let p1 = corners_screen[(i + 1) % sides];
             draw_line(p0.x, p0.y, p1.x, p1.y, line_thickness, color);
         }
     }
@@ -2131,10 +2226,7 @@ pub fn run(
     let line_radius = radius * 1.04;
     let zoom_t = ((state.distance - 2.0) / 18.0).clamp(0.0, 1.0);
     let segments = ((32.0 - 16.0 * zoom_t).round() as i32).clamp(10, 32) as usize;
-    let pent_size = 0.02;
-    let hex_size = 0.018;
     let show_labels = false;
-    let show_hexes = zoom_t < 0.75;
     let camera_dir = camera_pos.normalize();
     let use_fallback_relief = camera_animating || state.regen_in_progress;
     for mesh in state.base_texture_meshes.iter() {
@@ -2172,10 +2264,8 @@ pub fn run(
     let edges = icosahedron_edges();
     let faces = state.sector_faces.clone();
     let base_faces = build_faces(base_vertices, &edges);
-    let point_color = Color::from_rgba(240, 240, 255, 255);
     let edge_color = Color::from_rgba(200, 220, 250, 255);
     let hover_color = Color::from_rgba(255, 200, 120, 255);
-    let mid_color = Color::from_rgba(180, 255, 220, 255);
     let grid_color = Color::from_rgba(70, 78, 86, 255);
 
     let mut projected_base: Vec<Vec3> = vec![Vec3::ZERO; base_vertices.len()];
@@ -2183,14 +2273,7 @@ pub fn run(
     let mut screen_points: Vec<Option<Vec2>> = vec![None; base_vertices.len()];
     for (index, v) in base_vertices.iter().enumerate() {
         projected_base[index] = v.normalize() * line_radius;
-        draw_polygon_on_sphere(projected_base[index], line_radius, 5, pent_size, point_color);
         screen_points[index] = project_to_screen(&camera, projected_base[index]);
-        if !state.printed_midpoints {
-            println!(
-                "Vertex pent: ({:.3}, {:.3}, {:.3})",
-                projected_base[index].x, projected_base[index].y, projected_base[index].z
-            );
-        }   
     }
     for (index, v) in vertices.iter().enumerate() {
         projected_sector[index] = v.normalize() * line_radius;
@@ -2198,19 +2281,7 @@ pub fn run(
 
     for (a, b) in edges.iter().copied() {
         draw_arc_on_sphere(projected_base[a], projected_base[b], line_radius, segments, edge_color);
-        let mid_dir = great_circle_point(projected_base[a], projected_base[b], 0.5);
-        let mid_point = mid_dir * line_radius;
-        if show_hexes {
-            draw_polygon_on_sphere(mid_point, line_radius, 6, hex_size, mid_color);
-        }
-        if !state.printed_midpoints {
-            println!(
-                "Midpoint hex: ({:.3}, {:.3}, {:.3})",
-                mid_point.x, mid_point.y, mid_point.z
-            );
-        }
     }
-    state.printed_midpoints = true;
 
     let use_subface_hover = state.distance <= SUBFACE_HOVER_MAX_DISTANCE;
     let mut hovered_subface: Option<usize> = None;
@@ -2279,6 +2350,7 @@ pub fn run(
     if let Some(face_vertices) = hover_grid_face {
         draw_flat_hex_grid_on_face(
             face_vertices,
+            &projected_base,
             &camera,
             grid_color,
             1.2,

@@ -10,6 +10,7 @@ use std::sync::Arc;
 use std::time::{Instant, SystemTime};
 
 use crate::core::{FrameContext, Scene};
+use crate::SQRT_3;
 use crate::core::debug::{
     draw_planet_controls, format_log_timestamp, planet_perf_log, PLANET_DEBUG_UI_ENABLED_DEFAULT,
     SAVE_MESH_POINTS_RUNTIME,
@@ -27,6 +28,8 @@ const FALLBACK_RELIEF_SUBDIVISIONS: usize = 1;
 const REGEN_FACE_GRAIN: usize = 12;
 const ICOSAHEDRON_FACE_COUNT: usize = 20;
 const SUBFACE_HOVER_MAX_DISTANCE: f32 = 5.6;
+const NEAR_GRID_DISTANCE: f32 = 2.4;
+const HOVER_GRID_HEXES_ACROSS: i32 = 50;
 
 // Wraps an angle to the [-PI, PI] range for smooth camera interpolation.
 fn wrap_angle(mut angle: f32) -> f32 {
@@ -1386,6 +1389,25 @@ fn great_circle_point(start: Vec3, end: Vec3, t: f32) -> Vec3 {
     }
 }
 
+// Converts axial hex coordinates to 2D plane coordinates.
+fn axial_to_plane(q: i32, r: i32, size: f32) -> Vec2 {
+    let q = q as f32;
+    let r = r as f32;
+    let x = size * (SQRT_3 * q + (SQRT_3 / 2.0) * r);
+    let y = size * (1.5 * r);
+    vec2(x, y)
+}
+
+fn point_in_triangle_2d(p: Vec2, a: Vec2, b: Vec2, c: Vec2) -> bool {
+    let eps = 1e-5;
+    let s1 = (b.x - a.x) * (p.y - a.y) - (b.y - a.y) * (p.x - a.x);
+    let s2 = (c.x - b.x) * (p.y - b.y) - (c.y - b.y) * (p.x - b.x);
+    let s3 = (a.x - c.x) * (p.y - c.y) - (a.y - c.y) * (p.x - c.x);
+    let has_neg = s1 < -eps || s2 < -eps || s3 < -eps;
+    let has_pos = s1 > eps || s2 > eps || s3 > eps;
+    !(has_neg && has_pos)
+}
+
 // Draws a polyline polygon on the sphere surface around a point.
 fn draw_polygon_on_sphere(center: Vec3, radius: f32, sides: usize, size: f32, color: Color) {
     if sides < 3 {
@@ -1408,6 +1430,92 @@ fn draw_polygon_on_sphere(center: Vec3, radius: f32, sides: usize, size: f32, co
             draw_line_3d(prev, point, color);
         }
         prev = point;
+    }
+}
+
+// Draws a flat hex grid on the hovered face using planet-relative axes.
+fn draw_flat_hex_grid_on_face(
+    face_vertices: [Vec3; 3],
+    camera: &Camera3D,
+    color: Color,
+    line_thickness: f32,
+    hexes_across: i32,
+) {
+    if hexes_across < 2 {
+        return;
+    }
+    let [a, b, c] = face_vertices;
+    let mut normal = (b - a).cross(c - a);
+    if normal.length() < 1e-5 {
+        return;
+    }
+    normal = normal.normalize();
+    let center = (a + b + c) / 3.0;
+    if normal.dot(center) < 0.0 {
+        normal = -normal;
+    }
+    let mut u = vec3(0.0, 1.0, 0.0) - normal * normal.dot(vec3(0.0, 1.0, 0.0));
+    if u.length() < 1e-5 {
+        u = vec3(1.0, 0.0, 0.0) - normal * normal.dot(vec3(1.0, 0.0, 0.0));
+    }
+    if u.length() < 1e-5 {
+        return;
+    }
+    u = u.normalize();
+    let v = normal.cross(u).normalize();
+    let radius = center.length();
+
+    let a2 = vec2((a - center).dot(u), (a - center).dot(v));
+    let b2 = vec2((b - center).dot(u), (b - center).dot(v));
+    let c2 = vec2((c - center).dot(u), (c - center).dot(v));
+
+    let min_x = a2.x.min(b2.x.min(c2.x));
+    let max_x = a2.x.max(b2.x.max(c2.x));
+    let min_y = a2.y.min(b2.y.min(c2.y));
+    let max_y = a2.y.max(b2.y.max(c2.y));
+    let width = max_x - min_x;
+    let height = max_y - min_y;
+    if width <= 1e-5 || height <= 1e-5 {
+        return;
+    }
+
+    let cols = hexes_across as f32;
+    let size_raw = (width / (SQRT_3 * cols)).min(height / (1.5 * cols));
+    let size = size_raw.clamp(0.002, 0.25);
+    if size <= 0.0 {
+        return;
+    }
+
+    let max_q = ((width / (SQRT_3 * size)).ceil() as i32) + 2;
+    let max_r = ((height / (1.5 * size)).ceil() as i32) + 2;
+    for r in -max_r..=max_r {
+        for q in -max_q..=max_q {
+            let p2 = axial_to_plane(q, r, size);
+            if !point_in_triangle_2d(p2, a2, b2, c2) {
+                continue;
+            }
+            let mut corners: [Option<Vec2>; 6] = [None; 6];
+            let mut all_visible = true;
+            for i in 0..6 {
+                let angle = (60.0 * i as f32 - 30.0).to_radians();
+                let ox = size * angle.cos();
+                let oy = size * angle.sin();
+                let world_corner = (center + u * (p2.x + ox) + v * (p2.y + oy)).normalize() * radius;
+                corners[i] = project_to_screen(camera, world_corner);
+                if corners[i].is_none() {
+                    all_visible = false;
+                    break;
+                }
+            }
+            if !all_visible {
+                continue;
+            }
+            for i in 0..6 {
+                let a = corners[i].unwrap();
+                let b = corners[(i + 1) % 6].unwrap();
+                draw_line(a.x, a.y, b.x, b.y, line_thickness, color);
+            }
+        }
     }
 }
 
@@ -2022,6 +2130,7 @@ pub fn run(
     let edge_color = Color::from_rgba(200, 220, 250, 255);
     let hover_color = Color::from_rgba(255, 200, 120, 255);
     let mid_color = Color::from_rgba(180, 255, 220, 255);
+    let grid_color = Color::from_rgba(70, 78, 86, 255);
 
     let mut projected_base: Vec<Vec3> = vec![Vec3::ZERO; base_vertices.len()];
     let mut projected_sector: Vec<Vec3> = vec![Vec3::ZERO; vertices.len()];
@@ -2060,6 +2169,7 @@ pub fn run(
     let use_subface_hover = state.distance <= SUBFACE_HOVER_MAX_DISTANCE;
     let mut hovered_subface: Option<usize> = None;
     let mut hovered_base_face: Option<usize> = None;
+    let mut hover_grid_face: Option<[Vec3; 3]> = None;
     if let Some((origin, dir)) = ray_from_mouse(&camera, mouse) {
         if let Some(hit) = ray_sphere_intersection(origin, dir, radius) {
             if use_subface_hover {
@@ -2087,6 +2197,24 @@ pub fn run(
         draw_arc_on_sphere(b, c, line_radius, segments, hover_color);
         draw_arc_on_sphere(c, a, line_radius, segments, hover_color);
     }
+    let show_hover_grid = state.distance <= NEAR_GRID_DISTANCE;
+    if show_hover_grid {
+        if let Some(face_index) = hovered_subface {
+            let face = faces[face_index];
+            hover_grid_face = Some([
+                projected_sector[face[0]],
+                projected_sector[face[1]],
+                projected_sector[face[2]],
+            ]);
+        } else if let Some(face_index) = hovered_base_face {
+            let face = base_faces[face_index];
+            hover_grid_face = Some([
+                projected_base[face[0]],
+                projected_base[face[1]],
+                projected_base[face[2]],
+            ]);
+        }
+    }
     if is_mouse_button_pressed(MouseButton::Left) {
         if let Some(face_index) = hovered_subface {
             let face = faces[face_index];
@@ -2102,6 +2230,15 @@ pub fn run(
     }
 
     set_default_camera();
+    if let Some(face_vertices) = hover_grid_face {
+        draw_flat_hex_grid_on_face(
+            face_vertices,
+            &camera,
+            grid_color,
+            1.2,
+            HOVER_GRID_HEXES_ACROSS,
+        );
+    }
     if state.debug_enabled {
         draw_planet_controls(ctx, state, PLANET_NOISE_PATH);
     }

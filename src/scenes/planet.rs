@@ -29,7 +29,7 @@ const REGEN_FACE_GRAIN: usize = 12;
 const ICOSAHEDRON_FACE_COUNT: usize = 20;
 const SUBFACE_HOVER_MAX_DISTANCE: f32 = 5.6;
 const NEAR_GRID_DISTANCE: f32 = 2.4;
-const HOVER_GRID_HEXES_ACROSS: i32 = 50;
+const HOVER_GRID_HEXES_ACROSS: i32 = 20;
 
 // Wraps an angle to the [-PI, PI] range for smooth camera interpolation.
 fn wrap_angle(mut angle: f32) -> f32 {
@@ -1408,6 +1408,17 @@ fn point_in_triangle_2d(p: Vec2, a: Vec2, b: Vec2, c: Vec2) -> bool {
     !(has_neg && has_pos)
 }
 
+fn barycentric_coords_2d(p: Vec2, a: Vec2, b: Vec2, c: Vec2) -> Option<(f32, f32, f32)> {
+    let denom = (b.y - c.y) * (a.x - c.x) + (c.x - b.x) * (a.y - c.y);
+    if denom.abs() < 1e-6 {
+        return None;
+    }
+    let wa = ((b.y - c.y) * (p.x - c.x) + (c.x - b.x) * (p.y - c.y)) / denom;
+    let wb = ((c.y - a.y) * (p.x - c.x) + (a.x - c.x) * (p.y - c.y)) / denom;
+    let wc = 1.0 - wa - wb;
+    Some((wa, wb, wc))
+}
+
 // Draws a polyline polygon on the sphere surface around a point.
 fn draw_polygon_on_sphere(center: Vec3, radius: f32, sides: usize, size: f32, color: Color) {
     if sides < 3 {
@@ -1444,7 +1455,20 @@ fn draw_flat_hex_grid_on_face(
     if hexes_across < 2 {
         return;
     }
-    let [a, b, c] = face_vertices;
+    // Reorder so AB is the shortest side; this becomes the density baseline.
+    let [a, b, c] = {
+        let [v0, v1, v2] = face_vertices;
+        let l01 = (v1 - v0).length();
+        let l12 = (v2 - v1).length();
+        let l20 = (v0 - v2).length();
+        if l01 <= l12 && l01 <= l20 {
+            [v0, v1, v2]
+        } else if l12 <= l01 && l12 <= l20 {
+            [v1, v2, v0]
+        } else {
+            [v2, v0, v1]
+        }
+    };
     let mut normal = (b - a).cross(c - a);
     if normal.length() < 1e-5 {
         return;
@@ -1454,67 +1478,89 @@ fn draw_flat_hex_grid_on_face(
     if normal.dot(center) < 0.0 {
         normal = -normal;
     }
-    let mut u = vec3(0.0, 1.0, 0.0) - normal * normal.dot(vec3(0.0, 1.0, 0.0));
-    if u.length() < 1e-5 {
-        u = vec3(1.0, 0.0, 0.0) - normal * normal.dot(vec3(1.0, 0.0, 0.0));
-    }
+    // Planet-relative axes: u from shortest face edge, v from face normal.
+    let mut u = b - a;
     if u.length() < 1e-5 {
         return;
     }
     u = u.normalize();
     let v = normal.cross(u).normalize();
+    if v.length() < 1e-5 {
+        return;
+    }
     let radius = center.length();
 
     let a2 = vec2((a - center).dot(u), (a - center).dot(v));
     let b2 = vec2((b - center).dot(u), (b - center).dot(v));
     let c2 = vec2((c - center).dot(u), (c - center).dot(v));
 
-    let min_x = a2.x.min(b2.x.min(c2.x));
-    let max_x = a2.x.max(b2.x.max(c2.x));
-    let min_y = a2.y.min(b2.y.min(c2.y));
-    let max_y = a2.y.max(b2.y.max(c2.y));
-    let width = max_x - min_x;
-    let height = max_y - min_y;
-    if width <= 1e-5 || height <= 1e-5 {
+    let shortest_side = (b2 - a2).length();
+    if shortest_side <= 1e-5 {
+        return;
+    }
+    let side = shortest_side;
+    let ref_a = vec2(0.0, 0.0);
+    let ref_b = vec2(side, 0.0);
+    let ref_c = vec2(side * 0.5, side * 0.866_025_4);
+    let size = side / (SQRT_3 * hexes_across as f32);
+    if size <= 1e-5 {
         return;
     }
 
-    let cols = hexes_across as f32;
-    let size_raw = (width / (SQRT_3 * cols)).min(height / (1.5 * cols));
-    let size = size_raw.clamp(0.002, 0.25);
-    if size <= 0.0 {
-        return;
-    }
+    let mut centers_ref: Vec<Vec2> = Vec::new();
+    // Ensure a hex center at each triangle tip.
+    centers_ref.push(ref_a);
+    centers_ref.push(ref_b);
+    centers_ref.push(ref_c);
 
-    let max_q = ((width / (SQRT_3 * size)).ceil() as i32) + 2;
-    let max_r = ((height / (1.5 * size)).ceil() as i32) + 2;
+    let ref_height = side * 0.866_025_4;
+    let max_q = ((side / (SQRT_3 * size)).ceil() as i32) + 3;
+    let max_r = ((ref_height / (1.5 * size)).ceil() as i32) + 3;
     for r in -max_r..=max_r {
         for q in -max_q..=max_q {
             let p2 = axial_to_plane(q, r, size);
-            if !point_in_triangle_2d(p2, a2, b2, c2) {
+            if !point_in_triangle_2d(p2, ref_a, ref_b, ref_c) {
                 continue;
             }
-            let mut corners: [Option<Vec2>; 6] = [None; 6];
-            let mut all_visible = true;
-            for i in 0..6 {
-                let angle = (60.0 * i as f32 - 30.0).to_radians();
-                let ox = size * angle.cos();
-                let oy = size * angle.sin();
-                let world_corner = (center + u * (p2.x + ox) + v * (p2.y + oy)).normalize() * radius;
-                corners[i] = project_to_screen(camera, world_corner);
-                if corners[i].is_none() {
-                    all_visible = false;
-                    break;
-                }
+            centers_ref.push(p2);
+        }
+    }
+
+    let mut dedupe: HashSet<(i32, i32)> = HashSet::new();
+    for center_ref in centers_ref {
+        let key_scale = (size * 0.2).max(1e-5);
+        let key = (
+            (center_ref.x / key_scale).round() as i32,
+            (center_ref.y / key_scale).round() as i32,
+        );
+        if !dedupe.insert(key) {
+            continue;
+        }
+
+        let mut corners_screen: [Option<Vec2>; 6] = [None; 6];
+        let mut all_visible = true;
+        for i in 0..6 {
+            let angle = (60.0 * i as f32 - 30.0).to_radians();
+            let corner_ref = center_ref + vec2(size * angle.cos(), size * angle.sin());
+            let Some((cwa, cwb, cwc)) = barycentric_coords_2d(corner_ref, ref_a, ref_b, ref_c) else {
+                all_visible = false;
+                break;
+            };
+            let corner_dst = a2 * cwa + b2 * cwb + c2 * cwc;
+            let world_corner = (center + u * corner_dst.x + v * corner_dst.y).normalize() * radius;
+            corners_screen[i] = project_to_screen(camera, world_corner);
+            if corners_screen[i].is_none() {
+                all_visible = false;
+                break;
             }
-            if !all_visible {
-                continue;
-            }
-            for i in 0..6 {
-                let a = corners[i].unwrap();
-                let b = corners[(i + 1) % 6].unwrap();
-                draw_line(a.x, a.y, b.x, b.y, line_thickness, color);
-            }
+        }
+        if !all_visible {
+            continue;
+        }
+        for i in 0..6 {
+            let p0 = corners_screen[i].unwrap();
+            let p1 = corners_screen[(i + 1) % 6].unwrap();
+            draw_line(p0.x, p0.y, p1.x, p1.y, line_thickness, color);
         }
     }
 }

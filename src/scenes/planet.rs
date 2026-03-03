@@ -15,11 +15,13 @@ use crate::core::debug::{
     draw_planet_controls, format_log_timestamp, planet_perf_log, PLANET_DEBUG_UI_ENABLED_DEFAULT,
     SAVE_MESH_POINTS_RUNTIME,
 };
+use crate::scenes::planet_texture::{
+    PlanetNoiseConfig, color_from_height, height_value, load_or_build_heightmap, texture_params_match,
+};
 
 const PLANET_DATA_DIR: &str = "planet_data";
 const MESH_POINTS_PATH: &str = "planet_data/planet_mesh_points.csv";
 const PLANET_NOISE_PATH: &str = "planet_data/planet_noise.json";
-const HEIGHTMAP_IMAGE_PREFIX: &str = "planet_data/planet_heightmap";
 const HEIGHTMAP_SIZE: u16 = 2048;
 const TEXTURE_BASE_SUBDIVISIONS: usize = 2;
 const TEXTURE_LAYER_OFFSET: f32 = 0.004;
@@ -30,8 +32,7 @@ const ICOSAHEDRON_FACE_COUNT: usize = 20;
 const SUBFACE_HOVER_MAX_DISTANCE: f32 = 5.6;
 const NEAR_GRID_DISTANCE: f32 = 2.4;
 const HOVER_GRID_HEXES_ACROSS: i32 = 20;
-const HOVER_GRID_CELL_BASE_LIFT: f32 = 0.006;
-const HOVER_GRID_CELL_MID_EXTRA_LIFT: f32 = 0.003;
+const PLANET_OVERLAY_OFFSET: f32 = 0.01;
 
 // Wraps an angle to the [-PI, PI] range for smooth camera interpolation.
 fn wrap_angle(mut angle: f32) -> f32 {
@@ -88,89 +89,6 @@ fn icosahedron_vertices() -> [Vec3; 12] {
         vec3(-1.0, -phi, 0.0),
         vec3( 1.0, -phi, 0.0),
     ]
-}
-
-// Hashes a 3D integer coordinate to a deterministic [0,1] value.
-fn hash3(x: i32, y: i32, z: i32, seed: u32) -> f32 {
-    let mut n = (x as i64) * 374761393
-        + (y as i64) * 668265263
-        + (z as i64) * 2147483647
-        + seed as i64 * 69069;
-    n = (n ^ (n >> 13)).wrapping_mul(1274126177);
-    let n = n ^ (n >> 16);
-    (n as u32) as f32 / u32::MAX as f32
-}
-
-// Produces smooth value noise for a 3D position.
-fn value_noise3(x: f32, y: f32, z: f32, seed: u32) -> f32 {
-    let x0 = x.floor() as i32;
-    let y0 = y.floor() as i32;
-    let z0 = z.floor() as i32;
-    let x1 = x0 + 1;
-    let y1 = y0 + 1;
-    let z1 = z0 + 1;
-    let sx = x - x0 as f32;
-    let sy = y - y0 as f32;
-    let sz = z - z0 as f32;
-    let u = sx * sx * (3.0 - 2.0 * sx);
-    let v = sy * sy * (3.0 - 2.0 * sy);
-    let w = sz * sz * (3.0 - 2.0 * sz);
-    let n000 = hash3(x0, y0, z0, seed);
-    let n100 = hash3(x1, y0, z0, seed);
-    let n010 = hash3(x0, y1, z0, seed);
-    let n110 = hash3(x1, y1, z0, seed);
-    let n001 = hash3(x0, y0, z1, seed);
-    let n101 = hash3(x1, y0, z1, seed);
-    let n011 = hash3(x0, y1, z1, seed);
-    let n111 = hash3(x1, y1, z1, seed);
-    let nx00 = n000 + (n100 - n000) * u;
-    let nx10 = n010 + (n110 - n010) * u;
-    let nx01 = n001 + (n101 - n001) * u;
-    let nx11 = n011 + (n111 - n011) * u;
-    let nxy0 = nx00 + (nx10 - nx00) * v;
-    let nxy1 = nx01 + (nx11 - nx01) * v;
-    nxy0 + (nxy1 - nxy0) * w
-}
-
-// Combines multiple octaves of value noise into fBm.
-fn fbm3(x: f32, y: f32, z: f32, seed: u32) -> f32 {
-    let mut sum = 0.0;
-    let mut amp = 0.5;
-    let mut freq = 1.0;
-    for i in 0..5 {
-        sum += value_noise3(x * freq, y * freq, z * freq, seed + i) * amp;
-        freq *= 2.0;
-        amp *= 0.5;
-    }
-    sum.clamp(0.0, 1.0)
-}
-
-#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
-pub struct PlanetNoiseConfig {
-    pub noise_scale: f32,
-    pub height_amp: f32,
-    pub height_bias: f32,
-    pub lat_bias: f32,
-    pub sea_level: f32,
-    pub ice_start: f32,
-    pub ice_strength: f32,
-    pub subdivisions: u8,
-}
-
-impl Default for PlanetNoiseConfig {
-    // Provides a baseline noise configuration for the planet.
-    fn default() -> Self {
-        Self {
-            noise_scale: 2.0,
-            height_amp: 1.2,
-            height_bias: -0.3,
-            lat_bias: 0.1,
-            sea_level: 0.62,
-            ice_start: 0.55,
-            ice_strength: 1.6,
-            subdivisions: 4,
-        }
-    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -994,38 +912,6 @@ impl PlanetLoader {
 }
 
 
-// Calculates a height value for a given surface normal.
-fn height_value(normal: Vec3, config: &PlanetNoiseConfig) -> f32 {
-    let noise = fbm3(
-        normal.x * config.noise_scale,
-        normal.y * config.noise_scale,
-        normal.z * config.noise_scale,
-        1337,
-    );
-    (noise * config.height_amp + config.height_bias + normal.y * config.lat_bias).clamp(0.0, 1.0)
-}
-
-// Maps height and latitude to a terrain color.
-fn color_from_height(height: f32, normal: Vec3, config: &PlanetNoiseConfig) -> Color {
-    let ice = ((normal.y.abs() - config.ice_start) * config.ice_strength).clamp(0.0, 1.0);
-    let (mut r, mut g, mut b) = if height < config.sea_level {
-        (0.08, 0.18, 0.42)
-    } else if height < config.sea_level + 0.08 {
-        (0.12, 0.32, 0.24)
-    } else if height < config.sea_level + 0.22 {
-        (0.22, 0.44, 0.26)
-    } else {
-        (0.48, 0.46, 0.40)
-    };
-    if ice > 0.0 {
-        let t = ice * ice;
-        r = r * (1.0 - t) + 0.85 * t;
-        g = g * (1.0 - t) + 0.9 * t;
-        b = b * (1.0 - t) + 0.95 * t;
-    }
-    Color::new(r, g, b, 1.0)
-}
-
 // Subdivides triangle faces by inserting normalized midpoints.
 fn subdivide_faces(vertices: &mut Vec<Vec3>, faces: &[[usize; 3]]) -> Vec<[usize; 3]> {
     let mut mid_cache: HashMap<(usize, usize), usize> = HashMap::new();
@@ -1427,7 +1313,13 @@ fn draw_flat_hex_grid_on_face(
     color: Color,
     line_thickness: f32,
     hexes_across: i32,
+    overlay_radius: f32,
+    surface_radius: f32,
+    hover_hit: Option<Vec3>,
 ) {
+    let Some(hover_hit) = hover_hit else {
+        return;
+    };
     if hexes_across < 2 || global_vertices.is_empty() {
         return;
     }
@@ -1464,8 +1356,6 @@ fn draw_flat_hex_grid_on_face(
     if v.length() < 1e-5 {
         return;
     }
-    let radius = center.length();
-
     let a2 = vec2((a - center).dot(u), (a - center).dot(v));
     let b2 = vec2((b - center).dot(u), (b - center).dot(v));
     let c2 = vec2((c - center).dot(u), (c - center).dot(v));
@@ -1502,8 +1392,7 @@ fn draw_flat_hex_grid_on_face(
         }
     }
 
-    let global_edges = icosahedron_edges();
-    let pent_step = std::f32::consts::TAU / 5.0;
+    let mut unique_centers: Vec<Vec2> = Vec::new();
     let mut dedupe: HashSet<(i32, i32)> = HashSet::new();
     for center_ref in centers_ref {
         let key_scale = (size * 0.2).max(1e-5);
@@ -1511,152 +1400,199 @@ fn draw_flat_hex_grid_on_face(
             (center_ref.x / key_scale).round() as i32,
             (center_ref.y / key_scale).round() as i32,
         );
-        if !dedupe.insert(key) {
-            continue;
+        if dedupe.insert(key) {
+            unique_centers.push(center_ref);
         }
+    }
+    if unique_centers.is_empty() {
+        return;
+    }
 
-        let Some((wa, wb, wc)) = barycentric_coords_2d(center_ref, ref_a, ref_b, ref_c) else {
-            continue;
-        };
-        let center_dst = a2 * wa + b2 * wb + c2 * wc;
-        let center_surface =
-            (center + u * center_dst.x + v * center_dst.y).normalize() * radius;
-        let normal = center_surface.normalize();
-        let mut tangent_x = u - normal * normal.dot(u);
-        if tangent_x.length() < 1e-5 {
-            tangent_x = vec3(0.0, 1.0, 0.0) - normal * normal.dot(vec3(0.0, 1.0, 0.0));
+    let hit_surface = hover_hit.normalize() * surface_radius;
+    let hit_dst = vec2((hit_surface - center).dot(u), (hit_surface - center).dot(v));
+    let Some((hwa, hwb, hwc)) = barycentric_coords_2d(hit_dst, a2, b2, c2) else {
+        return;
+    };
+    let hit_ref = ref_a * hwa + ref_b * hwb + ref_c * hwc;
+
+    let mut selected_center_ref = unique_centers[0];
+    let mut selected_dist = (selected_center_ref - hit_ref).length_squared();
+    for center_ref in unique_centers.into_iter().skip(1) {
+        let dist = (center_ref - hit_ref).length_squared();
+        if dist < selected_dist {
+            selected_dist = dist;
+            selected_center_ref = center_ref;
         }
-        if tangent_x.length() < 1e-5 {
-            tangent_x = vec3(1.0, 0.0, 0.0) - normal * normal.dot(vec3(1.0, 0.0, 0.0));
-        }
-        if tangent_x.length() < 1e-5 {
-            continue;
-        }
-        tangent_x = tangent_x.normalize();
-        let tangent_y = normal.cross(tangent_x).normalize();
-        if tangent_y.length() < 1e-5 {
-            continue;
-        }
+    }
 
-        let center_factor = (wa.min(wb).min(wc) / (1.0 / 3.0)).clamp(0.0, 1.0);
-        let cell_lift =
-            radius * (HOVER_GRID_CELL_BASE_LIFT + HOVER_GRID_CELL_MID_EXTRA_LIFT * center_factor);
-        let center_world = center_surface + normal * cell_lift;
+    let center_ref = selected_center_ref;
+    let Some((wa, wb, wc)) = barycentric_coords_2d(center_ref, ref_a, ref_b, ref_c) else {
+        return;
+    };
+    let center_dst = a2 * wa + b2 * wb + c2 * wc;
+    let center_surface =
+        (center + u * center_dst.x + v * center_dst.y).normalize() * surface_radius;
+    let normal = center_surface.normalize();
+    let mut tangent_x = u - normal * normal.dot(u);
+    if tangent_x.length() < 1e-5 {
+        tangent_x = vec3(0.0, 1.0, 0.0) - normal * normal.dot(vec3(0.0, 1.0, 0.0));
+    }
+    if tangent_x.length() < 1e-5 {
+        tangent_x = vec3(1.0, 0.0, 0.0) - normal * normal.dot(vec3(1.0, 0.0, 0.0));
+    }
+    if tangent_x.length() < 1e-5 {
+        return;
+    }
+    tangent_x = tangent_x.normalize();
+    let tangent_y = normal.cross(tangent_x).normalize();
+    if tangent_y.length() < 1e-5 {
+        return;
+    }
 
-        let Some((u_wa, u_wb, u_wc)) =
-            barycentric_coords_2d(center_ref + vec2(size, 0.0), ref_a, ref_b, ref_c)
-        else {
-            continue;
-        };
-        let sample_u_dst = a2 * u_wa + b2 * u_wb + c2 * u_wc;
-        let sample_u_surface =
-            (center + u * sample_u_dst.x + v * sample_u_dst.y).normalize() * radius;
+    let Some((u_wa, u_wb, u_wc)) =
+        barycentric_coords_2d(center_ref + vec2(size, 0.0), ref_a, ref_b, ref_c)
+    else {
+        return;
+    };
+    let sample_u_dst = a2 * u_wa + b2 * u_wb + c2 * u_wc;
+    let sample_u_surface =
+        (center + u * sample_u_dst.x + v * sample_u_dst.y).normalize() * surface_radius;
 
-        let Some((v_wa, v_wb, v_wc)) =
-            barycentric_coords_2d(center_ref + vec2(0.0, size), ref_a, ref_b, ref_c)
-        else {
-            continue;
-        };
-        let sample_v_dst = a2 * v_wa + b2 * v_wb + c2 * v_wc;
-        let sample_v_surface =
-            (center + u * sample_v_dst.x + v * sample_v_dst.y).normalize() * radius;
+    let Some((v_wa, v_wb, v_wc)) =
+        barycentric_coords_2d(center_ref + vec2(0.0, size), ref_a, ref_b, ref_c)
+    else {
+        return;
+    };
+    let sample_v_dst = a2 * v_wa + b2 * v_wb + c2 * v_wc;
+    let sample_v_surface =
+        (center + u * sample_v_dst.x + v * sample_v_dst.y).normalize() * surface_radius;
 
-        let cell_step_world = ((sample_u_surface - center_surface).length()
-            + (sample_v_surface - center_surface).length())
+    let cell_step_world =
+        ((sample_u_surface - center_surface).length() + (sample_v_surface - center_surface).length())
             * 0.5;
-        let vertex_snap_threshold = (cell_step_world * 0.35).max(1e-4);
+    let vertex_snap_threshold = (cell_step_world * 0.35).max(1e-4);
 
-        let mut matched_global_vertex: Option<usize> = None;
-        let mut best_dist = f32::MAX;
-        for (idx, vertex) in global_vertices.iter().enumerate() {
-            let dist = (*vertex - center_surface).length();
-            if dist < best_dist {
-                best_dist = dist;
-                matched_global_vertex = Some(idx);
+    let mut matched_global_vertex: Option<usize> = None;
+    let mut best_dist = f32::MAX;
+    for (idx, vertex) in global_vertices.iter().enumerate() {
+        let dist = (*vertex - center_surface).length();
+        if dist < best_dist {
+            best_dist = dist;
+            matched_global_vertex = Some(idx);
+        }
+    }
+    let use_pentagon = best_dist <= vertex_snap_threshold;
+    let sides = if use_pentagon { 5usize } else { 6usize };
+    let draw_radius = size * 0.95;
+
+    let global_edges = icosahedron_edges();
+    let pent_step = std::f32::consts::TAU / 5.0;
+    let mut angle_offset = -std::f32::consts::PI / 6.0;
+    if use_pentagon {
+        angle_offset = -std::f32::consts::FRAC_PI_2;
+        if let Some(vertex_index) = matched_global_vertex {
+            let vertex_pos = global_vertices[vertex_index];
+            let mut neighbor_angles: Vec<f32> = Vec::new();
+            for (ea, eb) in global_edges.iter().copied() {
+                let neighbor_index = if ea == vertex_index {
+                    Some(eb)
+                } else if eb == vertex_index {
+                    Some(ea)
+                } else {
+                    None
+                };
+                let Some(neighbor_index) = neighbor_index else {
+                    continue;
+                };
+                let dir_world = (global_vertices[neighbor_index] - vertex_pos).normalize();
+                let tangent_dir = dir_world - normal * normal.dot(dir_world);
+                if tangent_dir.length() < 1e-5 {
+                    continue;
+                }
+                let tangent_dir = tangent_dir.normalize();
+                let x = tangent_dir.dot(tangent_x);
+                let y = tangent_dir.dot(tangent_y);
+                neighbor_angles.push(y.atan2(x));
+            }
+            if !neighbor_angles.is_empty() {
+                neighbor_angles.sort_by(|lhs, rhs| {
+                    lhs.partial_cmp(rhs).unwrap_or(std::cmp::Ordering::Equal)
+                });
+                let mut best_error = f32::MAX;
+                let mut best_offset = angle_offset;
+                for start in 0..neighbor_angles.len() {
+                    let candidate = neighbor_angles[start] - 0.5 * pent_step;
+                    let mut error = 0.0;
+                    for i in 0..neighbor_angles.len() {
+                        let idx = (start + i) % neighbor_angles.len();
+                        let expected = candidate + pent_step * (i as f32 + 0.5);
+                        error += wrap_angle(neighbor_angles[idx] - expected).abs();
+                    }
+                    if error < best_error {
+                        best_error = error;
+                        best_offset = candidate;
+                    }
+                }
+                angle_offset = best_offset;
             }
         }
-        let use_pentagon = best_dist <= vertex_snap_threshold;
-        let sides = if use_pentagon { 5usize } else { 6usize };
-        let draw_radius = size * 0.95;
+    }
 
-        let mut angle_offset = -std::f32::consts::PI / 6.0;
-        if use_pentagon {
-            angle_offset = -std::f32::consts::FRAC_PI_2;
-            if let Some(vertex_index) = matched_global_vertex {
-                let vertex_pos = global_vertices[vertex_index];
-                let mut neighbor_angles: Vec<f32> = Vec::new();
-                for (ea, eb) in global_edges.iter().copied() {
-                    let neighbor_index = if ea == vertex_index {
-                        Some(eb)
-                    } else if eb == vertex_index {
-                        Some(ea)
-                    } else {
-                        None
-                    };
-                    let Some(neighbor_index) = neighbor_index else {
-                        continue;
-                    };
-                    let dir_world = (global_vertices[neighbor_index] - vertex_pos).normalize();
-                    let tangent_dir = dir_world - normal * normal.dot(dir_world);
-                    if tangent_dir.length() < 1e-5 {
-                        continue;
-                    }
-                    let tangent_dir = tangent_dir.normalize();
-                    let x = tangent_dir.dot(tangent_x);
-                    let y = tangent_dir.dot(tangent_y);
-                    neighbor_angles.push(y.atan2(x));
-                }
-                if !neighbor_angles.is_empty() {
-                    neighbor_angles
-                        .sort_by(|lhs, rhs| lhs.partial_cmp(rhs).unwrap_or(std::cmp::Ordering::Equal));
-                    let mut best_error = f32::MAX;
-                    let mut best_offset = angle_offset;
-                    for start in 0..neighbor_angles.len() {
-                        let candidate = neighbor_angles[start] - 0.5 * pent_step;
-                        let mut error = 0.0;
-                        for i in 0..neighbor_angles.len() {
-                            let idx = (start + i) % neighbor_angles.len();
-                            let expected = candidate + pent_step * (i as f32 + 0.5);
-                            error += wrap_angle(neighbor_angles[idx] - expected).abs();
-                        }
-                        if error < best_error {
-                            best_error = error;
-                            best_offset = candidate;
-                        }
-                    }
-                    angle_offset = best_offset;
-                }
-            }
-        }
+    let mut outer_screen: Vec<Vec2> = Vec::with_capacity(sides);
+    let mut inner_screen: Vec<Vec2> = Vec::with_capacity(sides);
+    for i in 0..sides {
+        let angle = angle_offset + (i as f32 / sides as f32) * std::f32::consts::TAU;
+        let corner_ref = center_ref + vec2(draw_radius * angle.cos(), draw_radius * angle.sin());
+        let Some((cwa, cwb, cwc)) = barycentric_coords_2d(corner_ref, ref_a, ref_b, ref_c) else {
+            return;
+        };
+        let corner_dst = a2 * cwa + b2 * cwb + c2 * cwc;
+        let corner_delta = corner_dst - center_dst;
+        let corner_surface = center_surface + tangent_x * corner_delta.x + tangent_y * corner_delta.y;
+        let world_outer = corner_surface.normalize() * overlay_radius;
+        let world_inner = corner_surface.normalize() * surface_radius;
+        let Some(screen_outer) = project_to_screen(camera, world_outer) else {
+            return;
+        };
+        let Some(screen_inner) = project_to_screen(camera, world_inner) else {
+            return;
+        };
+        outer_screen.push(screen_outer);
+        inner_screen.push(screen_inner);
+    }
 
-        let mut corners_screen: Vec<Vec2> = Vec::with_capacity(sides);
-        let mut all_visible = true;
-        for i in 0..sides {
-            let angle = angle_offset + (i as f32 / sides as f32) * std::f32::consts::TAU;
-            let corner_ref =
-                center_ref + vec2(draw_radius * angle.cos(), draw_radius * angle.sin());
-            let Some((cwa, cwb, cwc)) = barycentric_coords_2d(corner_ref, ref_a, ref_b, ref_c)
-            else {
-                all_visible = false;
-                break;
-            };
-            let corner_dst = a2 * cwa + b2 * cwb + c2 * cwc;
-            let corner_delta = corner_dst - center_dst;
-            let world_corner = center_world + tangent_x * corner_delta.x + tangent_y * corner_delta.y;
-            let Some(screen_corner) = project_to_screen(camera, world_corner) else {
-                all_visible = false;
-                break;
-            };
-            corners_screen.push(screen_corner);
-        }
-        if !all_visible {
-            continue;
-        }
-        for i in 0..sides {
-            let p0 = corners_screen[i];
-            let p1 = corners_screen[(i + 1) % sides];
-            draw_line(p0.x, p0.y, p1.x, p1.y, line_thickness, color);
-        }
+    for i in 0..sides {
+        let p0 = outer_screen[i];
+        let p1 = outer_screen[(i + 1) % sides];
+        draw_line(p0.x, p0.y, p1.x, p1.y, line_thickness, color);
+    }
+
+    let inner_color = Color::new(color.r, color.g, color.b, (color.a * 0.9).clamp(0.0, 1.0));
+    for i in 0..sides {
+        let p0 = inner_screen[i];
+        let p1 = inner_screen[(i + 1) % sides];
+        draw_line(
+            p0.x,
+            p0.y,
+            p1.x,
+            p1.y,
+            (line_thickness * 0.95).max(0.6),
+            inner_color,
+        );
+    }
+
+    let radial_color = Color::new(color.r, color.g, color.b, (color.a * 0.7).clamp(0.0, 1.0));
+    for i in 0..sides {
+        let p_outer = outer_screen[i];
+        let p_inner = inner_screen[i];
+        draw_line(
+            p_outer.x,
+            p_outer.y,
+            p_inner.x,
+            p_inner.y,
+            (line_thickness * 0.9).max(0.6),
+            radial_color,
+        );
     }
 }
 
@@ -1934,122 +1870,6 @@ fn uv_from_normal(normal: Vec3) -> Vec2 {
     vec2(u, v)
 }
 
-// Builds an RGBA heightmap texture using equirectangular sampling.
-fn build_heightmap_pixels(
-    config: &PlanetNoiseConfig,
-    size: u16,
-) -> Vec<u8> {
-    let size = size as usize;
-    let mut pixels = vec![0u8; size * size * 4];
-    for y in 0..size {
-        let v = y as f32 / (size - 1) as f32;
-        let phi = v * std::f32::consts::PI;
-        let sin_phi = phi.sin();
-        let cos_phi = phi.cos();
-        for x in 0..size {
-            let u = x as f32 / (size - 1) as f32;
-            // Match uv_from_normal(): u = 0.5 + atan2(z, x) / TAU
-            let theta = (u - 0.5) * std::f32::consts::TAU;
-            let normal = vec3(sin_phi * theta.cos(), cos_phi, sin_phi * theta.sin());
-            let height = height_value(normal, config);
-            let color = color_from_height(height, normal, config);
-            let idx = (y * size + x) * 4;
-            pixels[idx] = (color.r * 255.0) as u8;
-            pixels[idx + 1] = (color.g * 255.0) as u8;
-            pixels[idx + 2] = (color.b * 255.0) as u8;
-            pixels[idx + 3] = (color.a * 255.0) as u8;
-        }
-    }
-    pixels
-}
-
-// Checks if texture-relevant noise parameters changed.
-fn texture_params_match(a: &PlanetNoiseConfig, b: &PlanetNoiseConfig) -> bool {
-    let eps = 1e-4;
-    (a.noise_scale - b.noise_scale).abs() < eps
-        && (a.height_amp - b.height_amp).abs() < eps
-        && (a.height_bias - b.height_bias).abs() < eps
-        && (a.lat_bias - b.lat_bias).abs() < eps
-        && (a.sea_level - b.sea_level).abs() < eps
-        && (a.ice_start - b.ice_start).abs() < eps
-        && (a.ice_strength - b.ice_strength).abs() < eps
-}
-
-// Builds or loads a cached heightmap PNG for current noise parameters.
-fn load_or_build_heightmap(config: &PlanetNoiseConfig, size: u16) -> Vec<u8> {
-    if let Some(pixels) = load_heightmap_png(config, size) {
-        return pixels;
-    }
-    let pixels = build_heightmap_pixels(config, size);
-    save_heightmap_png(config, size, &pixels);
-    pixels
-}
-
-fn heightmap_cache_key(config: &PlanetNoiseConfig, size: u16) -> u64 {
-    // Texture generation does not depend on LOD subdivisions.
-    let words = [
-        config.noise_scale.to_bits() as u64,
-        config.height_amp.to_bits() as u64,
-        config.height_bias.to_bits() as u64,
-        config.lat_bias.to_bits() as u64,
-        config.sea_level.to_bits() as u64,
-        config.ice_start.to_bits() as u64,
-        config.ice_strength.to_bits() as u64,
-        size as u64,
-    ];
-    let mut hash: u64 = 1469598103934665603;
-    for word in words {
-        hash ^= word;
-        hash = hash.wrapping_mul(1099511628211);
-    }
-    hash
-}
-
-fn heightmap_cache_path(config: &PlanetNoiseConfig, size: u16) -> String {
-    format!(
-        "{}_{:016x}_{}x{}.png",
-        HEIGHTMAP_IMAGE_PREFIX,
-        heightmap_cache_key(config, size),
-        size,
-        size
-    )
-}
-
-fn load_heightmap_png(config: &PlanetNoiseConfig, size: u16) -> Option<Vec<u8>> {
-    let path = heightmap_cache_path(config, size);
-    let file_bytes = fs::read(path).ok()?;
-    let mut image = Image::from_file_with_format(&file_bytes, None).ok()?;
-    if image.width != size || image.height != size {
-        return None;
-    }
-    flip_rgba_vertical(&mut image.bytes, image.width as usize, image.height as usize);
-    Some(image.bytes)
-}
-
-fn save_heightmap_png(config: &PlanetNoiseConfig, size: u16, pixels: &[u8]) {
-    if pixels.len() != size as usize * size as usize * 4 {
-        return;
-    }
-    let path = heightmap_cache_path(config, size);
-    let image = Image {
-        bytes: pixels.to_vec(),
-        width: size,
-        height: size,
-    };
-    image.export_png(&path);
-}
-
-fn flip_rgba_vertical(bytes: &mut [u8], width: usize, height: usize) {
-    let stride = width * 4;
-    for y in 0..(height / 2) {
-        let top = y * stride;
-        let bottom = (height - 1 - y) * stride;
-        for x in 0..stride {
-            bytes.swap(top + x, bottom + x);
-        }
-    }
-}
-
 fn save_mesh_points(meshes: &[MeshData]) {
     ensure_planet_data_dir();
     let Ok(file) = File::create(MESH_POINTS_PATH) else {
@@ -2223,7 +2043,7 @@ pub fn run(
     set_camera(&camera);
 
     let radius = 1.6;
-    let line_radius = radius * 1.04;
+    let line_radius = radius + PLANET_OVERLAY_OFFSET;
     let zoom_t = ((state.distance - 2.0) / 18.0).clamp(0.0, 1.0);
     let segments = ((32.0 - 16.0 * zoom_t).round() as i32).clamp(10, 32) as usize;
     let show_labels = false;
@@ -2287,8 +2107,10 @@ pub fn run(
     let mut hovered_subface: Option<usize> = None;
     let mut hovered_base_face: Option<usize> = None;
     let mut hover_grid_face: Option<[Vec3; 3]> = None;
+    let mut hover_hit: Option<Vec3> = None;
     if let Some((origin, dir)) = ray_from_mouse(&camera, mouse) {
         if let Some(hit) = ray_sphere_intersection(origin, dir, radius) {
+            hover_hit = Some(hit);
             if use_subface_hover {
                 hovered_subface = hovered_face(hit, &faces, vertices);
             } else {
@@ -2355,6 +2177,9 @@ pub fn run(
             grid_color,
             1.2,
             HOVER_GRID_HEXES_ACROSS,
+            line_radius,
+            radius,
+            hover_hit,
         );
     }
     if state.debug_enabled {

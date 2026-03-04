@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::fs::File;
-use std::io::{BufReader, BufWriter, Read, Write};
+use std::io::{BufWriter, Write};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -14,6 +14,11 @@ use crate::SQRT_3;
 use crate::core::debug::{
     draw_planet_controls, format_log_timestamp, planet_perf_log, PLANET_DEBUG_UI_ENABLED_DEFAULT,
     SAVE_MESH_POINTS_RUNTIME,
+};
+use crate::core::planet_grid::{
+    HexGrid, align_vertices_to_poles, build_faces, build_frequency_geodesic, build_geodesic_sphere,
+    build_hex_grid_from_data, icosahedron_edges, icosahedron_vertices, load_hex_grid_cache,
+    save_hex_grid_cache,
 };
 use crate::scenes::planet_texture::{
     PlanetNoiseConfig, color_from_height, height_value, load_or_build_heightmap, texture_params_match,
@@ -45,52 +50,6 @@ fn wrap_angle(mut angle: f32) -> f32 {
     angle - std::f32::consts::PI
 }
 
-// Rotates a vector around an axis using Rodrigues' rotation formula.
-fn rotate_vec3(v: Vec3, axis: Vec3, angle: f32) -> Vec3 {
-    let axis = axis.normalize();
-    let cos_theta = angle.cos();
-    let sin_theta = angle.sin();
-    v * cos_theta + axis.cross(v) * sin_theta + axis * (axis.dot(v) * (1.0 - cos_theta))
-}
-
-// Builds the icosahedron edge list used for arcs and face construction.
-fn icosahedron_edges() -> Vec<(usize, usize)> {
-    let mut edges: Vec<(usize, usize)> = Vec::new();
-    for i in 2..6 {
-        edges.push((0,i));
-        edges.push((11,4+i));
-    }
-    for i in 1..5 {
-        edges.push((i,i+5));
-        edges.push((i,i+6));
-    }
-    edges.push((1,5));
-    edges.push((5,10));
-    edges.push((10,6));
-    for i in 0..11 {
-        edges.push((i,i+1));
-    }
-    edges
-}
-
-// Returns the 12 vertices of a unit icosahedron.
-fn icosahedron_vertices() -> [Vec3; 12] {
-    let phi = (1.0 + 5.0_f32.sqrt()) * 0.5;
-    [
-        vec3(-1.0,  phi, 0.0),
-        vec3(0.0,  1.0,  phi),
-        vec3( 1.0,  phi, 0.0),
-        vec3(0.0,  1.0, -phi),
-        vec3(-phi, 0.0, -1.0),
-        vec3(-phi, 0.0,  1.0),
-        vec3(0.0, -1.0,  phi),
-        vec3( phi, 0.0,  1.0),
-        vec3( phi, 0.0, -1.0),
-        vec3(0.0, -1.0, -phi),
-        vec3(-1.0, -phi, 0.0),
-        vec3( 1.0, -phi, 0.0),
-    ]
-}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct PlanetNoiseSnapshot {
@@ -119,16 +78,6 @@ pub struct PlanetTextureData {
     heightmap_pixels: Vec<u8>,
 }
 
-#[derive(Debug)]
-struct HexGrid {
-    freq: i32,
-    vertices: Vec<Vec3>,
-    faces: Vec<[u32; 3]>,
-    vertex_faces: Vec<Vec<u32>>,
-    base_face_buckets: Vec<Vec<u32>>,
-    base_face_neighbors: Vec<Vec<usize>>,
-}
-
 // Ensures the planet data folder exists and migrates legacy files into it.
 fn ensure_planet_data_dir() {
     let _ = fs::create_dir_all(PLANET_DATA_DIR);
@@ -143,6 +92,45 @@ fn ensure_planet_data_dir() {
             let _ = fs::rename(old_path, new_path);
         }
     }
+}
+
+fn start_hex_grid_build(
+    freq: i32,
+    base_vertices: &[Vec3],
+    base_faces: &[[usize; 3]],
+) -> Receiver<HexGrid> {
+    let (tx, rx) = mpsc::channel();
+    let base_vertices = base_vertices.to_vec();
+    let base_faces = base_faces.to_vec();
+    std::thread::spawn(move || {
+        let t0 = Instant::now();
+        let grid = if let Some((vertices, faces)) =
+            load_hex_grid_cache(HEX_GRID_CACHE_PATH, freq)
+        {
+            planet_perf_log(&format!(
+                "hex grid cache loaded freq={} vertices={} faces={} took_ms={}",
+                freq,
+                vertices.len(),
+                faces.len(),
+                t0.elapsed().as_millis()
+            ));
+            build_hex_grid_from_data(freq, vertices, faces, &base_vertices, &base_faces)
+        } else {
+            let (vertices, faces) = build_frequency_geodesic(freq, &base_vertices, &base_faces);
+            ensure_planet_data_dir();
+            save_hex_grid_cache(HEX_GRID_CACHE_PATH, freq, &vertices, &faces);
+            planet_perf_log(&format!(
+                "hex grid built freq={} vertices={} faces={} took_ms={}",
+                freq,
+                vertices.len(),
+                faces.len(),
+                t0.elapsed().as_millis()
+            ));
+            build_hex_grid_from_data(freq, vertices, faces, &base_vertices, &base_faces)
+        };
+        let _ = tx.send(grid);
+    });
+    rx
 }
 
 enum PlanetLoadEvent {
@@ -195,6 +183,7 @@ pub struct PlanetState {
     pub heightmap_texture: Option<Texture2D>,
     pub texture_config: PlanetNoiseConfig,
     hex_grid: Option<HexGrid>,
+    hex_grid_rx: Option<Receiver<HexGrid>>,
     relief_cache: HashMap<ReliefCacheKey, ReliefCacheEntry>,
     pending_relief_key: Option<ReliefCacheKey>,
     regen_rx: Option<Receiver<RegenMessage>>,
@@ -260,7 +249,7 @@ impl PlanetState {
             .collect::<Vec<_>>();
         let face_centers = build_face_centers(&sector_vertices, &sector_faces);
         let base_faces = build_faces(&base_vertices, &icosahedron_edges());
-        let hex_grid = Some(load_or_build_hex_grid(
+        let hex_grid_rx = Some(start_hex_grid_build(
             HOVER_GRID_HEXES_ACROSS,
             &base_vertices,
             &base_faces,
@@ -289,7 +278,8 @@ impl PlanetState {
             debug_enabled: PLANET_DEBUG_UI_ENABLED_DEFAULT,
             heightmap_texture: Some(heightmap_texture),
             texture_config: config,
-            hex_grid,
+            hex_grid: None,
+            hex_grid_rx,
             relief_cache: HashMap::new(),
             pending_relief_key: None,
             regen_rx: None,
@@ -930,7 +920,6 @@ impl PlanetLoader {
     }
 }
 
-
 // Subdivides triangle faces by inserting normalized midpoints.
 fn subdivide_faces(vertices: &mut Vec<Vec3>, faces: &[[usize; 3]]) -> Vec<[usize; 3]> {
     let mut mid_cache: HashMap<(usize, usize), usize> = HashMap::new();
@@ -962,397 +951,6 @@ fn subdivide_faces(vertices: &mut Vec<Vec3>, faces: &[[usize; 3]]) -> Vec<[usize
     }
 
     new_faces
-}
-
-// Subdivides the base icosahedron faces into 4 using shared midpoints.
-fn subdivide_base_faces(
-    vertices: &[Vec3],
-    faces: &[[usize; 3]],
-) -> (Vec<Vec3>, Vec<[usize; 3]>) {
-    let mut out_vertices: Vec<Vec3> = vertices.iter().map(|v| v.normalize()).collect();
-    let mut mid_cache: HashMap<(usize, usize), usize> = HashMap::new();
-    let mut new_faces = Vec::with_capacity(faces.len() * 4);
-
-    let mut midpoint = |a: usize, b: usize, verts: &mut Vec<Vec3>| -> usize {
-        let key = if a < b { (a, b) } else { (b, a) };
-        if let Some(&idx) = mid_cache.get(&key) {
-            return idx;
-        }
-        let mid = (verts[a] + verts[b]) * 0.5;
-        let idx = verts.len();
-        verts.push(mid.normalize());
-        mid_cache.insert(key, idx);
-        idx
-    };
-
-    for face in faces {
-        let a = face[0];
-        let b = face[1];
-        let c = face[2];
-        let ab: usize = midpoint(a, b, &mut out_vertices);
-        let bc = midpoint(b, c, &mut out_vertices);
-        let ca = midpoint(c, a, &mut out_vertices);
-        new_faces.push([a, ab, ca]);
-        new_faces.push([b, bc, ab]);
-        new_faces.push([c, ca, bc]);
-        new_faces.push([ab, bc, ca]);
-    }
-
-    (out_vertices, new_faces)
-}
-
-// Builds a geodesic sphere by subdividing and relaxing vertices on the unit sphere.
-fn build_geodesic_sphere(
-    base_vertices: &[Vec3],
-    base_faces: &[[usize; 3]],
-    subdivisions: usize,
-    relax_iterations: usize,
-    relax_strength: f32,
-) -> (Vec<Vec3>, Vec<[usize; 3]>) {
-    let mut vertices: Vec<Vec3> = base_vertices.iter().map(|v| v.normalize()).collect();
-    let mut faces: Vec<[usize; 3]> = base_faces.to_vec();
-
-    for _ in 0..subdivisions {
-        let (new_vertices, new_faces) = subdivide_base_faces(&vertices, &faces);
-        vertices = new_vertices;
-        faces = new_faces;
-    }
-
-    if relax_iterations > 0 {
-        relax_sphere(&mut vertices, &faces, relax_iterations, relax_strength);
-    }
-
-    (vertices, faces)
-}
-
-// Relaxes vertex positions along the sphere to reduce edge length variance.
-fn relax_sphere(
-    vertices: &mut [Vec3],
-    faces: &[[usize; 3]],
-    iterations: usize,
-    strength: f32,
-) {
-    let neighbors = build_vertex_neighbors(faces, vertices.len());
-    let strength = strength.clamp(0.0, 1.0);
-
-    for _ in 0..iterations {
-        let mut next = vertices.to_vec();
-        for (index, pos) in vertices.iter().enumerate() {
-            let neighbor_list = &neighbors[index];
-            if neighbor_list.is_empty() {
-                continue;
-            }
-            let mut avg = Vec3::ZERO;
-            for &neighbor in neighbor_list.iter() {
-                avg += vertices[neighbor];
-            }
-            avg /= neighbor_list.len() as f32;
-            let target = avg.normalize();
-            let moved = *pos + (target - *pos) * strength;
-            next[index] = moved.normalize();
-        }
-        vertices.copy_from_slice(&next);
-    }
-}
-
-// Builds adjacency lists for each vertex from face indices.
-fn build_vertex_neighbors(faces: &[[usize; 3]], vertex_count: usize) -> Vec<Vec<usize>> {
-    let mut neighbors: Vec<HashSet<usize>> = (0..vertex_count).map(|_| HashSet::new()).collect();
-
-    for face in faces {
-        let a = face[0];
-        let b = face[1];
-        let c = face[2];
-        neighbors[a].insert(b);
-        neighbors[a].insert(c);
-        neighbors[b].insert(a);
-        neighbors[b].insert(c);
-        neighbors[c].insert(a);
-        neighbors[c].insert(b);
-    }
-
-    neighbors
-        .into_iter()
-        .map(|set| set.into_iter().collect())
-        .collect()
-}
-
-fn build_face_neighbors(faces: &[[usize; 3]]) -> Vec<Vec<usize>> {
-    let mut edge_map: HashMap<(usize, usize), Vec<usize>> = HashMap::new();
-    for (face_index, face) in faces.iter().enumerate() {
-        let edges = [
-            (face[0], face[1]),
-            (face[1], face[2]),
-            (face[2], face[0]),
-        ];
-        for (a, b) in edges {
-            let key = if a < b { (a, b) } else { (b, a) };
-            edge_map.entry(key).or_default().push(face_index);
-        }
-    }
-
-    let mut neighbors: Vec<HashSet<usize>> = vec![HashSet::new(); faces.len()];
-    for face_list in edge_map.values() {
-        if face_list.len() < 2 {
-            continue;
-        }
-        for i in 0..face_list.len() {
-            for j in (i + 1)..face_list.len() {
-                let a = face_list[i];
-                let b = face_list[j];
-                neighbors[a].insert(b);
-                neighbors[b].insert(a);
-            }
-        }
-    }
-
-    neighbors
-        .into_iter()
-        .map(|set| set.into_iter().collect())
-        .collect()
-}
-
-fn load_hex_grid_cache(freq: i32) -> Option<(Vec<Vec3>, Vec<[u32; 3]>)> {
-    let file = File::open(HEX_GRID_CACHE_PATH).ok()?;
-    let mut reader = BufReader::new(file);
-    let mut magic = [0u8; 4];
-    reader.read_exact(&mut magic).ok()?;
-    if &magic != b"HXG1" {
-        return None;
-    }
-    let mut read_u32 = |reader: &mut BufReader<File>| -> Option<u32> {
-        let mut buf = [0u8; 4];
-        reader.read_exact(&mut buf).ok()?;
-        Some(u32::from_le_bytes(buf))
-    };
-    let stored_freq = read_u32(&mut reader)? as i32;
-    if stored_freq != freq {
-        return None;
-    }
-    let vertex_count = read_u32(&mut reader)? as usize;
-    let face_count = read_u32(&mut reader)? as usize;
-    if vertex_count == 0 || face_count == 0 {
-        return None;
-    }
-    let mut vertices: Vec<Vec3> = Vec::with_capacity(vertex_count);
-    for _ in 0..vertex_count {
-        let mut buf = [0u8; 12];
-        reader.read_exact(&mut buf).ok()?;
-        let x = f32::from_le_bytes(buf[0..4].try_into().ok()?);
-        let y = f32::from_le_bytes(buf[4..8].try_into().ok()?);
-        let z = f32::from_le_bytes(buf[8..12].try_into().ok()?);
-        vertices.push(vec3(x, y, z));
-    }
-    let mut faces: Vec<[u32; 3]> = Vec::with_capacity(face_count);
-    for _ in 0..face_count {
-        let a = read_u32(&mut reader)?;
-        let b = read_u32(&mut reader)?;
-        let c = read_u32(&mut reader)?;
-        faces.push([a, b, c]);
-    }
-    Some((vertices, faces))
-}
-
-fn save_hex_grid_cache(freq: i32, vertices: &[Vec3], faces: &[[u32; 3]]) {
-    ensure_planet_data_dir();
-    let Ok(file) = File::create(HEX_GRID_CACHE_PATH) else {
-        return;
-    };
-    let mut writer = BufWriter::new(file);
-    let _ = writer.write_all(b"HXG1");
-    let _ = writer.write_all(&(freq as u32).to_le_bytes());
-    let _ = writer.write_all(&(vertices.len() as u32).to_le_bytes());
-    let _ = writer.write_all(&(faces.len() as u32).to_le_bytes());
-    for v in vertices {
-        let _ = writer.write_all(&v.x.to_le_bytes());
-        let _ = writer.write_all(&v.y.to_le_bytes());
-        let _ = writer.write_all(&v.z.to_le_bytes());
-    }
-    for face in faces {
-        let _ = writer.write_all(&face[0].to_le_bytes());
-        let _ = writer.write_all(&face[1].to_le_bytes());
-        let _ = writer.write_all(&face[2].to_le_bytes());
-    }
-    let _ = writer.flush();
-}
-
-fn build_frequency_geodesic(
-    freq: i32,
-    base_vertices: &[Vec3],
-    base_faces: &[[usize; 3]],
-) -> (Vec<Vec3>, Vec<[u32; 3]>) {
-    let freq = freq.max(1) as usize;
-    let mut vertices: Vec<Vec3> = base_vertices.iter().map(|v| v.normalize()).collect();
-    let mut faces: Vec<[u32; 3]> = Vec::new();
-    let mut edge_cache: HashMap<(usize, usize), Vec<usize>> = HashMap::new();
-
-    let mut edge_indices = |a: usize, b: usize,
-                            vertices: &mut Vec<Vec3>,
-                            edge_cache: &mut HashMap<(usize, usize), Vec<usize>>|
-     -> Vec<usize> {
-        let key = if a < b { (a, b) } else { (b, a) };
-        if let Some(indices) = edge_cache.get(&key) {
-            if a < b {
-                return indices.clone();
-            }
-            let mut reversed = indices.clone();
-            reversed.reverse();
-            return reversed;
-        }
-        let va = base_vertices[a].normalize();
-        let vb = base_vertices[b].normalize();
-        let mut indices: Vec<usize> = Vec::with_capacity(freq + 1);
-        for t in 0..=freq {
-            if t == 0 {
-                indices.push(a);
-                continue;
-            }
-            if t == freq {
-                indices.push(b);
-                continue;
-            }
-            let alpha = t as f32 / freq as f32;
-            let pos = (va * (1.0 - alpha) + vb * alpha).normalize();
-            let idx = vertices.len();
-            vertices.push(pos);
-            indices.push(idx);
-        }
-        edge_cache.insert(key, indices.clone());
-        if a < b {
-            indices
-        } else {
-            let mut reversed = indices;
-            reversed.reverse();
-            reversed
-        }
-    };
-
-    for face in base_faces {
-        let a = face[0];
-        let b = face[1];
-        let c = face[2];
-        let ab = edge_indices(a, b, &mut vertices, &mut edge_cache);
-        let ac = edge_indices(a, c, &mut vertices, &mut edge_cache);
-        let bc = edge_indices(b, c, &mut vertices, &mut edge_cache);
-
-        let va = base_vertices[a].normalize();
-        let vb = base_vertices[b].normalize();
-        let vc = base_vertices[c].normalize();
-        let mut grid: Vec<Vec<usize>> = Vec::with_capacity(freq + 1);
-        for i in 0..=freq {
-            grid.push(vec![0usize; freq + 1 - i]);
-        }
-
-        for i in 0..=freq {
-            for j in 0..=freq - i {
-                let index = if j == 0 {
-                    ab[i]
-                } else if i == 0 {
-                    ac[j]
-                } else if i + j == freq {
-                    bc[j]
-                } else {
-                    let wa = (freq - i - j) as f32 / freq as f32;
-                    let wb = i as f32 / freq as f32;
-                    let wc = j as f32 / freq as f32;
-                    let pos = (va * wa + vb * wb + vc * wc).normalize();
-                    let idx = vertices.len();
-                    vertices.push(pos);
-                    idx
-                };
-                grid[i][j] = index;
-            }
-        }
-
-        for i in 0..freq {
-            for j in 0..(freq - i) {
-                let v0 = grid[i][j] as u32;
-                let v1 = grid[i + 1][j] as u32;
-                let v2 = grid[i][j + 1] as u32;
-                faces.push([v0, v1, v2]);
-                if i + j < freq - 1 {
-                    let v3 = grid[i + 1][j + 1] as u32;
-                    faces.push([v1, v3, v2]);
-                }
-            }
-        }
-    }
-
-    (vertices, faces)
-}
-
-fn build_hex_grid_from_data(
-    freq: i32,
-    vertices: Vec<Vec3>,
-    faces: Vec<[u32; 3]>,
-    base_vertices: &[Vec3],
-    base_faces: &[[usize; 3]],
-) -> HexGrid {
-    let mut vertex_faces: Vec<Vec<u32>> = vec![Vec::new(); vertices.len()];
-    for (index, face) in faces.iter().enumerate() {
-        let idx = index as u32;
-        vertex_faces[face[0] as usize].push(idx);
-        vertex_faces[face[1] as usize].push(idx);
-        vertex_faces[face[2] as usize].push(idx);
-    }
-
-    let base_face_normals = base_faces
-        .iter()
-        .copied()
-        .map(|face| face_normal(base_vertices, face))
-        .collect::<Vec<_>>();
-    let base_face_neighbors = build_face_neighbors(base_faces);
-    let mut base_face_buckets: Vec<Vec<u32>> = vec![Vec::new(); base_faces.len()];
-    for (index, dir) in vertices.iter().enumerate() {
-        let mut best_face = 0usize;
-        let mut best_dot = -1.0_f32;
-        for (face_index, normal) in base_face_normals.iter().enumerate() {
-            let dot = dir.dot(*normal);
-            if dot > best_dot {
-                best_dot = dot;
-                best_face = face_index;
-            }
-        }
-        base_face_buckets[best_face].push(index as u32);
-    }
-
-    HexGrid {
-        freq,
-        vertices,
-        faces,
-        vertex_faces,
-        base_face_buckets,
-        base_face_neighbors,
-    }
-}
-
-fn load_or_build_hex_grid(
-    freq: i32,
-    base_vertices: &[Vec3],
-    base_faces: &[[usize; 3]],
-) -> HexGrid {
-    let t0 = Instant::now();
-    if let Some((vertices, faces)) = load_hex_grid_cache(freq) {
-        planet_perf_log(&format!(
-            "hex grid cache loaded freq={} vertices={} faces={} took_ms={}",
-            freq,
-            vertices.len(),
-            faces.len(),
-            t0.elapsed().as_millis()
-        ));
-        return build_hex_grid_from_data(freq, vertices, faces, base_vertices, base_faces);
-    }
-
-    let (vertices, faces) = build_frequency_geodesic(freq, base_vertices, base_faces);
-    save_hex_grid_cache(freq, &vertices, &faces);
-    planet_perf_log(&format!(
-        "hex grid built freq={} vertices={} faces={} took_ms={}",
-        freq,
-        vertices.len(),
-        faces.len(),
-        t0.elapsed().as_millis()
-    ));
-    build_hex_grid_from_data(freq, vertices, faces, base_vertices, base_faces)
 }
 
 #[derive(Debug, Clone)]
@@ -1749,54 +1347,6 @@ fn draw_arc_on_sphere(start: Vec3, end: Vec3, radius: f32, segments: usize, colo
     }
 }
 
-// Builds triangle faces from the icosahedron edges via planar checks.
-fn build_faces(vertices: &[Vec3], edges: &[(usize, usize)]) -> Vec<[usize; 3]> {
-    let mut connected = [[false; 12]; 12];
-    for (a, b) in edges {
-        connected[*a][*b] = true;
-        connected[*b][*a] = true;
-    }
-
-    let mut faces = Vec::new();
-    for i in 0..12 {
-        for j in (i + 1)..12 {
-            if !connected[i][j] {
-                continue;
-            }
-            for k in (j + 1)..12 {
-                if !(connected[i][k] && connected[j][k]) {
-                    continue;
-                }
-                let a = vertices[i];
-                let b = vertices[j];
-                let c = vertices[k];
-                let mut normal = (b - a).cross(c - a);
-                if normal.length() < 1e-5 {
-                    continue;
-                }
-                normal = normal.normalize();
-                if normal.dot(a) < 0.0 {
-                    normal = -normal;
-                }
-                let mut is_face = true;
-                for (idx, v) in vertices.iter().enumerate() {
-                    if idx == i || idx == j || idx == k {
-                        continue;
-                    }
-                    if (*v - a).dot(normal) > 1e-4 {
-                        is_face = false;
-                        break;
-                    }
-                }
-                if is_face {
-                    faces.push([i, j, k]);
-                }
-            }
-        }
-    }
-    faces
-}
-
 // Builds a ray from screen-space mouse coordinates in world space.
 fn ray_from_mouse(camera: &Camera3D, mouse: Vec2) -> Option<(Vec3, Vec3)> {
     let x = (mouse.x / screen_width()) * 2.0 - 1.0;
@@ -1941,38 +1491,6 @@ fn build_face_centers(vertices: &[Vec3], faces: &[[usize; 3]]) -> Vec<Vec3> {
         .collect()
 }
 
-// Rotates vertices so one vertex aligns with the +Y axis.
-fn alignment_axis_angle(vertices: &[Vec3; 12]) -> Option<(Vec3, f32)> {
-    let mut max_index = 0usize;
-    let mut max_y = vertices[0].y;
-    for (index, v) in vertices.iter().enumerate() {
-        if v.y > max_y {
-            max_y = v.y;
-            max_index = index;
-        }
-    }
-    let north = vertices[max_index].normalize();
-    let up = vec3(0.0, 1.0, 0.0);
-    let dot = north.dot(up).clamp(-1.0, 1.0);
-    let angle = dot.acos();
-    let axis = north.cross(up);
-    if axis.length() < 1e-5 || angle.abs() < 1e-5 {
-        return None;
-    }
-    Some((axis.normalize(), angle))
-}
-
-fn align_vertices_to_poles(vertices: &[Vec3; 12]) -> Vec<Vec3> {
-    let Some((axis, angle)) = alignment_axis_angle(vertices) else {
-        return vertices.to_vec();
-    };
-    let mut out = vec![Vec3::ZERO; vertices.len()];
-    for (index, v) in vertices.iter().enumerate() {
-        out[index] = rotate_vec3(*v, axis, angle);
-    }
-    out
-}
-
 // Projects a 3D point into screen space and clips off-screen points.
 fn project_to_screen(camera: &Camera3D, point: Vec3) -> Option<Vec2> {
     let mat = camera.matrix();
@@ -2105,6 +1623,14 @@ pub fn run(
     }
     if !state.relief_available && state.show_relief {
         state.show_relief = false;
+    }
+    if state.hex_grid.is_none() {
+        if let Some(rx) = state.hex_grid_rx.as_ref() {
+            if let Ok(grid) = rx.try_recv() {
+                state.hex_grid = Some(grid);
+                state.hex_grid_rx = None;
+            }
+        }
     }
 
     let mouse = vec2(mouse_position().0, mouse_position().1);

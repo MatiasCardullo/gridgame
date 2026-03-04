@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 
 pub mod ui;
 pub mod debug;
+pub mod planet_grid;
 
 use crate::SQRT_3;
 use crate::core::ui::UiButtonColors;

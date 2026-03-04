@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::fs::File;
-use std::io::{BufWriter, Write};
+use std::io::{BufReader, BufWriter, Read, Write};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -22,6 +22,7 @@ use crate::scenes::planet_texture::{
 const PLANET_DATA_DIR: &str = "planet_data";
 const MESH_POINTS_PATH: &str = "planet_data/planet_mesh_points.csv";
 const PLANET_NOISE_PATH: &str = "planet_data/planet_noise.json";
+const HEX_GRID_CACHE_PATH: &str = "planet_data/planet_hex_grid.bin";
 const HEIGHTMAP_SIZE: u16 = 2048;
 const TEXTURE_BASE_SUBDIVISIONS: usize = 2;
 const TEXTURE_LAYER_OFFSET: f32 = 0.004;
@@ -118,6 +119,16 @@ pub struct PlanetTextureData {
     heightmap_pixels: Vec<u8>,
 }
 
+#[derive(Debug)]
+struct HexGrid {
+    freq: i32,
+    vertices: Vec<Vec3>,
+    faces: Vec<[u32; 3]>,
+    vertex_faces: Vec<Vec<u32>>,
+    base_face_buckets: Vec<Vec<u32>>,
+    base_face_neighbors: Vec<Vec<usize>>,
+}
+
 // Ensures the planet data folder exists and migrates legacy files into it.
 fn ensure_planet_data_dir() {
     let _ = fs::create_dir_all(PLANET_DATA_DIR);
@@ -183,6 +194,7 @@ pub struct PlanetState {
     pub debug_enabled: bool,
     pub heightmap_texture: Option<Texture2D>,
     pub texture_config: PlanetNoiseConfig,
+    hex_grid: Option<HexGrid>,
     relief_cache: HashMap<ReliefCacheKey, ReliefCacheEntry>,
     pending_relief_key: Option<ReliefCacheKey>,
     regen_rx: Option<Receiver<RegenMessage>>,
@@ -247,6 +259,12 @@ impl PlanetState {
             .map(|face| face_normal(&sector_vertices, face))
             .collect::<Vec<_>>();
         let face_centers = build_face_centers(&sector_vertices, &sector_faces);
+        let base_faces = build_faces(&base_vertices, &icosahedron_edges());
+        let hex_grid = Some(load_or_build_hex_grid(
+            HOVER_GRID_HEXES_ACROSS,
+            &base_vertices,
+            &base_faces,
+        ));
         Self {
             yaw: 0.0,
             pitch: 0.3,
@@ -271,6 +289,7 @@ impl PlanetState {
             debug_enabled: PLANET_DEBUG_UI_ENABLED_DEFAULT,
             heightmap_texture: Some(heightmap_texture),
             texture_config: config,
+            hex_grid,
             relief_cache: HashMap::new(),
             pending_relief_key: None,
             regen_rx: None,
@@ -1058,6 +1077,284 @@ fn build_vertex_neighbors(faces: &[[usize; 3]], vertex_count: usize) -> Vec<Vec<
         .collect()
 }
 
+fn build_face_neighbors(faces: &[[usize; 3]]) -> Vec<Vec<usize>> {
+    let mut edge_map: HashMap<(usize, usize), Vec<usize>> = HashMap::new();
+    for (face_index, face) in faces.iter().enumerate() {
+        let edges = [
+            (face[0], face[1]),
+            (face[1], face[2]),
+            (face[2], face[0]),
+        ];
+        for (a, b) in edges {
+            let key = if a < b { (a, b) } else { (b, a) };
+            edge_map.entry(key).or_default().push(face_index);
+        }
+    }
+
+    let mut neighbors: Vec<HashSet<usize>> = vec![HashSet::new(); faces.len()];
+    for face_list in edge_map.values() {
+        if face_list.len() < 2 {
+            continue;
+        }
+        for i in 0..face_list.len() {
+            for j in (i + 1)..face_list.len() {
+                let a = face_list[i];
+                let b = face_list[j];
+                neighbors[a].insert(b);
+                neighbors[b].insert(a);
+            }
+        }
+    }
+
+    neighbors
+        .into_iter()
+        .map(|set| set.into_iter().collect())
+        .collect()
+}
+
+fn load_hex_grid_cache(freq: i32) -> Option<(Vec<Vec3>, Vec<[u32; 3]>)> {
+    let file = File::open(HEX_GRID_CACHE_PATH).ok()?;
+    let mut reader = BufReader::new(file);
+    let mut magic = [0u8; 4];
+    reader.read_exact(&mut magic).ok()?;
+    if &magic != b"HXG1" {
+        return None;
+    }
+    let mut read_u32 = |reader: &mut BufReader<File>| -> Option<u32> {
+        let mut buf = [0u8; 4];
+        reader.read_exact(&mut buf).ok()?;
+        Some(u32::from_le_bytes(buf))
+    };
+    let stored_freq = read_u32(&mut reader)? as i32;
+    if stored_freq != freq {
+        return None;
+    }
+    let vertex_count = read_u32(&mut reader)? as usize;
+    let face_count = read_u32(&mut reader)? as usize;
+    if vertex_count == 0 || face_count == 0 {
+        return None;
+    }
+    let mut vertices: Vec<Vec3> = Vec::with_capacity(vertex_count);
+    for _ in 0..vertex_count {
+        let mut buf = [0u8; 12];
+        reader.read_exact(&mut buf).ok()?;
+        let x = f32::from_le_bytes(buf[0..4].try_into().ok()?);
+        let y = f32::from_le_bytes(buf[4..8].try_into().ok()?);
+        let z = f32::from_le_bytes(buf[8..12].try_into().ok()?);
+        vertices.push(vec3(x, y, z));
+    }
+    let mut faces: Vec<[u32; 3]> = Vec::with_capacity(face_count);
+    for _ in 0..face_count {
+        let a = read_u32(&mut reader)?;
+        let b = read_u32(&mut reader)?;
+        let c = read_u32(&mut reader)?;
+        faces.push([a, b, c]);
+    }
+    Some((vertices, faces))
+}
+
+fn save_hex_grid_cache(freq: i32, vertices: &[Vec3], faces: &[[u32; 3]]) {
+    ensure_planet_data_dir();
+    let Ok(file) = File::create(HEX_GRID_CACHE_PATH) else {
+        return;
+    };
+    let mut writer = BufWriter::new(file);
+    let _ = writer.write_all(b"HXG1");
+    let _ = writer.write_all(&(freq as u32).to_le_bytes());
+    let _ = writer.write_all(&(vertices.len() as u32).to_le_bytes());
+    let _ = writer.write_all(&(faces.len() as u32).to_le_bytes());
+    for v in vertices {
+        let _ = writer.write_all(&v.x.to_le_bytes());
+        let _ = writer.write_all(&v.y.to_le_bytes());
+        let _ = writer.write_all(&v.z.to_le_bytes());
+    }
+    for face in faces {
+        let _ = writer.write_all(&face[0].to_le_bytes());
+        let _ = writer.write_all(&face[1].to_le_bytes());
+        let _ = writer.write_all(&face[2].to_le_bytes());
+    }
+    let _ = writer.flush();
+}
+
+fn build_frequency_geodesic(
+    freq: i32,
+    base_vertices: &[Vec3],
+    base_faces: &[[usize; 3]],
+) -> (Vec<Vec3>, Vec<[u32; 3]>) {
+    let freq = freq.max(1) as usize;
+    let mut vertices: Vec<Vec3> = base_vertices.iter().map(|v| v.normalize()).collect();
+    let mut faces: Vec<[u32; 3]> = Vec::new();
+    let mut edge_cache: HashMap<(usize, usize), Vec<usize>> = HashMap::new();
+
+    let mut edge_indices = |a: usize, b: usize,
+                            vertices: &mut Vec<Vec3>,
+                            edge_cache: &mut HashMap<(usize, usize), Vec<usize>>|
+     -> Vec<usize> {
+        let key = if a < b { (a, b) } else { (b, a) };
+        if let Some(indices) = edge_cache.get(&key) {
+            if a < b {
+                return indices.clone();
+            }
+            let mut reversed = indices.clone();
+            reversed.reverse();
+            return reversed;
+        }
+        let va = base_vertices[a].normalize();
+        let vb = base_vertices[b].normalize();
+        let mut indices: Vec<usize> = Vec::with_capacity(freq + 1);
+        for t in 0..=freq {
+            if t == 0 {
+                indices.push(a);
+                continue;
+            }
+            if t == freq {
+                indices.push(b);
+                continue;
+            }
+            let alpha = t as f32 / freq as f32;
+            let pos = (va * (1.0 - alpha) + vb * alpha).normalize();
+            let idx = vertices.len();
+            vertices.push(pos);
+            indices.push(idx);
+        }
+        edge_cache.insert(key, indices.clone());
+        if a < b {
+            indices
+        } else {
+            let mut reversed = indices;
+            reversed.reverse();
+            reversed
+        }
+    };
+
+    for face in base_faces {
+        let a = face[0];
+        let b = face[1];
+        let c = face[2];
+        let ab = edge_indices(a, b, &mut vertices, &mut edge_cache);
+        let ac = edge_indices(a, c, &mut vertices, &mut edge_cache);
+        let bc = edge_indices(b, c, &mut vertices, &mut edge_cache);
+
+        let va = base_vertices[a].normalize();
+        let vb = base_vertices[b].normalize();
+        let vc = base_vertices[c].normalize();
+        let mut grid: Vec<Vec<usize>> = Vec::with_capacity(freq + 1);
+        for i in 0..=freq {
+            grid.push(vec![0usize; freq + 1 - i]);
+        }
+
+        for i in 0..=freq {
+            for j in 0..=freq - i {
+                let index = if j == 0 {
+                    ab[i]
+                } else if i == 0 {
+                    ac[j]
+                } else if i + j == freq {
+                    bc[j]
+                } else {
+                    let wa = (freq - i - j) as f32 / freq as f32;
+                    let wb = i as f32 / freq as f32;
+                    let wc = j as f32 / freq as f32;
+                    let pos = (va * wa + vb * wb + vc * wc).normalize();
+                    let idx = vertices.len();
+                    vertices.push(pos);
+                    idx
+                };
+                grid[i][j] = index;
+            }
+        }
+
+        for i in 0..freq {
+            for j in 0..(freq - i) {
+                let v0 = grid[i][j] as u32;
+                let v1 = grid[i + 1][j] as u32;
+                let v2 = grid[i][j + 1] as u32;
+                faces.push([v0, v1, v2]);
+                if i + j < freq - 1 {
+                    let v3 = grid[i + 1][j + 1] as u32;
+                    faces.push([v1, v3, v2]);
+                }
+            }
+        }
+    }
+
+    (vertices, faces)
+}
+
+fn build_hex_grid_from_data(
+    freq: i32,
+    vertices: Vec<Vec3>,
+    faces: Vec<[u32; 3]>,
+    base_vertices: &[Vec3],
+    base_faces: &[[usize; 3]],
+) -> HexGrid {
+    let mut vertex_faces: Vec<Vec<u32>> = vec![Vec::new(); vertices.len()];
+    for (index, face) in faces.iter().enumerate() {
+        let idx = index as u32;
+        vertex_faces[face[0] as usize].push(idx);
+        vertex_faces[face[1] as usize].push(idx);
+        vertex_faces[face[2] as usize].push(idx);
+    }
+
+    let base_face_normals = base_faces
+        .iter()
+        .copied()
+        .map(|face| face_normal(base_vertices, face))
+        .collect::<Vec<_>>();
+    let base_face_neighbors = build_face_neighbors(base_faces);
+    let mut base_face_buckets: Vec<Vec<u32>> = vec![Vec::new(); base_faces.len()];
+    for (index, dir) in vertices.iter().enumerate() {
+        let mut best_face = 0usize;
+        let mut best_dot = -1.0_f32;
+        for (face_index, normal) in base_face_normals.iter().enumerate() {
+            let dot = dir.dot(*normal);
+            if dot > best_dot {
+                best_dot = dot;
+                best_face = face_index;
+            }
+        }
+        base_face_buckets[best_face].push(index as u32);
+    }
+
+    HexGrid {
+        freq,
+        vertices,
+        faces,
+        vertex_faces,
+        base_face_buckets,
+        base_face_neighbors,
+    }
+}
+
+fn load_or_build_hex_grid(
+    freq: i32,
+    base_vertices: &[Vec3],
+    base_faces: &[[usize; 3]],
+) -> HexGrid {
+    let t0 = Instant::now();
+    if let Some((vertices, faces)) = load_hex_grid_cache(freq) {
+        planet_perf_log(&format!(
+            "hex grid cache loaded freq={} vertices={} faces={} took_ms={}",
+            freq,
+            vertices.len(),
+            faces.len(),
+            t0.elapsed().as_millis()
+        ));
+        return build_hex_grid_from_data(freq, vertices, faces, base_vertices, base_faces);
+    }
+
+    let (vertices, faces) = build_frequency_geodesic(freq, base_vertices, base_faces);
+    save_hex_grid_cache(freq, &vertices, &faces);
+    planet_perf_log(&format!(
+        "hex grid built freq={} vertices={} faces={} took_ms={}",
+        freq,
+        vertices.len(),
+        faces.len(),
+        t0.elapsed().as_millis()
+    ));
+    build_hex_grid_from_data(freq, vertices, faces, base_vertices, base_faces)
+}
+
 #[derive(Debug, Clone)]
 struct MeshData {
     vertices: Vec<Vertex>,
@@ -1305,231 +1602,94 @@ fn barycentric_coords_2d(p: Vec2, a: Vec2, b: Vec2, c: Vec2) -> Option<(f32, f32
     Some((wa, wb, wc))
 }
 
-// Draws a flat hex grid on the hovered face using planet-relative axes.
-fn draw_flat_hex_grid_on_face(
-    face_vertices: [Vec3; 3],
-    global_vertices: &[Vec3],
+fn draw_global_hex_cell(
+    hex_grid: &HexGrid,
     camera: &Camera3D,
     color: Color,
     line_thickness: f32,
-    hexes_across: i32,
     overlay_radius: f32,
     surface_radius: f32,
     hover_hit: Option<Vec3>,
+    hovered_base_face: Option<usize>,
 ) {
     let Some(hover_hit) = hover_hit else {
         return;
     };
-    if hexes_across < 2 || global_vertices.is_empty() {
+    let Some(face_index) = hovered_base_face else {
         return;
-    }
-    // Reorder so AB is the shortest side; this becomes the density baseline.
-    let [a, b, c] = {
-        let [v0, v1, v2] = face_vertices;
-        let l01 = (v1 - v0).length();
-        let l12 = (v2 - v1).length();
-        let l20 = (v0 - v2).length();
-        if l01 <= l12 && l01 <= l20 {
-            [v0, v1, v2]
-        } else if l12 <= l01 && l12 <= l20 {
-            [v1, v2, v0]
-        } else {
-            [v2, v0, v1]
-        }
     };
-    let mapping_radius = overlay_radius;
-    let a_dir = a.normalize();
-    let b_dir = b.normalize();
-    let c_dir = c.normalize();
-    let edge_angle_ab = a_dir.dot(b_dir).clamp(-1.0, 1.0).acos();
-    let edge_angle_bc = b_dir.dot(c_dir).clamp(-1.0, 1.0).acos();
-    let edge_angle_ca = c_dir.dot(a_dir).clamp(-1.0, 1.0).acos();
-    let shortest_side = edge_angle_ab.min(edge_angle_bc.min(edge_angle_ca)) * mapping_radius;
-    if shortest_side <= 1e-5 {
-        return;
+    let hover_dir = hover_hit.normalize();
+
+    let mut candidates: Vec<u32> = Vec::new();
+    candidates.extend(hex_grid.base_face_buckets[face_index].iter().copied());
+    for &neighbor in hex_grid.base_face_neighbors[face_index].iter() {
+        candidates.extend(hex_grid.base_face_buckets[neighbor].iter().copied());
     }
-    let side = shortest_side;
-    let ref_a = vec2(0.0, 0.0);
-    let ref_b = vec2(side, 0.0);
-    let ref_c = vec2(side * 0.5, side * 0.866_025_4);
-    let size = side / (SQRT_3 * hexes_across as f32);
-    if size <= 1e-5 {
+    if candidates.is_empty() {
         return;
     }
 
-    let mut centers_ref: Vec<Vec2> = Vec::new();
-    // Ensure a hex center at each triangle tip.
-    centers_ref.push(ref_a);
-    centers_ref.push(ref_b);
-    centers_ref.push(ref_c);
-
-    let ref_height = side * 0.866_025_4;
-    let max_q = ((side / (SQRT_3 * size)).ceil() as i32) + 3;
-    let max_r = ((ref_height / (1.5 * size)).ceil() as i32) + 3;
-    for r in -max_r..=max_r {
-        for q in -max_q..=max_q {
-            let p2 = axial_to_plane(q, r, size);
-            if !point_in_triangle_2d(p2, ref_a, ref_b, ref_c) {
-                continue;
-            }
-            centers_ref.push(p2);
-        }
-    }
-
-    let mut unique_centers: Vec<Vec2> = Vec::new();
-    let mut dedupe: HashSet<(i32, i32)> = HashSet::new();
-    for center_ref in centers_ref {
-        let key_scale = (size * 0.2).max(1e-5);
-        let key = (
-            (center_ref.x / key_scale).round() as i32,
-            (center_ref.y / key_scale).round() as i32,
-        );
-        if dedupe.insert(key) {
-            unique_centers.push(center_ref);
-        }
-    }
-    if unique_centers.is_empty() {
-        return;
-    }
-
-    let hit_dir = hover_hit.normalize();
-    let mut selected_center_ref = unique_centers[0];
-    let mut selected_dir = None;
+    let mut best_index = candidates[0];
     let mut best_dot = -1.0_f32;
-    for center_ref in unique_centers.into_iter() {
-        let Some((wa, wb, wc)) = barycentric_coords_2d(center_ref, ref_a, ref_b, ref_c) else {
-            continue;
-        };
-        let dir = (a_dir * wa + b_dir * wb + c_dir * wc).normalize();
-        let dot = dir.dot(hit_dir);
+    for index in candidates {
+        let dir = hex_grid.vertices[index as usize];
+        let dot = dir.dot(hover_dir);
         if dot > best_dot {
             best_dot = dot;
-            selected_center_ref = center_ref;
-            selected_dir = Some(dir);
-        }
-    }
-    let Some(center_dir) = selected_dir else {
-        return;
-    };
-    let center_ref = selected_center_ref;
-    let center_surface = center_dir * surface_radius;
-    let normal = center_dir;
-    let mut local_tangent_x = a_dir - normal * normal.dot(a_dir);
-    if local_tangent_x.length() < 1e-5 {
-        local_tangent_x = b_dir - normal * normal.dot(b_dir);
-    }
-    if local_tangent_x.length() < 1e-5 {
-        local_tangent_x = c_dir - normal * normal.dot(c_dir);
-    }
-    if local_tangent_x.length() < 1e-5 {
-        return;
-    }
-    local_tangent_x = local_tangent_x.normalize();
-    let local_tangent_y = normal.cross(local_tangent_x).normalize();
-    if local_tangent_y.length() < 1e-5 {
-        return;
-    }
-
-    let Some((u_wa, u_wb, u_wc)) =
-        barycentric_coords_2d(center_ref + vec2(size, 0.0), ref_a, ref_b, ref_c)
-    else {
-        return;
-    };
-    let sample_u_dir = (a_dir * u_wa + b_dir * u_wb + c_dir * u_wc).normalize();
-    let sample_u_surface = sample_u_dir * surface_radius;
-
-    let Some((v_wa, v_wb, v_wc)) =
-        barycentric_coords_2d(center_ref + vec2(0.0, size), ref_a, ref_b, ref_c)
-    else {
-        return;
-    };
-    let sample_v_dir = (a_dir * v_wa + b_dir * v_wb + c_dir * v_wc).normalize();
-    let sample_v_surface = sample_v_dir * surface_radius;
-
-    let cell_step_world =
-        ((sample_u_surface - center_surface).length() + (sample_v_surface - center_surface).length())
-            * 0.5;
-    let vertex_snap_threshold = (cell_step_world * 0.35).max(1e-4);
-
-    let mut matched_global_vertex: Option<usize> = None;
-    let mut best_dist = f32::MAX;
-    for (idx, vertex) in global_vertices.iter().enumerate() {
-        let vertex_surface = vertex.normalize() * surface_radius;
-        let dist = (vertex_surface - center_surface).length();
-        if dist < best_dist {
-            best_dist = dist;
-            matched_global_vertex = Some(idx);
-        }
-    }
-    let use_pentagon = best_dist <= vertex_snap_threshold;
-    let sides = if use_pentagon { 5usize } else { 6usize };
-    let draw_radius = size * 0.95;
-
-    let global_edges = icosahedron_edges();
-    let pent_step = std::f32::consts::TAU / 5.0;
-    let mut angle_offset = -std::f32::consts::PI / 6.0;
-    if use_pentagon {
-        angle_offset = -std::f32::consts::FRAC_PI_2;
-        if let Some(vertex_index) = matched_global_vertex {
-            let vertex_pos = global_vertices[vertex_index].normalize() * surface_radius;
-            let mut neighbor_angles: Vec<f32> = Vec::new();
-            for (ea, eb) in global_edges.iter().copied() {
-                let neighbor_index = if ea == vertex_index {
-                    Some(eb)
-                } else if eb == vertex_index {
-                    Some(ea)
-                } else {
-                    None
-                };
-                let Some(neighbor_index) = neighbor_index else {
-                    continue;
-                };
-                let neighbor_pos = global_vertices[neighbor_index].normalize() * surface_radius;
-                let dir_world = (neighbor_pos - vertex_pos).normalize();
-                let tangent_dir = dir_world - normal * normal.dot(dir_world);
-                if tangent_dir.length() < 1e-5 {
-                    continue;
-                }
-                let tangent_dir = tangent_dir.normalize();
-                let x = tangent_dir.dot(local_tangent_x);
-                let y = tangent_dir.dot(local_tangent_y);
-                neighbor_angles.push(y.atan2(x));
-            }
-            if !neighbor_angles.is_empty() {
-                neighbor_angles.sort_by(|lhs, rhs| {
-                    lhs.partial_cmp(rhs).unwrap_or(std::cmp::Ordering::Equal)
-                });
-                let mut best_error = f32::MAX;
-                let mut best_offset = angle_offset;
-                for start in 0..neighbor_angles.len() {
-                    let candidate = neighbor_angles[start] - 0.5 * pent_step;
-                    let mut error = 0.0;
-                    for i in 0..neighbor_angles.len() {
-                        let idx = (start + i) % neighbor_angles.len();
-                        let expected = candidate + pent_step * (i as f32 + 0.5);
-                        error += wrap_angle(neighbor_angles[idx] - expected).abs();
-                    }
-                    if error < best_error {
-                        best_error = error;
-                        best_offset = candidate;
-                    }
-                }
-                angle_offset = best_offset;
-            }
+            best_index = index;
         }
     }
 
-    let mut outer_screen: Vec<Vec2> = Vec::with_capacity(sides);
-    let mut inner_screen: Vec<Vec2> = Vec::with_capacity(sides);
-    for i in 0..sides {
-        let angle = angle_offset + (i as f32 / sides as f32) * std::f32::consts::TAU;
-        let corner_ref = center_ref + vec2(draw_radius * angle.cos(), draw_radius * angle.sin());
-        let Some((cwa, cwb, cwc)) = barycentric_coords_2d(corner_ref, ref_a, ref_b, ref_c) else {
+    let vertex_dir = hex_grid.vertices[best_index as usize];
+    let face_list = &hex_grid.vertex_faces[best_index as usize];
+    if face_list.len() < 3 {
+        return;
+    }
+
+    let mut centers: Vec<Vec3> = Vec::with_capacity(face_list.len());
+    for &face_index in face_list {
+        let face = hex_grid.faces[face_index as usize];
+        let v0 = hex_grid.vertices[face[0] as usize];
+        let v1 = hex_grid.vertices[face[1] as usize];
+        let v2 = hex_grid.vertices[face[2] as usize];
+        let center = (v0 + v1 + v2).normalize();
+        centers.push(center);
+    }
+
+    let mut tangent_x = Vec3::ZERO;
+    for center in centers.iter() {
+        let candidate = *center - vertex_dir * vertex_dir.dot(*center);
+        if candidate.length() > 1e-5 {
+            tangent_x = candidate.normalize();
+            break;
+        }
+    }
+    if tangent_x.length() < 1e-5 {
+        let fallback = vec3(0.0, 1.0, 0.0) - vertex_dir * vertex_dir.dot(vec3(0.0, 1.0, 0.0));
+        if fallback.length() < 1e-5 {
             return;
-        };
-        let corner_dir = (a_dir * cwa + b_dir * cwb + c_dir * cwc).normalize();
-        let world_outer = corner_dir * overlay_radius;
-        let world_inner = corner_dir * surface_radius;
+        }
+        tangent_x = fallback.normalize();
+    }
+    let tangent_y = vertex_dir.cross(tangent_x).normalize();
+    if tangent_y.length() < 1e-5 {
+        return;
+    }
+
+    let mut ordered: Vec<(f32, Vec3)> = centers
+        .into_iter()
+        .map(|center| {
+            let angle = center.dot(tangent_y).atan2(center.dot(tangent_x));
+            (angle, center)
+        })
+        .collect();
+    ordered.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+
+    let mut outer_screen: Vec<Vec2> = Vec::with_capacity(ordered.len());
+    let mut inner_screen: Vec<Vec2> = Vec::with_capacity(ordered.len());
+    for (_, dir) in ordered.iter() {
+        let world_outer = *dir * overlay_radius;
+        let world_inner = *dir * surface_radius;
         let Some(screen_outer) = project_to_screen(camera, world_outer) else {
             return;
         };
@@ -1540,6 +1700,7 @@ fn draw_flat_hex_grid_on_face(
         inner_screen.push(screen_inner);
     }
 
+    let sides = outer_screen.len();
     for i in 0..sides {
         let p0 = outer_screen[i];
         let p1 = outer_screen[(i + 1) % sides];
@@ -2085,7 +2246,6 @@ pub fn run(
     let use_subface_hover = state.distance <= SUBFACE_HOVER_MAX_DISTANCE;
     let mut hovered_subface: Option<usize> = None;
     let mut hovered_base_face: Option<usize> = None;
-    let mut hover_grid_face: Option<[Vec3; 3]> = None;
     let mut hover_hit: Option<Vec3> = None;
     if let Some((origin, dir)) = ray_from_mouse(&camera, mouse) {
         if let Some(hit) = ray_sphere_intersection(origin, dir, radius) {
@@ -2115,16 +2275,6 @@ pub fn run(
         draw_arc_on_sphere(c, a, line_radius, segments, hover_color);
     }
     let show_hover_grid = state.distance <= NEAR_GRID_DISTANCE;
-    if show_hover_grid {
-        if let Some(face_index) = hovered_base_face {
-            let face = base_faces[face_index];
-            hover_grid_face = Some([
-                projected_base[face[0]],
-                projected_base[face[1]],
-                projected_base[face[2]],
-            ]);
-        }
-    }
     if is_mouse_button_pressed(MouseButton::Left) {
         if let Some(face_index) = hovered_subface {
             let face = faces[face_index];
@@ -2140,18 +2290,19 @@ pub fn run(
     }
 
     set_default_camera();
-    if let Some(face_vertices) = hover_grid_face {
-        draw_flat_hex_grid_on_face(
-            face_vertices,
-            &projected_base,
-            &camera,
-            grid_color,
-            1.2,
-            HOVER_GRID_HEXES_ACROSS,
-            line_radius,
-            radius,
-            hover_hit,
-        );
+    if show_hover_grid {
+        if let Some(hex_grid) = state.hex_grid.as_ref() {
+            draw_global_hex_cell(
+                hex_grid,
+                &camera,
+                grid_color,
+                1.2,
+                line_radius,
+                radius,
+                hover_hit,
+                hovered_base_face,
+            );
+        }
     }
     if state.debug_enabled {
         draw_planet_controls(ctx, state, PLANET_NOISE_PATH);

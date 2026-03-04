@@ -31,7 +31,7 @@ const REGEN_FACE_GRAIN: usize = 12;
 const ICOSAHEDRON_FACE_COUNT: usize = 20;
 const SUBFACE_HOVER_MAX_DISTANCE: f32 = 5.6;
 const NEAR_GRID_DISTANCE: f32 = 2.4;
-const HOVER_GRID_HEXES_ACROSS: i32 = 20;
+const HOVER_GRID_HEXES_ACROSS: i32 = 320;
 const PLANET_OVERLAY_OFFSET: f32 = 0.01;
 
 // Wraps an angle to the [-PI, PI] range for smooth camera interpolation.
@@ -1337,30 +1337,14 @@ fn draw_flat_hex_grid_on_face(
             [v2, v0, v1]
         }
     };
-    let mut normal = (b - a).cross(c - a);
-    if normal.length() < 1e-5 {
-        return;
-    }
-    normal = normal.normalize();
-    let center = (a + b + c) / 3.0;
-    if normal.dot(center) < 0.0 {
-        normal = -normal;
-    }
-    // Planet-relative axes: u from shortest face edge, v from face normal.
-    let mut u = b - a;
-    if u.length() < 1e-5 {
-        return;
-    }
-    u = u.normalize();
-    let v = normal.cross(u).normalize();
-    if v.length() < 1e-5 {
-        return;
-    }
-    let a2 = vec2((a - center).dot(u), (a - center).dot(v));
-    let b2 = vec2((b - center).dot(u), (b - center).dot(v));
-    let c2 = vec2((c - center).dot(u), (c - center).dot(v));
-
-    let shortest_side = (b2 - a2).length();
+    let mapping_radius = overlay_radius;
+    let a_dir = a.normalize();
+    let b_dir = b.normalize();
+    let c_dir = c.normalize();
+    let edge_angle_ab = a_dir.dot(b_dir).clamp(-1.0, 1.0).acos();
+    let edge_angle_bc = b_dir.dot(c_dir).clamp(-1.0, 1.0).acos();
+    let edge_angle_ca = c_dir.dot(a_dir).clamp(-1.0, 1.0).acos();
+    let shortest_side = edge_angle_ab.min(edge_angle_bc.min(edge_angle_ca)) * mapping_radius;
     if shortest_side <= 1e-5 {
         return;
     }
@@ -1408,44 +1392,41 @@ fn draw_flat_hex_grid_on_face(
         return;
     }
 
-    let hit_surface = hover_hit.normalize() * surface_radius;
-    let hit_dst = vec2((hit_surface - center).dot(u), (hit_surface - center).dot(v));
-    let Some((hwa, hwb, hwc)) = barycentric_coords_2d(hit_dst, a2, b2, c2) else {
-        return;
-    };
-    let hit_ref = ref_a * hwa + ref_b * hwb + ref_c * hwc;
-
+    let hit_dir = hover_hit.normalize();
     let mut selected_center_ref = unique_centers[0];
-    let mut selected_dist = (selected_center_ref - hit_ref).length_squared();
-    for center_ref in unique_centers.into_iter().skip(1) {
-        let dist = (center_ref - hit_ref).length_squared();
-        if dist < selected_dist {
-            selected_dist = dist;
+    let mut selected_dir = None;
+    let mut best_dot = -1.0_f32;
+    for center_ref in unique_centers.into_iter() {
+        let Some((wa, wb, wc)) = barycentric_coords_2d(center_ref, ref_a, ref_b, ref_c) else {
+            continue;
+        };
+        let dir = (a_dir * wa + b_dir * wb + c_dir * wc).normalize();
+        let dot = dir.dot(hit_dir);
+        if dot > best_dot {
+            best_dot = dot;
             selected_center_ref = center_ref;
+            selected_dir = Some(dir);
         }
     }
-
-    let center_ref = selected_center_ref;
-    let Some((wa, wb, wc)) = barycentric_coords_2d(center_ref, ref_a, ref_b, ref_c) else {
+    let Some(center_dir) = selected_dir else {
         return;
     };
-    let center_dst = a2 * wa + b2 * wb + c2 * wc;
-    let center_surface =
-        (center + u * center_dst.x + v * center_dst.y).normalize() * surface_radius;
-    let normal = center_surface.normalize();
-    let mut tangent_x = u - normal * normal.dot(u);
-    if tangent_x.length() < 1e-5 {
-        tangent_x = vec3(0.0, 1.0, 0.0) - normal * normal.dot(vec3(0.0, 1.0, 0.0));
+    let center_ref = selected_center_ref;
+    let center_surface = center_dir * surface_radius;
+    let normal = center_dir;
+    let mut local_tangent_x = a_dir - normal * normal.dot(a_dir);
+    if local_tangent_x.length() < 1e-5 {
+        local_tangent_x = b_dir - normal * normal.dot(b_dir);
     }
-    if tangent_x.length() < 1e-5 {
-        tangent_x = vec3(1.0, 0.0, 0.0) - normal * normal.dot(vec3(1.0, 0.0, 0.0));
+    if local_tangent_x.length() < 1e-5 {
+        local_tangent_x = c_dir - normal * normal.dot(c_dir);
     }
-    if tangent_x.length() < 1e-5 {
+    if local_tangent_x.length() < 1e-5 {
         return;
     }
-    tangent_x = tangent_x.normalize();
-    let tangent_y = normal.cross(tangent_x).normalize();
-    if tangent_y.length() < 1e-5 {
+    local_tangent_x = local_tangent_x.normalize();
+    let local_tangent_y = normal.cross(local_tangent_x).normalize();
+    if local_tangent_y.length() < 1e-5 {
         return;
     }
 
@@ -1454,18 +1435,16 @@ fn draw_flat_hex_grid_on_face(
     else {
         return;
     };
-    let sample_u_dst = a2 * u_wa + b2 * u_wb + c2 * u_wc;
-    let sample_u_surface =
-        (center + u * sample_u_dst.x + v * sample_u_dst.y).normalize() * surface_radius;
+    let sample_u_dir = (a_dir * u_wa + b_dir * u_wb + c_dir * u_wc).normalize();
+    let sample_u_surface = sample_u_dir * surface_radius;
 
     let Some((v_wa, v_wb, v_wc)) =
         barycentric_coords_2d(center_ref + vec2(0.0, size), ref_a, ref_b, ref_c)
     else {
         return;
     };
-    let sample_v_dst = a2 * v_wa + b2 * v_wb + c2 * v_wc;
-    let sample_v_surface =
-        (center + u * sample_v_dst.x + v * sample_v_dst.y).normalize() * surface_radius;
+    let sample_v_dir = (a_dir * v_wa + b_dir * v_wb + c_dir * v_wc).normalize();
+    let sample_v_surface = sample_v_dir * surface_radius;
 
     let cell_step_world =
         ((sample_u_surface - center_surface).length() + (sample_v_surface - center_surface).length())
@@ -1475,7 +1454,8 @@ fn draw_flat_hex_grid_on_face(
     let mut matched_global_vertex: Option<usize> = None;
     let mut best_dist = f32::MAX;
     for (idx, vertex) in global_vertices.iter().enumerate() {
-        let dist = (*vertex - center_surface).length();
+        let vertex_surface = vertex.normalize() * surface_radius;
+        let dist = (vertex_surface - center_surface).length();
         if dist < best_dist {
             best_dist = dist;
             matched_global_vertex = Some(idx);
@@ -1491,7 +1471,7 @@ fn draw_flat_hex_grid_on_face(
     if use_pentagon {
         angle_offset = -std::f32::consts::FRAC_PI_2;
         if let Some(vertex_index) = matched_global_vertex {
-            let vertex_pos = global_vertices[vertex_index];
+            let vertex_pos = global_vertices[vertex_index].normalize() * surface_radius;
             let mut neighbor_angles: Vec<f32> = Vec::new();
             for (ea, eb) in global_edges.iter().copied() {
                 let neighbor_index = if ea == vertex_index {
@@ -1504,14 +1484,15 @@ fn draw_flat_hex_grid_on_face(
                 let Some(neighbor_index) = neighbor_index else {
                     continue;
                 };
-                let dir_world = (global_vertices[neighbor_index] - vertex_pos).normalize();
+                let neighbor_pos = global_vertices[neighbor_index].normalize() * surface_radius;
+                let dir_world = (neighbor_pos - vertex_pos).normalize();
                 let tangent_dir = dir_world - normal * normal.dot(dir_world);
                 if tangent_dir.length() < 1e-5 {
                     continue;
                 }
                 let tangent_dir = tangent_dir.normalize();
-                let x = tangent_dir.dot(tangent_x);
-                let y = tangent_dir.dot(tangent_y);
+                let x = tangent_dir.dot(local_tangent_x);
+                let y = tangent_dir.dot(local_tangent_y);
                 neighbor_angles.push(y.atan2(x));
             }
             if !neighbor_angles.is_empty() {
@@ -1546,11 +1527,9 @@ fn draw_flat_hex_grid_on_face(
         let Some((cwa, cwb, cwc)) = barycentric_coords_2d(corner_ref, ref_a, ref_b, ref_c) else {
             return;
         };
-        let corner_dst = a2 * cwa + b2 * cwb + c2 * cwc;
-        let corner_delta = corner_dst - center_dst;
-        let corner_surface = center_surface + tangent_x * corner_delta.x + tangent_y * corner_delta.y;
-        let world_outer = corner_surface.normalize() * overlay_radius;
-        let world_inner = corner_surface.normalize() * surface_radius;
+        let corner_dir = (a_dir * cwa + b_dir * cwb + c_dir * cwc).normalize();
+        let world_outer = corner_dir * overlay_radius;
+        let world_inner = corner_dir * surface_radius;
         let Some(screen_outer) = project_to_screen(camera, world_outer) else {
             return;
         };
@@ -2111,10 +2090,9 @@ pub fn run(
     if let Some((origin, dir)) = ray_from_mouse(&camera, mouse) {
         if let Some(hit) = ray_sphere_intersection(origin, dir, radius) {
             hover_hit = Some(hit);
+            hovered_base_face = hovered_face(hit, &base_faces, base_vertices);
             if use_subface_hover {
                 hovered_subface = hovered_face(hit, &faces, vertices);
-            } else {
-                hovered_base_face = hovered_face(hit, &base_faces, base_vertices);
             }
         }
     }
@@ -2138,14 +2116,7 @@ pub fn run(
     }
     let show_hover_grid = state.distance <= NEAR_GRID_DISTANCE;
     if show_hover_grid {
-        if let Some(face_index) = hovered_subface {
-            let face = faces[face_index];
-            hover_grid_face = Some([
-                projected_sector[face[0]],
-                projected_sector[face[1]],
-                projected_sector[face[2]],
-            ]);
-        } else if let Some(face_index) = hovered_base_face {
+        if let Some(face_index) = hovered_base_face {
             let face = base_faces[face_index];
             hover_grid_face = Some([
                 projected_base[face[0]],

@@ -297,7 +297,7 @@ pub fn load_hex_grid_cache(
     if &magic != b"HXG1" {
         return None;
     }
-    let mut read_u32 = |reader: &mut BufReader<File>| -> Option<u32> {
+    let read_u32 = |reader: &mut BufReader<File>| -> Option<u32> {
         let mut buf = [0u8; 4];
         reader.read_exact(&mut buf).ok()?;
         Some(u32::from_le_bytes(buf))
@@ -362,7 +362,7 @@ pub fn build_frequency_geodesic(
     let mut faces: Vec<[u32; 3]> = Vec::new();
     let mut edge_cache: HashMap<(usize, usize), Vec<usize>> = HashMap::new();
 
-    let mut edge_indices = |a: usize,
+    let edge_indices = |a: usize,
                             b: usize,
                             vertices: &mut Vec<Vec3>,
                             edge_cache: &mut HashMap<(usize, usize), Vec<usize>>|

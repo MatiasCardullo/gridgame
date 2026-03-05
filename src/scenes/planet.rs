@@ -1,6 +1,6 @@
 use macroquad::prelude::*;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fs;
 use std::fs::File;
 use std::io::{BufWriter, Write};
@@ -40,15 +40,6 @@ const HOVER_GRID_HEXES_ACROSS: i32 = 320;
 const PLANET_OVERLAY_OFFSET: f32 = 0.01;
 
 // Wraps an angle to the [-PI, PI] range for smooth camera interpolation.
-fn wrap_angle(mut angle: f32) -> f32 {
-    let two_pi = std::f32::consts::PI * 2.0;
-    angle = (angle + std::f32::consts::PI) % two_pi;
-    if angle < 0.0 {
-        angle += two_pi;
-    }
-    angle - std::f32::consts::PI
-}
-
 fn quat_from_forward_up(forward: Vec3, up: Vec3) -> Quat {
     let forward = forward.normalize();
     let mut up = up - forward * forward.dot(up);

@@ -19,8 +19,9 @@ Hex-grid strategy game built with Rust and Macroquad. Build structures, extract 
 2. Right click: place a block or start demolish (when "Demolish" is selected).
 3. Mouse wheel: zoom.
 4. Middle mouse (drag): pan camera.
-5. `R`: rotate placement.
-6. `Esc`: back to menu (saves the game).
+5. Arrow keys: rotate planet camera.
+6. `R`: rotate placement.
+7. `Esc`: back to menu (saves the game).
 
 **Notes**
 1. Mines can expand their attached zones from the block window.
@@ -34,3 +35,6 @@ Hex-grid strategy game built with Rust and Macroquad. Build structures, extract 
 3. Optional runtime artifacts:
 4. `planet_data/planet_perf.log` for perf/hitch logging.
 5. `planet_data/planet_mesh_points.csv` only when mesh-point export is enabled.
+
+**Roadmap Notes**
+1. `planet_sector.rs` will be deprecated in favor of the 3D `planet.rs` scene now that the global hex grid exists.

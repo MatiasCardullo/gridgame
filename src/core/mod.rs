@@ -7,6 +7,9 @@ use serde::{Deserialize, Serialize};
 pub mod ui;
 pub mod debug;
 pub mod planet_grid;
+pub mod map_common;
+pub mod planet_texture;
+pub mod planet_sector_units;
 
 use crate::SQRT_3;
 use crate::core::ui::UiButtonColors;

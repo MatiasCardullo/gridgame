@@ -6,7 +6,7 @@ use crate::core::{
 };
 use crate::core::ui::{draw_log_panel, draw_progress_bar, ui_button};
 use crate::TRI_LENGHT;
-use crate::scenes::map_common::{outline_start_offset, MapOutline};
+use crate::core::map_common::{outline_start_offset, MapOutline};
 use std::collections::HashMap;
 
 // Render and handle input for the main menu scene.

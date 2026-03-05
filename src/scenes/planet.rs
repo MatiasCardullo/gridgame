@@ -10,7 +10,6 @@ use std::sync::Arc;
 use std::time::{Instant, SystemTime};
 
 use crate::core::{FrameContext, Scene};
-use crate::SQRT_3;
 use crate::core::debug::{
     draw_planet_controls, format_log_timestamp, planet_perf_log, PLANET_DEBUG_UI_ENABLED_DEFAULT,
     SAVE_MESH_POINTS_RUNTIME,
@@ -20,7 +19,7 @@ use crate::core::planet_grid::{
     build_hex_grid_from_data, icosahedron_edges, icosahedron_vertices, load_hex_grid_cache,
     save_hex_grid_cache,
 };
-use crate::scenes::planet_texture::{
+use crate::core::planet_texture::{
     PlanetNoiseConfig, color_from_height, height_value, load_or_build_heightmap, texture_params_match,
 };
 
@@ -48,6 +47,22 @@ fn wrap_angle(mut angle: f32) -> f32 {
         angle += two_pi;
     }
     angle - std::f32::consts::PI
+}
+
+fn quat_from_forward_up(forward: Vec3, up: Vec3) -> Quat {
+    let forward = forward.normalize();
+    let mut up = up - forward * forward.dot(up);
+    if up.length() < 1e-5 {
+        up = vec3(1.0, 0.0, 0.0) - forward * forward.dot(vec3(1.0, 0.0, 0.0));
+    }
+    if up.length() < 1e-5 {
+        up = vec3(0.0, 0.0, 1.0) - forward * forward.dot(vec3(0.0, 0.0, 1.0));
+    }
+    let up = up.normalize();
+    let right = up.cross(forward).normalize();
+    let up = forward.cross(right).normalize();
+    let mat = Mat3::from_cols(right, up, forward);
+    Quat::from_mat3(&mat)
 }
 
 
@@ -159,12 +174,10 @@ pub struct PlanetLoader {
 }
 
 pub struct PlanetState {
-    pub yaw: f32,
-    pub pitch: f32,
+    pub camera_rot: Quat,
+    pub target_rot: Quat,
     pub distance: f32,
     pub target_distance: f32,
-    pub target_yaw: f32,
-    pub target_pitch: f32,
     pub dragging: bool,
     pub last_mouse: Vec2,
     pub config: PlanetNoiseConfig,
@@ -254,13 +267,12 @@ impl PlanetState {
             &base_vertices,
             &base_faces,
         ));
+        let initial_rot = Quat::from_rotation_y(0.0) * Quat::from_rotation_x(0.3);
         Self {
-            yaw: 0.0,
-            pitch: 0.3,
+            camera_rot: initial_rot,
+            target_rot: initial_rot,
             distance: 6.0,
             target_distance: 6.0,
-            target_yaw: 0.0,
-            target_pitch: 0.3,
             dragging: false,
             last_mouse: Vec2::ZERO,
             config,
@@ -1170,36 +1182,6 @@ fn great_circle_point(start: Vec3, end: Vec3, t: f32) -> Vec3 {
     }
 }
 
-// Converts axial hex coordinates to 2D plane coordinates.
-fn axial_to_plane(q: i32, r: i32, size: f32) -> Vec2 {
-    let q = q as f32;
-    let r = r as f32;
-    let x = size * (SQRT_3 * q + (SQRT_3 / 2.0) * r);
-    let y = size * (1.5 * r);
-    vec2(x, y)
-}
-
-fn point_in_triangle_2d(p: Vec2, a: Vec2, b: Vec2, c: Vec2) -> bool {
-    let eps = 1e-5;
-    let s1 = (b.x - a.x) * (p.y - a.y) - (b.y - a.y) * (p.x - a.x);
-    let s2 = (c.x - b.x) * (p.y - b.y) - (c.y - b.y) * (p.x - b.x);
-    let s3 = (a.x - c.x) * (p.y - c.y) - (a.y - c.y) * (p.x - c.x);
-    let has_neg = s1 < -eps || s2 < -eps || s3 < -eps;
-    let has_pos = s1 > eps || s2 > eps || s3 > eps;
-    !(has_neg && has_pos)
-}
-
-fn barycentric_coords_2d(p: Vec2, a: Vec2, b: Vec2, c: Vec2) -> Option<(f32, f32, f32)> {
-    let denom = (b.y - c.y) * (a.x - c.x) + (c.x - b.x) * (a.y - c.y);
-    if denom.abs() < 1e-6 {
-        return None;
-    }
-    let wa = ((b.y - c.y) * (p.x - c.x) + (c.x - b.x) * (p.y - c.y)) / denom;
-    let wb = ((c.y - a.y) * (p.x - c.x) + (a.x - c.x) * (p.y - c.y)) / denom;
-    let wc = 1.0 - wa - wb;
-    Some((wa, wb, wc))
-}
-
 fn draw_global_hex_cell(
     hex_grid: &HexGrid,
     camera: &Camera3D,
@@ -1223,13 +1205,14 @@ fn draw_global_hex_cell(
     for &neighbor in hex_grid.base_face_neighbors[face_index].iter() {
         candidates.extend(hex_grid.base_face_buckets[neighbor].iter().copied());
     }
+    candidates.extend(0..12u32);
     if candidates.is_empty() {
         return;
     }
 
     let mut best_index = candidates[0];
     let mut best_dot = -1.0_f32;
-    for index in candidates {
+    for index in candidates.into_iter() {
         let dir = hex_grid.vertices[index as usize];
         let dot = dir.dot(hover_dir);
         if dot > best_dot {
@@ -1246,12 +1229,7 @@ fn draw_global_hex_cell(
 
     let mut centers: Vec<Vec3> = Vec::with_capacity(face_list.len());
     for &face_index in face_list {
-        let face = hex_grid.faces[face_index as usize];
-        let v0 = hex_grid.vertices[face[0] as usize];
-        let v1 = hex_grid.vertices[face[1] as usize];
-        let v2 = hex_grid.vertices[face[2] as usize];
-        let center = (v0 + v1 + v2).normalize();
-        centers.push(center);
+        centers.push(hex_grid.face_centers[face_index as usize]);
     }
 
     let mut tangent_x = Vec3::ZERO;
@@ -1640,15 +1618,39 @@ pub fn run(
             state.last_mouse = mouse;
         } else {
             let delta = mouse - state.last_mouse;
-            state.yaw += delta.x * 0.01;
-            state.pitch += delta.y * 0.01;
-            state.pitch = state.pitch.clamp(-1.3, 1.3);
-            state.target_yaw = state.yaw;
-            state.target_pitch = state.pitch;
+            let up_dir = state.target_rot * vec3(0.0, 1.0, 0.0);
+            let right_dir = state.target_rot * vec3(1.0, 0.0, 0.0);
+            let yaw_rot = Quat::from_axis_angle(up_dir, -delta.x * 0.01);
+            let pitch_rot = Quat::from_axis_angle(right_dir, -delta.y * 0.01);
+            state.target_rot = (yaw_rot * pitch_rot) * state.target_rot;
             state.last_mouse = mouse;
         }
     } else {
         state.dragging = false;
+    }
+
+    let frame_time = get_frame_time();
+    let mut yaw_input = 0.0;
+    let mut pitch_input = 0.0;
+    if is_key_down(KeyCode::Left) {
+        yaw_input -= 1.0;
+    }
+    if is_key_down(KeyCode::Right) {
+        yaw_input += 1.0;
+    }
+    if is_key_down(KeyCode::Up) {
+        pitch_input += 1.0;
+    }
+    if is_key_down(KeyCode::Down) {
+        pitch_input -= 1.0;
+    }
+    if yaw_input != 0.0 || pitch_input != 0.0 {
+        let speed = 1.6;
+        let up_dir = state.target_rot * vec3(0.0, 1.0, 0.0);
+        let right_dir = state.target_rot * vec3(1.0, 0.0, 0.0);
+        let yaw_rot = Quat::from_axis_angle(up_dir, yaw_input * speed * frame_time);
+        let pitch_rot = Quat::from_axis_angle(right_dir, pitch_input * speed * frame_time);
+        state.target_rot = (yaw_rot * pitch_rot) * state.target_rot;
     }
 
     let (_wx, wy) = mouse_wheel();
@@ -1684,25 +1686,19 @@ pub fn run(
             ));
         }
     }
-    let yaw_delta = wrap_angle(state.target_yaw - state.yaw);
-    state.yaw += yaw_delta * 0.12;
-    state.pitch += (state.target_pitch - state.pitch) * 0.12;
+    let rot_delta = 1.0 - state.camera_rot.dot(state.target_rot).abs();
+    state.camera_rot = state.camera_rot.slerp(state.target_rot, 0.12);
     let camera_animating =
         state.dragging
-            || wy.abs() > 0.01
-            || (state.target_distance - state.distance).abs() > 0.02
-            || yaw_delta.abs() > 0.01
-            || (state.target_pitch - state.pitch).abs() > 0.01;
+        || wy.abs() > 0.01
+        || (state.target_distance - state.distance).abs() > 0.02
+        || rot_delta > 0.001;
 
-    let camera_pos = vec3(
-        state.distance * state.yaw.cos() * state.pitch.cos(),
-        state.distance * state.pitch.sin(),
-        state.distance * state.yaw.sin() * state.pitch.cos(),
-    );
+    let camera_pos = (state.camera_rot * vec3(0.0, 0.0, 1.0)) * state.distance;
     let camera = Camera3D {
         position: camera_pos,
         target: vec3(0.0, 0.0, 0.0),
-        up: vec3(0.0, 1.0, 0.0),
+        up: state.camera_rot * vec3(0.0, 1.0, 0.0),
         fovy: 45.0,
         ..Default::default()
     };
@@ -1805,13 +1801,11 @@ pub fn run(
         if let Some(face_index) = hovered_subface {
             let face = faces[face_index];
             let normal = face_normal(vertices, face);
-            state.target_yaw = normal.z.atan2(normal.x);
-            state.target_pitch = normal.y.asin();
+            state.target_rot = quat_from_forward_up(normal, vec3(0.0, 1.0, 0.0));
         } else if let Some(face_index) = hovered_base_face {
             let face = base_faces[face_index];
             let normal = face_normal(base_vertices, face);
-            state.target_yaw = normal.z.atan2(normal.x);
-            state.target_pitch = normal.y.asin();
+            state.target_rot = quat_from_forward_up(normal, vec3(0.0, 1.0, 0.0));
         }
     }
 

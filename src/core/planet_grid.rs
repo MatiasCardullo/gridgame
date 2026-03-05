@@ -8,6 +8,7 @@ pub struct HexGrid {
     pub freq: i32,
     pub vertices: Vec<Vec3>,
     pub faces: Vec<[u32; 3]>,
+    pub face_centers: Vec<Vec3>,
     pub vertex_faces: Vec<Vec<u32>>,
     pub base_face_buckets: Vec<Vec<u32>>,
     pub base_face_neighbors: Vec<Vec<usize>>,
@@ -464,6 +465,15 @@ pub fn build_hex_grid_from_data(
     base_vertices: &[Vec3],
     base_faces: &[[usize; 3]],
 ) -> HexGrid {
+    let face_centers = faces
+        .iter()
+        .map(|face| {
+            let v0 = vertices[face[0] as usize];
+            let v1 = vertices[face[1] as usize];
+            let v2 = vertices[face[2] as usize];
+            (v0 + v1 + v2).normalize()
+        })
+        .collect::<Vec<_>>();
     let mut vertex_faces: Vec<Vec<u32>> = vec![Vec::new(); vertices.len()];
     for (index, face) in faces.iter().enumerate() {
         let idx = index as u32;
@@ -496,6 +506,7 @@ pub fn build_hex_grid_from_data(
         freq,
         vertices,
         faces,
+        face_centers,
         vertex_faces,
         base_face_buckets,
         base_face_neighbors,

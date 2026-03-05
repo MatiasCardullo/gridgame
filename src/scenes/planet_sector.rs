@@ -9,7 +9,7 @@ use crate::core::{
 };
 use crate::core::ui::{ui_button, WindowState, WINDOW_TITLE_HEIGHT};
 use crate::{TRI_LENGHT, HEX_SIZE};
-use crate::scenes::map_common::{
+use crate::core::map_common::{
     build_panel_layout,
     confirm_label_for_target,
     draw_window_frame,
@@ -25,7 +25,7 @@ use crate::scenes::map_common::{
     hover_hex_from_mouse,
     in_bounds,
 };
-use crate::scenes::planet_sector_units::{
+use crate::core::planet_sector_units::{
     combine_paths, find_route_path, update_units_and_mining,
 };
 

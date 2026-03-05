@@ -6,7 +6,7 @@ use crate::core::{
     MachineBlock, MachineBlockType, draw_hex_filled, draw_hex_outline,
 };
 use crate::core::ui::{ui_button, WindowState, WINDOW_TITLE_HEIGHT};
-use crate::scenes::map_common::{
+use crate::core::map_common::{
     build_panel_layout,
     confirm_label_for_target,
     draw_window_frame,

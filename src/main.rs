@@ -176,7 +176,7 @@ async fn main() {
                     map_path,
                     &config,
                     &colors_rt,
-                    scenes::map_common::MapOutline::Triangle,
+                    core::map_common::MapOutline::Triangle,
                 );
             }
             Scene::Planet => {

@@ -9,6 +9,7 @@ pub mod debug;
 pub mod planet_grid;
 pub mod map_common;
 pub mod planet_texture;
+pub mod planet_resources;
 pub mod planet_sector_units;
 
 use crate::SQRT_3;

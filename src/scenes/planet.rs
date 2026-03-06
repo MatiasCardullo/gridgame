@@ -19,6 +19,9 @@ use crate::core::planet_grid::{
     build_hex_grid_from_data, icosahedron_edges, icosahedron_vertices, load_hex_grid_cache,
     save_hex_grid_cache,
 };
+use crate::core::planet_resources::{
+    PlanetResourceKind, PlanetSimWorld, PlanetSurfaceClass, build_or_load_sim_world,
+};
 use crate::core::planet_texture::{
     PlanetNoiseConfig, color_from_height, height_value, load_or_build_heightmap, texture_params_match,
 };
@@ -27,6 +30,9 @@ const PLANET_DATA_DIR: &str = "planet_data";
 const MESH_POINTS_PATH: &str = "planet_data/planet_mesh_points.csv";
 const PLANET_NOISE_PATH: &str = "planet_data/planet_noise.json";
 const HEX_GRID_CACHE_PATH: &str = "planet_data/planet_hex_grid.bin";
+const SIM_GRID_CACHE_PATH: &str = "planet_data/planet_sim_grid.bin";
+const PLANET_RESOURCES_PATH: &str = "planet_data/planet_resources_v1.bin";
+const PLANET_BUILDINGS_PATH: &str = "planet_data/planet_buildings_v1.json";
 const HEIGHTMAP_SIZE: u16 = 2048;
 const TEXTURE_BASE_SUBDIVISIONS: usize = 2;
 const TEXTURE_LAYER_OFFSET: f32 = 0.004;
@@ -37,7 +43,10 @@ const ICOSAHEDRON_FACE_COUNT: usize = 20;
 const SUBFACE_HOVER_MAX_DISTANCE: f32 = 5.6;
 const NEAR_GRID_DISTANCE: f32 = 2.4;
 const HOVER_GRID_HEXES_ACROSS: i32 = 320;
+const SIM_GRID_HEXES_ACROSS: i32 = 128;
 const PLANET_OVERLAY_OFFSET: f32 = 0.01;
+const PLANET_SIM_SEED: u64 = 0xDA7A_51C4_1234_8B9E;
+const MINE_EXTRACT_RATE_PER_SEC: f32 = 6.0;
 
 // Wraps an angle to the [-PI, PI] range for smooth camera interpolation.
 fn quat_from_forward_up(forward: Vec3, up: Vec3) -> Quat {
@@ -101,6 +110,7 @@ fn ensure_planet_data_dir() {
 }
 
 fn start_hex_grid_build(
+    cache_path: &'static str,
     freq: i32,
     base_vertices: &[Vec3],
     base_faces: &[[usize; 3]],
@@ -111,10 +121,11 @@ fn start_hex_grid_build(
     std::thread::spawn(move || {
         let t0 = Instant::now();
         let grid = if let Some((vertices, faces)) =
-            load_hex_grid_cache(HEX_GRID_CACHE_PATH, freq)
+            load_hex_grid_cache(cache_path, freq)
         {
             planet_perf_log(&format!(
-                "hex grid cache loaded freq={} vertices={} faces={} took_ms={}",
+                "hex grid cache loaded path={} freq={} vertices={} faces={} took_ms={}",
+                cache_path,
                 freq,
                 vertices.len(),
                 faces.len(),
@@ -124,9 +135,10 @@ fn start_hex_grid_build(
         } else {
             let (vertices, faces) = build_frequency_geodesic(freq, &base_vertices, &base_faces);
             ensure_planet_data_dir();
-            save_hex_grid_cache(HEX_GRID_CACHE_PATH, freq, &vertices, &faces);
+            save_hex_grid_cache(cache_path, freq, &vertices, &faces);
             planet_perf_log(&format!(
-                "hex grid built freq={} vertices={} faces={} took_ms={}",
+                "hex grid built path={} freq={} vertices={} faces={} took_ms={}",
+                cache_path,
                 freq,
                 vertices.len(),
                 faces.len(),
@@ -151,6 +163,33 @@ enum PlanetLoadEvent {
 enum PlanetLoadStatus {
     Loading,
     Done,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+enum PlanetBuildingKind {
+    Base,
+    Mine,
+}
+
+impl PlanetBuildingKind {
+    fn label(self) -> &'static str {
+        match self {
+            PlanetBuildingKind::Base => "Base",
+            PlanetBuildingKind::Mine => "Mine",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct PlanetBuildingRecord {
+    cell_index: u32,
+    kind: PlanetBuildingKind,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct PlanetBuildingsSnapshot {
+    #[serde(default)]
+    buildings: Vec<PlanetBuildingRecord>,
 }
 
 pub struct PlanetLoader {
@@ -188,6 +227,14 @@ pub struct PlanetState {
     pub texture_config: PlanetNoiseConfig,
     hex_grid: Option<HexGrid>,
     hex_grid_rx: Option<Receiver<HexGrid>>,
+    sim_grid: Option<HexGrid>,
+    sim_grid_rx: Option<Receiver<HexGrid>>,
+    sim_world: Option<PlanetSimWorld>,
+    selected_build_tool: Option<PlanetBuildingKind>,
+    buildings: HashMap<u32, PlanetBuildingKind>,
+    buildings_dirty: bool,
+    mine_progress: HashMap<u32, f32>,
+    stockpiles: HashMap<PlanetResourceKind, u32>,
     relief_cache: HashMap<ReliefCacheKey, ReliefCacheEntry>,
     pending_relief_key: Option<ReliefCacheKey>,
     regen_rx: Option<Receiver<RegenMessage>>,
@@ -197,6 +244,8 @@ pub struct PlanetState {
     pub regen_expected_chunks: usize,
     pub regen_received_chunks: usize,
     last_hitch_log_at: f64,
+    last_resource_save_at: f64,
+    last_buildings_save_at: f64,
     regen_generation: Arc<AtomicU64>,
 }
 
@@ -254,12 +303,19 @@ impl PlanetState {
         let face_centers = build_face_centers(&sector_vertices, &sector_faces);
         let base_faces = build_faces(&base_vertices, &icosahedron_edges());
         let hex_grid_rx = Some(start_hex_grid_build(
+            HEX_GRID_CACHE_PATH,
             HOVER_GRID_HEXES_ACROSS,
             &base_vertices,
             &base_faces,
         ));
+        let sim_grid_rx = Some(start_hex_grid_build(
+            SIM_GRID_CACHE_PATH,
+            SIM_GRID_HEXES_ACROSS,
+            &base_vertices,
+            &base_faces,
+        ));
         let initial_rot = Quat::from_rotation_y(0.0) * Quat::from_rotation_x(0.3);
-        Self {
+        let mut state = Self {
             camera_rot: initial_rot,
             target_rot: initial_rot,
             distance: 6.0,
@@ -283,6 +339,14 @@ impl PlanetState {
             texture_config: config,
             hex_grid: None,
             hex_grid_rx,
+            sim_grid: None,
+            sim_grid_rx,
+            sim_world: None,
+            selected_build_tool: Some(PlanetBuildingKind::Mine),
+            buildings: HashMap::new(),
+            buildings_dirty: false,
+            mine_progress: HashMap::new(),
+            stockpiles: HashMap::new(),
             relief_cache: HashMap::new(),
             pending_relief_key: None,
             regen_rx: None,
@@ -292,8 +356,12 @@ impl PlanetState {
             regen_expected_chunks: 0,
             regen_received_chunks: 0,
             last_hitch_log_at: 0.0,
+            last_resource_save_at: 0.0,
+            last_buildings_save_at: 0.0,
             regen_generation: Arc::new(AtomicU64::new(0)),
-        }
+        };
+        state.load_buildings_snapshot(PLANET_BUILDINGS_PATH);
+        state
     }
 
     pub fn apply_relief_build_data(&mut self, data: PlanetBuildData) {
@@ -319,6 +387,10 @@ impl PlanetState {
         self.relief_meshes = mesh_data.into_iter().map(mesh_data_to_mesh).collect();
         self.face_normals = face_normals;
         self.sector_values = sector_values;
+        if let Some(sim_world) = self.sim_world.as_mut() {
+            sim_world.save_if_dirty(PLANET_RESOURCES_PATH);
+        }
+        self.sim_world = None;
         self.rebuild_fallback_relief_meshes();
         self.relief_cache.clear();
         self.relief_cache.insert(
@@ -398,6 +470,122 @@ impl PlanetState {
 
     pub(crate) fn debug_save_heightmap(&self, path: &str) {
         self.save_heightmap(512, path);
+    }
+
+    pub fn can_build_on_sim_cell(&self, cell_index: u32) -> bool {
+        self.sim_world
+            .as_ref()
+            .map(|world| world.can_build(cell_index))
+            .unwrap_or(false)
+    }
+
+    fn load_buildings_snapshot(&mut self, path: &str) {
+        let Ok(contents) = fs::read_to_string(path) else {
+            return;
+        };
+        let Ok(snapshot) = serde_json::from_str::<PlanetBuildingsSnapshot>(&contents) else {
+            return;
+        };
+        self.buildings.clear();
+        for record in snapshot.buildings.into_iter() {
+            self.buildings.insert(record.cell_index, record.kind);
+        }
+        self.buildings_dirty = false;
+    }
+
+    fn save_buildings_if_dirty(&mut self, path: &str) {
+        if !self.buildings_dirty {
+            return;
+        }
+        ensure_planet_data_dir();
+        let snapshot = PlanetBuildingsSnapshot {
+            buildings: self
+                .buildings
+                .iter()
+                .map(|(cell_index, kind)| PlanetBuildingRecord {
+                    cell_index: *cell_index,
+                    kind: *kind,
+                })
+                .collect(),
+        };
+        if let Ok(json) = serde_json::to_string_pretty(&snapshot) {
+            let _ = fs::write(path, json);
+            self.buildings_dirty = false;
+        }
+    }
+
+    fn can_place_building(&self, cell_index: u32, kind: PlanetBuildingKind) -> bool {
+        if self.buildings.contains_key(&cell_index) {
+            return false;
+        }
+        if !self.can_build_on_sim_cell(cell_index) {
+            return false;
+        }
+        match (kind, self.sim_world.as_ref()) {
+            (PlanetBuildingKind::Mine, Some(world)) => world
+                .cells
+                .get(cell_index as usize)
+                .and_then(|cell| cell.deposit)
+                .map(|deposit| deposit.remaining_amount > 0)
+                .unwrap_or(false),
+            _ => true,
+        }
+    }
+
+    fn place_building(&mut self, cell_index: u32, kind: PlanetBuildingKind) -> bool {
+        if !self.can_place_building(cell_index, kind) {
+            return false;
+        }
+        self.buildings.insert(cell_index, kind);
+        self.buildings_dirty = true;
+        true
+    }
+
+    fn remove_building(&mut self, cell_index: u32) -> bool {
+        let removed = self.buildings.remove(&cell_index).is_some();
+        if removed {
+            self.mine_progress.remove(&cell_index);
+            self.buildings_dirty = true;
+        }
+        removed
+    }
+
+    fn tick_mining(&mut self, dt: f32) {
+        let Some(sim_world) = self.sim_world.as_mut() else {
+            return;
+        };
+        let mine_cells: Vec<u32> = self
+            .buildings
+            .iter()
+            .filter_map(|(cell_index, kind)| {
+                if *kind == PlanetBuildingKind::Mine {
+                    Some(*cell_index)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        for cell_index in mine_cells.into_iter() {
+            let progress = self.mine_progress.entry(cell_index).or_insert(0.0);
+            *progress += dt * MINE_EXTRACT_RATE_PER_SEC;
+            let units = progress.floor() as u32;
+            if units == 0 {
+                continue;
+            }
+            *progress -= units as f32;
+            let resource_kind = sim_world
+                .cells
+                .get(cell_index as usize)
+                .and_then(|cell| cell.deposit)
+                .map(|deposit| deposit.kind);
+            let Some(resource_kind) = resource_kind else {
+                continue;
+            };
+            let mined = sim_world.extract_from_cell(cell_index, units);
+            if mined > 0 {
+                *self.stockpiles.entry(resource_kind).or_insert(0) += mined;
+            }
+        }
     }
 
     // Rebuilds the low-detail fallback relief mesh and reapplies current texture.
@@ -1180,42 +1368,30 @@ fn draw_global_hex_cell(
     line_thickness: f32,
     overlay_radius: f32,
     surface_radius: f32,
+    selected_cell: Option<u32>,
     hover_hit: Option<Vec3>,
     hovered_base_face: Option<usize>,
-) {
-    let Some(hover_hit) = hover_hit else {
-        return;
+) -> Option<u32> {
+    let best_index = if let Some(selected_cell) = selected_cell {
+        selected_cell
+    } else {
+        let Some(hover_hit) = hover_hit else {
+            return None;
+        };
+        let Some(face_index) = hovered_base_face else {
+            return None;
+        };
+        let hover_dir = hover_hit.normalize();
+        let Some(best_index) = hovered_hex_vertex(hex_grid, hover_dir, face_index) else {
+            return None;
+        };
+        best_index
     };
-    let Some(face_index) = hovered_base_face else {
-        return;
-    };
-    let hover_dir = hover_hit.normalize();
-
-    let mut candidates: Vec<u32> = Vec::new();
-    candidates.extend(hex_grid.base_face_buckets[face_index].iter().copied());
-    for &neighbor in hex_grid.base_face_neighbors[face_index].iter() {
-        candidates.extend(hex_grid.base_face_buckets[neighbor].iter().copied());
-    }
-    candidates.extend(0..12u32);
-    if candidates.is_empty() {
-        return;
-    }
-
-    let mut best_index = candidates[0];
-    let mut best_dot = -1.0_f32;
-    for index in candidates.into_iter() {
-        let dir = hex_grid.vertices[index as usize];
-        let dot = dir.dot(hover_dir);
-        if dot > best_dot {
-            best_dot = dot;
-            best_index = index;
-        }
-    }
 
     let vertex_dir = hex_grid.vertices[best_index as usize];
     let face_list = &hex_grid.vertex_faces[best_index as usize];
     if face_list.len() < 3 {
-        return;
+        return None;
     }
 
     let mut centers: Vec<Vec3> = Vec::with_capacity(face_list.len());
@@ -1234,13 +1410,13 @@ fn draw_global_hex_cell(
     if tangent_x.length() < 1e-5 {
         let fallback = vec3(0.0, 1.0, 0.0) - vertex_dir * vertex_dir.dot(vec3(0.0, 1.0, 0.0));
         if fallback.length() < 1e-5 {
-            return;
+            return None;
         }
         tangent_x = fallback.normalize();
     }
     let tangent_y = vertex_dir.cross(tangent_x).normalize();
     if tangent_y.length() < 1e-5 {
-        return;
+        return None;
     }
 
     let mut ordered: Vec<(f32, Vec3)> = centers
@@ -1258,10 +1434,10 @@ fn draw_global_hex_cell(
         let world_outer = *dir * overlay_radius;
         let world_inner = *dir * surface_radius;
         let Some(screen_outer) = project_to_screen(camera, world_outer) else {
-            return;
+            return None;
         };
         let Some(screen_inner) = project_to_screen(camera, world_inner) else {
-            return;
+            return None;
         };
         outer_screen.push(screen_outer);
         inner_screen.push(screen_inner);
@@ -1301,6 +1477,60 @@ fn draw_global_hex_cell(
             radial_color,
         );
     }
+    Some(best_index)
+}
+
+fn draw_sim_buildings(
+    sim_grid: &HexGrid,
+    buildings: &HashMap<u32, PlanetBuildingKind>,
+    radius: f32,
+) {
+    for (cell_index, kind) in buildings.iter() {
+        let Some(dir) = sim_grid.vertices.get(*cell_index as usize) else {
+            continue;
+        };
+        let dir = dir.normalize();
+        let center = dir * radius;
+        let tangent = if dir.y.abs() < 0.9 {
+            dir.cross(vec3(0.0, 1.0, 0.0)).normalize()
+        } else {
+            dir.cross(vec3(1.0, 0.0, 0.0)).normalize()
+        };
+        let bitangent = dir.cross(tangent).normalize();
+        let size = 0.015;
+        let color = match kind {
+            PlanetBuildingKind::Base => Color::from_rgba(80, 220, 220, 255),
+            PlanetBuildingKind::Mine => Color::from_rgba(240, 170, 90, 255),
+        };
+        draw_line_3d(center - tangent * size, center + tangent * size, color);
+        draw_line_3d(center - bitangent * size, center + bitangent * size, color);
+    }
+}
+
+fn hovered_hex_vertex(hex_grid: &HexGrid, hover_dir: Vec3, base_face_index: usize) -> Option<u32> {
+    if base_face_index >= hex_grid.base_face_buckets.len() {
+        return None;
+    }
+    let mut candidates: Vec<u32> = Vec::new();
+    candidates.extend(hex_grid.base_face_buckets[base_face_index].iter().copied());
+    for &neighbor in hex_grid.base_face_neighbors[base_face_index].iter() {
+        candidates.extend(hex_grid.base_face_buckets[neighbor].iter().copied());
+    }
+    candidates.extend(0..12u32);
+    if candidates.is_empty() {
+        return None;
+    }
+    let mut best_index = candidates[0];
+    let mut best_dot = -1.0_f32;
+    for index in candidates.into_iter() {
+        let dir = hex_grid.vertices[index as usize];
+        let dot = dir.dot(hover_dir);
+        if dot > best_dot {
+            best_dot = dot;
+            best_index = index;
+        }
+    }
+    Some(best_index)
 }
 
 // Draws a great-circle arc between two points on the sphere.
@@ -1428,6 +1658,29 @@ fn face_name(face_index: usize, total_faces: usize, include_subface: bool) -> St
         format!("{}{:02x}", letter, subface_number)
     } else {
         letter.to_string()
+    }
+}
+
+fn surface_label(surface: PlanetSurfaceClass) -> &'static str {
+    match surface {
+        PlanetSurfaceClass::Land => "Land",
+        PlanetSurfaceClass::Coast => "Coast",
+        PlanetSurfaceClass::Water => "Water",
+    }
+}
+
+fn resource_label(kind: PlanetResourceKind) -> &'static str {
+    match kind {
+        PlanetResourceKind::Iron => "Iron",
+        PlanetResourceKind::Copper => "Copper",
+        PlanetResourceKind::Gold => "Gold",
+        PlanetResourceKind::Lead => "Lead",
+        PlanetResourceKind::Zinc => "Zinc",
+        PlanetResourceKind::Lithium => "Lithium",
+        PlanetResourceKind::Phosphate => "Phosphate",
+        PlanetResourceKind::Stone => "Stone",
+        PlanetResourceKind::FreshWater => "FreshWater",
+        PlanetResourceKind::Salt => "Salt",
     }
 }
 
@@ -1587,6 +1840,10 @@ pub fn run(
     greek_font: Option<&Font>,
 ) {
     if is_key_pressed(KeyCode::Escape) {
+        if let Some(sim_world) = state.sim_world.as_mut() {
+            sim_world.save_if_dirty(PLANET_RESOURCES_PATH);
+        }
+        state.save_buildings_if_dirty(PLANET_BUILDINGS_PATH);
         *scene = Scene::MainMenu;
         return;
     }
@@ -1600,6 +1857,42 @@ pub fn run(
                 state.hex_grid_rx = None;
             }
         }
+    }
+    if state.sim_grid.is_none() {
+        if let Some(rx) = state.sim_grid_rx.as_ref() {
+            if let Ok(grid) = rx.try_recv() {
+                state.sim_grid = Some(grid);
+                state.sim_grid_rx = None;
+            }
+        }
+    }
+    if state.sim_world.is_none() {
+        if let Some(sim_grid) = state.sim_grid.as_ref() {
+            let t0 = Instant::now();
+            state.sim_world = Some(build_or_load_sim_world(
+                PLANET_RESOURCES_PATH,
+                sim_grid,
+                &state.config,
+                PLANET_SIM_SEED,
+            ));
+            planet_perf_log(&format!(
+                "sim world ready freq={} cells={} took_ms={}",
+                sim_grid.freq,
+                sim_grid.vertices.len(),
+                t0.elapsed().as_millis()
+            ));
+        }
+    }
+    let now = get_time();
+    if now - state.last_resource_save_at > 5.0 {
+        if let Some(sim_world) = state.sim_world.as_mut() {
+            sim_world.save_if_dirty(PLANET_RESOURCES_PATH);
+        }
+        state.last_resource_save_at = now;
+    }
+    if now - state.last_buildings_save_at > 5.0 {
+        state.save_buildings_if_dirty(PLANET_BUILDINGS_PATH);
+        state.last_buildings_save_at = now;
     }
 
     let mouse = vec2(mouse_position().0, mouse_position().1);
@@ -1621,6 +1914,17 @@ pub fn run(
     }
 
     let frame_time = get_frame_time();
+    if is_key_pressed(KeyCode::Key1) {
+        state.selected_build_tool = None;
+    }
+    if is_key_pressed(KeyCode::Key2) {
+        state.selected_build_tool = Some(PlanetBuildingKind::Base);
+    }
+    if is_key_pressed(KeyCode::Key3) {
+        state.selected_build_tool = Some(PlanetBuildingKind::Mine);
+    }
+    state.tick_mining(frame_time);
+
     let mut yaw_input = 0.0;
     let mut pitch_input = 0.0;
     if is_key_down(KeyCode::Left) {
@@ -1760,12 +2064,27 @@ pub fn run(
     let mut hovered_subface: Option<usize> = None;
     let mut hovered_base_face: Option<usize> = None;
     let mut hover_hit: Option<Vec3> = None;
+    let mut hovered_visual_cell: Option<u32> = None;
+    let mut hovered_sim_cell: Option<u32> = None;
     if let Some((origin, dir)) = ray_from_mouse(&camera, mouse) {
         if let Some(hit) = ray_sphere_intersection(origin, dir, radius) {
             hover_hit = Some(hit);
             hovered_base_face = hovered_face(hit, &base_faces, base_vertices);
             if use_subface_hover {
                 hovered_subface = hovered_face(hit, &faces, vertices);
+            }
+            if let (Some(hex_grid), Some(base_face)) = (state.hex_grid.as_ref(), hovered_base_face) {
+                hovered_visual_cell = hovered_hex_vertex(hex_grid, hit.normalize(), base_face);
+            }
+            if let (Some(sim_grid), Some(base_face)) = (state.sim_grid.as_ref(), hovered_base_face) {
+                let sim_dir = if let (Some(hex_grid), Some(visual_cell)) =
+                    (state.hex_grid.as_ref(), hovered_visual_cell)
+                {
+                    hex_grid.vertices[visual_cell as usize].normalize()
+                } else {
+                    hit.normalize()
+                };
+                hovered_sim_cell = hovered_hex_vertex(sim_grid, sim_dir, base_face);
             }
         }
     }
@@ -1799,17 +2118,33 @@ pub fn run(
             state.target_rot = quat_from_forward_up(normal, vec3(0.0, 1.0, 0.0));
         }
     }
+    if let Some(sim_grid) = state.sim_grid.as_ref() {
+        draw_sim_buildings(sim_grid, &state.buildings, line_radius + 0.012);
+    }
+    if is_mouse_button_pressed(MouseButton::Right) {
+        if let Some(cell_index) = hovered_sim_cell {
+            if let Some(kind) = state.selected_build_tool {
+                let _ = state.place_building(cell_index, kind);
+            }
+        }
+    }
+    if is_key_pressed(KeyCode::Delete) {
+        if let Some(cell_index) = hovered_sim_cell {
+            let _ = state.remove_building(cell_index);
+        }
+    }
 
     set_default_camera();
     if show_hover_grid {
         if let Some(hex_grid) = state.hex_grid.as_ref() {
-            draw_global_hex_cell(
+            let _ = draw_global_hex_cell(
                 hex_grid,
                 &camera,
                 grid_color,
                 1.2,
                 line_radius,
                 radius,
+                hovered_visual_cell,
                 hover_hit,
                 hovered_base_face,
             );
@@ -1854,6 +2189,100 @@ pub fn run(
                 font: greek_font,
                 font_size: 30,
                 color: Color::from_rgba(255, 235, 180, 255),
+                ..Default::default()
+            },
+        );
+    }
+    if let (Some(sim_world), Some(cell_index)) = (state.sim_world.as_ref(), hovered_sim_cell) {
+        if let Some(cell) = sim_world.cells.get(cell_index as usize) {
+            let buildable = if state.can_build_on_sim_cell(cell_index) {
+                "yes"
+            } else {
+                "no"
+            };
+            draw_text_ex(
+                &format!(
+                    "Cell {}  {}  Buildable:{}",
+                    cell_index,
+                    surface_label(cell.surface),
+                    buildable
+                ),
+                20.0,
+                64.0,
+                TextParams {
+                    font: greek_font,
+                    font_size: 22,
+                    color: Color::from_rgba(220, 238, 255, 255),
+                    ..Default::default()
+                },
+            );
+            let deposit_text = if let Some(deposit) = cell.deposit {
+                format!(
+                    "{} {}/{} grade:{}",
+                    resource_label(deposit.kind),
+                    deposit.remaining_amount,
+                    deposit.initial_amount,
+                    deposit.grade_permille
+                )
+            } else {
+                "No deposit".to_string()
+            };
+            draw_text_ex(
+                &deposit_text,
+                20.0,
+                86.0,
+                TextParams {
+                    font: greek_font,
+                    font_size: 20,
+                    color: Color::from_rgba(190, 220, 240, 255),
+                    ..Default::default()
+                },
+            );
+        }
+    }
+    let tool_label = match state.selected_build_tool {
+        None => "None",
+        Some(kind) => kind.label(),
+    };
+    draw_text_ex(
+        &format!("Tool: {}   [1 None] [2 Base] [3 Mine] [RMB place] [Del remove]", tool_label),
+        20.0,
+        screen_height() - 56.0,
+        TextParams {
+            font: greek_font,
+            font_size: 20,
+            color: Color::from_rgba(180, 210, 230, 255),
+            ..Default::default()
+        },
+    );
+    let mut stock_lines: Vec<String> = state
+        .stockpiles
+        .iter()
+        .filter(|(_, amount)| **amount > 0)
+        .map(|(kind, amount)| format!("{}: {}", resource_label(*kind), amount))
+        .collect();
+    stock_lines.sort();
+    if stock_lines.is_empty() {
+        draw_text_ex(
+            "Stockpile: empty",
+            20.0,
+            screen_height() - 34.0,
+            TextParams {
+                font: greek_font,
+                font_size: 18,
+                color: Color::from_rgba(150, 185, 210, 255),
+                ..Default::default()
+            },
+        );
+    } else {
+        draw_text_ex(
+            &format!("Stockpile: {}", stock_lines.join(" | ")),
+            20.0,
+            screen_height() - 34.0,
+            TextParams {
+                font: greek_font,
+                font_size: 18,
+                color: Color::from_rgba(150, 185, 210, 255),
                 ..Default::default()
             },
         );

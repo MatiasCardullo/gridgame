@@ -7,7 +7,7 @@ use crate::core::planet_grid::HexGrid;
 use crate::core::planet_texture::{height_value, PlanetNoiseConfig};
 
 const SNAPSHOT_MAGIC: &[u8; 4] = b"PRS1";
-const SNAPSHOT_VERSION: u16 = 2;
+const SNAPSHOT_VERSION: u16 = 1;
 const COASTAL_HEIGHT_BAND: f32 = 0.08;
 const NONE_RESOURCE: u8 = 255;
 

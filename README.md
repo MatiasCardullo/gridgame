@@ -32,9 +32,13 @@ Hex-grid strategy game built with Rust and Macroquad. Build structures, extract 
 **Planet Scene Data**
 1. Terrain parameters and sector values are saved in `planet_data/planet_noise.json`.
 2. The 2D heightmap texture is regenerated from that JSON when needed (no separate texture cache files).
-3. Optional runtime artifacts:
-4. `planet_data/planet_perf.log` for perf/hitch logging.
-5. `planet_data/planet_mesh_points.csv` only when mesh-point export is enabled.
+3. Hover grid cache: `planet_data/planet_hex_grid.bin` (`freq=320`).
+4. Simulation grid cache: `planet_data/planet_sim_grid.bin` (`freq=128` by default).
+5. Per-cell resource snapshot (depletable state): `planet_data/planet_resources.bin`.
+6. Planet buildings snapshot: `planet_data/planet_buildings.json`.
+7. Optional runtime artifacts:
+8. `planet_data/planet_perf.log` for perf/hitch logging.
+9. `planet_data/planet_mesh_points.csv` only when mesh-point export is enabled.
 
 **Roadmap Notes**
 1. `planet_sector.rs` will be deprecated in favor of the 3D `planet.rs` scene now that the global hex grid exists.

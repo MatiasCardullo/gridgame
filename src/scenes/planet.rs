@@ -25,14 +25,16 @@ use crate::core::planet_resources::{
 use crate::core::planet_texture::{
     PlanetNoiseConfig, color_from_height, height_value, load_or_build_heightmap, texture_params_match,
 };
+use crate::core::ui::{draw_build_panel, draw_window, ui_button, WindowState, WindowStyle, WINDOW_TITLE_HEIGHT};
+use crate::core::map_common::{build_panel_layout, handle_window_drag};
 
 const PLANET_DATA_DIR: &str = "planet_data";
 const MESH_POINTS_PATH: &str = "planet_data/planet_mesh_points.csv";
 const PLANET_NOISE_PATH: &str = "planet_data/planet_noise.json";
 const HEX_GRID_CACHE_PATH: &str = "planet_data/planet_hex_grid.bin";
 const SIM_GRID_CACHE_PATH: &str = "planet_data/planet_sim_grid.bin";
-const PLANET_RESOURCES_PATH: &str = "planet_data/planet_resources_v1.bin";
-const PLANET_BUILDINGS_PATH: &str = "planet_data/planet_buildings_v1.json";
+const PLANET_RESOURCES_PATH: &str = "planet_data/planet_resources.bin";
+const PLANET_BUILDINGS_PATH: &str = "planet_data/planet_buildings.json";
 const HEIGHTMAP_SIZE: u16 = 2048;
 const TEXTURE_BASE_SUBDIVISIONS: usize = 2;
 const TEXTURE_LAYER_OFFSET: f32 = 0.004;
@@ -182,7 +184,14 @@ impl PlanetBuildingKind {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct PlanetBuildingRecord {
-    cell_index: u32,
+    visual_cell: u32,
+    sim_cell: u32,
+    kind: PlanetBuildingKind,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PlanetPlacedBuilding {
+    sim_cell: u32,
     kind: PlanetBuildingKind,
 }
 
@@ -231,10 +240,15 @@ pub struct PlanetState {
     sim_grid_rx: Option<Receiver<HexGrid>>,
     sim_world: Option<PlanetSimWorld>,
     selected_build_tool: Option<PlanetBuildingKind>,
-    buildings: HashMap<u32, PlanetBuildingKind>,
+    panel_collapsed: bool,
+    buildings: HashMap<u32, PlanetPlacedBuilding>,
     buildings_dirty: bool,
     mine_progress: HashMap<u32, f32>,
     stockpiles: HashMap<PlanetResourceKind, u32>,
+    info_window: WindowState,
+    info_target_visual_cell: Option<u32>,
+    confirm_window: WindowState,
+    confirm_target_visual_cell: Option<u32>,
     relief_cache: HashMap<ReliefCacheKey, ReliefCacheEntry>,
     pending_relief_key: Option<ReliefCacheKey>,
     regen_rx: Option<Receiver<RegenMessage>>,
@@ -343,10 +357,31 @@ impl PlanetState {
             sim_grid_rx,
             sim_world: None,
             selected_build_tool: Some(PlanetBuildingKind::Mine),
+            panel_collapsed: false,
             buildings: HashMap::new(),
             buildings_dirty: false,
             mine_progress: HashMap::new(),
             stockpiles: HashMap::new(),
+            info_window: WindowState {
+                title: String::new(),
+                rect: Rect::new(40.0, 120.0, 260.0, 170.0),
+                open: false,
+                target: None,
+                dragging: false,
+                drag_offset: Vec2::ZERO,
+                show_units: false,
+            },
+            info_target_visual_cell: None,
+            confirm_window: WindowState {
+                title: "Confirm".to_string(),
+                rect: Rect::new(40.0, 120.0, 250.0, 120.0),
+                open: false,
+                target: None,
+                dragging: false,
+                drag_offset: Vec2::ZERO,
+                show_units: false,
+            },
+            confirm_target_visual_cell: None,
             relief_cache: HashMap::new(),
             pending_relief_key: None,
             regen_rx: None,
@@ -488,7 +523,13 @@ impl PlanetState {
         };
         self.buildings.clear();
         for record in snapshot.buildings.into_iter() {
-            self.buildings.insert(record.cell_index, record.kind);
+            self.buildings.insert(
+                record.visual_cell,
+                PlanetPlacedBuilding {
+                    sim_cell: record.sim_cell,
+                    kind: record.kind,
+                },
+            );
         }
         self.buildings_dirty = false;
     }
@@ -502,9 +543,10 @@ impl PlanetState {
             buildings: self
                 .buildings
                 .iter()
-                .map(|(cell_index, kind)| PlanetBuildingRecord {
-                    cell_index: *cell_index,
-                    kind: *kind,
+                .map(|(visual_cell, placed)| PlanetBuildingRecord {
+                    visual_cell: *visual_cell,
+                    sim_cell: placed.sim_cell,
+                    kind: placed.kind,
                 })
                 .collect(),
         };
@@ -514,17 +556,17 @@ impl PlanetState {
         }
     }
 
-    fn can_place_building(&self, cell_index: u32, kind: PlanetBuildingKind) -> bool {
-        if self.buildings.contains_key(&cell_index) {
+    fn can_place_building(&self, visual_cell: u32, sim_cell: u32, kind: PlanetBuildingKind) -> bool {
+        if self.buildings.contains_key(&visual_cell) {
             return false;
         }
-        if !self.can_build_on_sim_cell(cell_index) {
+        if !self.can_build_on_sim_cell(sim_cell) {
             return false;
         }
         match (kind, self.sim_world.as_ref()) {
             (PlanetBuildingKind::Mine, Some(world)) => world
                 .cells
-                .get(cell_index as usize)
+                .get(sim_cell as usize)
                 .and_then(|cell| cell.deposit)
                 .map(|deposit| deposit.remaining_amount > 0)
                 .unwrap_or(false),
@@ -532,19 +574,25 @@ impl PlanetState {
         }
     }
 
-    fn place_building(&mut self, cell_index: u32, kind: PlanetBuildingKind) -> bool {
-        if !self.can_place_building(cell_index, kind) {
+    fn place_building(&mut self, visual_cell: u32, sim_cell: u32, kind: PlanetBuildingKind) -> bool {
+        if !self.can_place_building(visual_cell, sim_cell, kind) {
             return false;
         }
-        self.buildings.insert(cell_index, kind);
+        self.buildings.insert(
+            visual_cell,
+            PlanetPlacedBuilding {
+                sim_cell,
+                kind,
+            },
+        );
         self.buildings_dirty = true;
         true
     }
 
-    fn remove_building(&mut self, cell_index: u32) -> bool {
-        let removed = self.buildings.remove(&cell_index).is_some();
+    fn remove_building(&mut self, visual_cell: u32) -> bool {
+        let removed = self.buildings.remove(&visual_cell).is_some();
         if removed {
-            self.mine_progress.remove(&cell_index);
+            self.mine_progress.remove(&visual_cell);
             self.buildings_dirty = true;
         }
         removed
@@ -554,19 +602,19 @@ impl PlanetState {
         let Some(sim_world) = self.sim_world.as_mut() else {
             return;
         };
-        let mine_cells: Vec<u32> = self
+        let mine_cells: Vec<(u32, u32)> = self
             .buildings
             .iter()
-            .filter_map(|(cell_index, kind)| {
-                if *kind == PlanetBuildingKind::Mine {
-                    Some(*cell_index)
+            .filter_map(|(visual_cell, placed)| {
+                if placed.kind == PlanetBuildingKind::Mine {
+                    Some((*visual_cell, placed.sim_cell))
                 } else {
                     None
                 }
             })
             .collect();
-        for cell_index in mine_cells.into_iter() {
-            let progress = self.mine_progress.entry(cell_index).or_insert(0.0);
+        for (visual_cell, sim_cell) in mine_cells.into_iter() {
+            let progress = self.mine_progress.entry(visual_cell).or_insert(0.0);
             *progress += dt * MINE_EXTRACT_RATE_PER_SEC;
             let units = progress.floor() as u32;
             if units == 0 {
@@ -575,13 +623,13 @@ impl PlanetState {
             *progress -= units as f32;
             let resource_kind = sim_world
                 .cells
-                .get(cell_index as usize)
+                .get(sim_cell as usize)
                 .and_then(|cell| cell.deposit)
                 .map(|deposit| deposit.kind);
             let Some(resource_kind) = resource_kind else {
                 continue;
             };
-            let mined = sim_world.extract_from_cell(cell_index, units);
+            let mined = sim_world.extract_from_cell(sim_cell, units);
             if mined > 0 {
                 *self.stockpiles.entry(resource_kind).or_insert(0) += mined;
             }
@@ -1481,12 +1529,12 @@ fn draw_global_hex_cell(
 }
 
 fn draw_sim_buildings(
-    sim_grid: &HexGrid,
-    buildings: &HashMap<u32, PlanetBuildingKind>,
+    visual_grid: &HexGrid,
+    buildings: &HashMap<u32, PlanetPlacedBuilding>,
     radius: f32,
 ) {
-    for (cell_index, kind) in buildings.iter() {
-        let Some(dir) = sim_grid.vertices.get(*cell_index as usize) else {
+    for (visual_cell, placed) in buildings.iter() {
+        let Some(dir) = visual_grid.vertices.get(*visual_cell as usize) else {
             continue;
         };
         let dir = dir.normalize();
@@ -1497,13 +1545,25 @@ fn draw_sim_buildings(
             dir.cross(vec3(1.0, 0.0, 0.0)).normalize()
         };
         let bitangent = dir.cross(tangent).normalize();
-        let size = 0.015;
-        let color = match kind {
+        let size_outer = 0.013;
+        let size_inner = 0.0085;
+        let color = match placed.kind {
             PlanetBuildingKind::Base => Color::from_rgba(80, 220, 220, 255),
             PlanetBuildingKind::Mine => Color::from_rgba(240, 170, 90, 255),
         };
-        draw_line_3d(center - tangent * size, center + tangent * size, color);
-        draw_line_3d(center - bitangent * size, center + bitangent * size, color);
+        let mut outer = [Vec3::ZERO; 6];
+        let mut inner = [Vec3::ZERO; 6];
+        for i in 0..6 {
+            let a = i as f32 * std::f32::consts::TAU / 6.0;
+            let ring = tangent * a.cos() + bitangent * a.sin();
+            outer[i] = center + ring * size_outer;
+            inner[i] = center + ring * size_inner;
+        }
+        for i in 0..6 {
+            let j = (i + 1) % 6;
+            draw_line_3d(outer[i], outer[j], color);
+            draw_line_3d(inner[i], inner[j], Color::new(color.r, color.g, color.b, 0.8));
+        }
     }
 }
 
@@ -2106,9 +2166,33 @@ pub fn run(
         draw_arc_on_sphere(b, c, line_radius, segments, hover_color);
         draw_arc_on_sphere(c, a, line_radius, segments, hover_color);
     }
+    let panel_buttons: [(Option<PlanetBuildingKind>, &'static str); 3] = [
+        (None, "Demolish"),
+        (Some(PlanetBuildingKind::Base), "Base"),
+        (Some(PlanetBuildingKind::Mine), "Mine"),
+    ];
+    let panel_layout = build_panel_layout(panel_buttons.len(), state.panel_collapsed);
+    let ui_capturing = panel_layout.rect.contains(mouse)
+        || (state.info_window.open && state.info_window.rect.contains(mouse))
+        || (state.confirm_window.open && state.confirm_window.rect.contains(mouse));
     let show_hover_grid = state.distance <= NEAR_GRID_DISTANCE;
-    if is_mouse_button_pressed(MouseButton::Left) {
-        if let Some(face_index) = hovered_subface {
+    if is_mouse_button_pressed(MouseButton::Left) && !ui_capturing {
+        if let Some(visual_cell) = hovered_visual_cell {
+            if let Some(placed) = state.buildings.get(&visual_cell) {
+                state.info_window.title = placed.kind.label().to_string();
+                state.info_window.rect = Rect::new(mouse.x + 12.0, mouse.y + 12.0, 280.0, 190.0);
+                state.info_window.open = true;
+                state.info_target_visual_cell = Some(visual_cell);
+            } else if let Some(face_index) = hovered_subface {
+                let face = faces[face_index];
+                let normal = face_normal(vertices, face);
+                state.target_rot = quat_from_forward_up(normal, vec3(0.0, 1.0, 0.0));
+            } else if let Some(face_index) = hovered_base_face {
+                let face = base_faces[face_index];
+                let normal = face_normal(base_vertices, face);
+                state.target_rot = quat_from_forward_up(normal, vec3(0.0, 1.0, 0.0));
+            }
+        } else if let Some(face_index) = hovered_subface {
             let face = faces[face_index];
             let normal = face_normal(vertices, face);
             state.target_rot = quat_from_forward_up(normal, vec3(0.0, 1.0, 0.0));
@@ -2118,19 +2202,24 @@ pub fn run(
             state.target_rot = quat_from_forward_up(normal, vec3(0.0, 1.0, 0.0));
         }
     }
-    if let Some(sim_grid) = state.sim_grid.as_ref() {
-        draw_sim_buildings(sim_grid, &state.buildings, line_radius + 0.012);
+    if let Some(visual_grid) = state.hex_grid.as_ref() {
+        draw_sim_buildings(visual_grid, &state.buildings, line_radius + 0.012);
     }
-    if is_mouse_button_pressed(MouseButton::Right) {
-        if let Some(cell_index) = hovered_sim_cell {
+    if is_mouse_button_pressed(MouseButton::Right) && !ui_capturing {
+        if let (Some(visual_cell), Some(sim_cell)) = (hovered_visual_cell, hovered_sim_cell) {
             if let Some(kind) = state.selected_build_tool {
-                let _ = state.place_building(cell_index, kind);
+                let _ = state.place_building(visual_cell, sim_cell, kind);
+            } else if state.buildings.contains_key(&visual_cell) {
+                state.confirm_window.open = true;
+                state.confirm_window.title = "Confirm".to_string();
+                state.confirm_window.rect = Rect::new(mouse.x + 12.0, mouse.y + 12.0, 250.0, 120.0);
+                state.confirm_target_visual_cell = Some(visual_cell);
             }
         }
     }
     if is_key_pressed(KeyCode::Delete) {
-        if let Some(cell_index) = hovered_sim_cell {
-            let _ = state.remove_building(cell_index);
+        if let Some(visual_cell) = hovered_visual_cell {
+            let _ = state.remove_building(visual_cell);
         }
     }
 
@@ -2148,6 +2237,175 @@ pub fn run(
                 hover_hit,
                 hovered_base_face,
             );
+        }
+    }
+    let panel_result = draw_build_panel(
+        panel_layout.pos,
+        panel_layout.size,
+        state.panel_collapsed,
+        mouse,
+        1.5,
+        &ctx.colors_rt,
+        &panel_buttons,
+        state.selected_build_tool,
+        |kind| match kind {
+            PlanetBuildingKind::Base => Color::from_rgba(80, 220, 220, 255),
+            PlanetBuildingKind::Mine => Color::from_rgba(240, 170, 90, 255),
+        },
+    );
+    if panel_result.toggled {
+        state.panel_collapsed = !state.panel_collapsed;
+    }
+    if let Some(option) = panel_result.clicked_option {
+        state.selected_build_tool = option;
+    }
+    if let Some(tip) = panel_result.hovered_tip {
+        let dim = measure_text(tip, None, ctx.font_sm as u16, 1.0);
+        let pad = 8.0;
+        let x = (mouse.x + 12.0).min(screen_width() - dim.width - pad * 2.0 - 4.0);
+        let y = (mouse.y + 14.0).min(screen_height() - dim.height - pad * 2.0 - 4.0);
+        draw_rectangle(
+            x,
+            y,
+            dim.width + pad * 2.0,
+            dim.height + pad * 2.0,
+            ctx.colors_rt.tooltip_bg,
+        );
+        draw_rectangle_lines(
+            x,
+            y,
+            dim.width + pad * 2.0,
+            dim.height + pad * 2.0,
+            1.0,
+            ctx.colors_rt.tooltip_border,
+        );
+        draw_text(
+            tip,
+            x + pad,
+            y + pad + dim.height - 2.0,
+            ctx.font_sm,
+            ctx.colors_rt.text_primary,
+        );
+    }
+    if state.info_window.open {
+        handle_window_drag(&mut state.info_window, mouse);
+        let close = draw_window(
+            &state.info_window,
+            WindowStyle {
+                bg: ctx.colors_rt.panel_bg,
+                border: ctx.colors_rt.panel_border,
+                title: ctx.colors_rt.text_primary,
+                title_bg: ctx.colors_rt.button_base,
+            },
+            ctx.font_sm,
+            1.4,
+            mouse,
+        );
+        if close {
+            state.info_window.open = false;
+            state.info_target_visual_cell = None;
+        } else {
+            let tx = state.info_window.rect.x + 10.0;
+            let mut ty = state.info_window.rect.y + WINDOW_TITLE_HEIGHT + 18.0;
+            if let Some(visual_cell) = state.info_target_visual_cell {
+                if let Some(placed) = state.buildings.get(&visual_cell) {
+                    draw_text(
+                        &format!("Visual cell: {}", visual_cell),
+                        tx,
+                        ty,
+                        ctx.font_sm,
+                        ctx.colors_rt.text_secondary,
+                    );
+                    ty += 20.0;
+                    draw_text(
+                        &format!("Kind: {}", placed.kind.label()),
+                        tx,
+                        ty,
+                        ctx.font_sm,
+                        ctx.colors_rt.text_secondary,
+                    );
+                    ty += 20.0;
+                    if let Some(sim_world) = state.sim_world.as_ref() {
+                        if let Some(cell) = sim_world.cells.get(placed.sim_cell as usize) {
+                            draw_text(
+                                &format!(
+                                    "Surface: {}  Buildable:{}",
+                                    surface_label(cell.surface),
+                                    if cell.buildable { "yes" } else { "no" }
+                                ),
+                                tx,
+                                ty,
+                                ctx.font_sm,
+                                ctx.colors_rt.text_secondary,
+                            );
+                            ty += 20.0;
+                            let dep = cell
+                                .deposit
+                                .map(|d| format!("{} {}/{}", resource_label(d.kind), d.remaining_amount, d.initial_amount))
+                                .unwrap_or_else(|| "No deposit".to_string());
+                            draw_text(&dep, tx, ty, ctx.font_sm, ctx.colors_rt.text_secondary);
+                            ty += 26.0;
+                        }
+                    }
+                    let demolish_rect = Rect::new(tx, ty, 120.0, 28.0);
+                    let (clicked, _) = ui_button(
+                        demolish_rect,
+                        "Demolish",
+                        mouse,
+                        ctx.font_sm,
+                        ctx.button_colors,
+                    );
+                    if clicked {
+                        state.confirm_window.open = true;
+                        state.confirm_target_visual_cell = Some(visual_cell);
+                    }
+                }
+            }
+        }
+    }
+    if state.confirm_window.open {
+        handle_window_drag(&mut state.confirm_window, mouse);
+        let close = draw_window(
+            &state.confirm_window,
+            WindowStyle {
+                bg: ctx.colors_rt.panel_bg,
+                border: ctx.colors_rt.panel_border,
+                title: ctx.colors_rt.text_primary,
+                title_bg: ctx.colors_rt.button_base,
+            },
+            ctx.font_sm,
+            1.4,
+            mouse,
+        );
+        if close {
+            state.confirm_window.open = false;
+            state.confirm_target_visual_cell = None;
+        } else {
+            let tx = state.confirm_window.rect.x + 10.0;
+            let ty = state.confirm_window.rect.y + WINDOW_TITLE_HEIGHT + 22.0;
+            let label = if let Some(cell) = state.confirm_target_visual_cell {
+                format!("Demolish building in cell {}?", cell)
+            } else {
+                "Demolish building?".to_string()
+            };
+            draw_text(&label, tx, ty, ctx.font_sm, ctx.colors_rt.text_secondary);
+            let rect_cancel = Rect::new(tx, ty + 18.0, 90.0, 28.0);
+            let rect_ok = Rect::new(tx + 100.0, ty + 18.0, 90.0, 28.0);
+            let (clicked_cancel, _) =
+                ui_button(rect_cancel, "Cancel", mouse, ctx.font_sm, ctx.button_colors);
+            let (clicked_ok, _) =
+                ui_button(rect_ok, "Delete", mouse, ctx.font_sm, ctx.button_colors);
+            if clicked_cancel {
+                state.confirm_window.open = false;
+                state.confirm_target_visual_cell = None;
+            }
+            if clicked_ok {
+                if let Some(cell) = state.confirm_target_visual_cell {
+                    let _ = state.remove_building(cell);
+                }
+                state.confirm_window.open = false;
+                state.confirm_target_visual_cell = None;
+            }
         }
     }
     if state.debug_enabled {
@@ -2193,17 +2451,21 @@ pub fn run(
             },
         );
     }
-    if let (Some(sim_world), Some(cell_index)) = (state.sim_world.as_ref(), hovered_sim_cell) {
-        if let Some(cell) = sim_world.cells.get(cell_index as usize) {
-            let buildable = if state.can_build_on_sim_cell(cell_index) {
+    if let (Some(sim_world), Some(sim_cell)) = (state.sim_world.as_ref(), hovered_sim_cell) {
+        if let Some(cell) = sim_world.cells.get(sim_cell as usize) {
+            let buildable = if state.can_build_on_sim_cell(sim_cell) {
                 "yes"
             } else {
                 "no"
             };
+            let visual_txt = hovered_visual_cell
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "-".to_string());
             draw_text_ex(
                 &format!(
-                    "Cell {}  {}  Buildable:{}",
-                    cell_index,
+                    "Cell v:{} -> s:{}  {}  Buildable:{}",
+                    visual_txt,
+                    sim_cell,
                     surface_label(cell.surface),
                     buildable
                 ),

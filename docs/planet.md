@@ -16,6 +16,7 @@
 - Math/helpers:
   - `wrap_angle`
   - Icosahedron geometry + subdivisions live in `src/core/planet_grid.rs`
+  - Planet surface/resource simulation lives in `src/core/planet_resources.rs`
   - Procedural noise + heightmap live in `src/core/planet_texture.rs`
 
 ### Noise Configuration/Data
@@ -31,6 +32,8 @@
   - camera (quaternion rotation + distance/targets),
   - meshes (`base_texture_meshes`, `relief_meshes`, fallback),
   - topology (`base_vertices`, `sector_vertices`, `sector_faces`),
+  - a single planet grid (`freq=160` default) used for hover + gameplay simulation,
+  - per-cell simulation world (surface class + deposit state),
   - regeneration cache and async state.
 
 ### Async Loader
@@ -94,21 +97,47 @@
 - Draws a highlighted face outline.
 
 6. Hover grid/cell:
-- When near (`NEAR_GRID_DISTANCE`), selects the cell from the global grid.
-- Global grid (dual of the triangulation) cached at `planet_data/planet_hex_grid.bin`.
+- Selects the cell from the same grid used by simulation.
+- Grid cache (dual of the triangulation) at `planet_data/planet_sim_grid.bin`.
 - Draws a single polygon (pent/hex) with an outer ring at `overlay_radius` and an inner ring at `surface_radius`.
 
-7. Left click:
+7. Gameplay cell simulation:
+- Uses the same grid cache (`planet_data/planet_sim_grid.bin`) for gameplay state.
+- Builds or loads per-cell simulation snapshot (`planet_data/planet_resources.bin`).
+- Classifies cells as `Land`, `Coast`, or `Water` from noise/sea-level, then derives lithology and deposits.
+- Buildability currently allows only `Land`.
+
+8. Left click:
 - Reorients the camera to the selected face normal.
 
-8. UI:
+9. UI:
 - Debug controls (`draw_planet_controls`).
-- Text for the hovered sector/zone name.
+- Text for the hovered sector/zone name plus hovered sim-cell info (surface/buildability/deposit).
+- Basic build/mining controls:
+  - `1`: no tool
+  - `2`: `Base`
+  - `3`: `Mine`
+  - Right click on hovered sim cell: place selected building (validated by `can_build`)
+  - `Delete`: remove building on hovered sim cell
+  - `M`: export hovered base-face zone PNG to `planet_data/zone_maps/`
+  - `Shift+M`: export PNGs for all base-face zones
+  - Mines extract continuously from cell deposits and reduce persisted `remaining_amount`.
 
 ## 5) Key Picking/Coordinate Functions
 - `project_to_screen`: world -> screen with clipping.
 - `point_in_frustum`: fast culling in clip-space.
 - `hovered_face`: picks the face by max dot(normal, hit direction).
 - `face_name`: greek label for base faces/subfaces.
+
+## TODO (Migration from `planet_sector.rs`)
+- Add full construction economy: requirements, payment/claim, build progress/time.
+- Move per-building inventories and capacities from 2D sector logic.
+- Migrate logistics units, route blocks, and station in/out behavior.
+- Migrate auto-supply behavior (`Base` / `Builder`) and its priorities.
+- Implement mining expansion (`mine_extra`) and multi-cell extraction behavior.
+- Add advanced building windows (unit list, spawn controls, supply toggles).
+- Persist full planet gameplay state in a dedicated 3D save format.
+- Add per-building placement rules and validation beyond the current `Land` gate.
+- Draw logistics routes and flow overlays directly on the sphere.
 
 

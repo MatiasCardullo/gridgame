@@ -416,7 +416,7 @@ fn generate_deposit(
     for (_, score) in candidates.iter_mut() {
         *score += (jitter - 0.5) * 0.15;
     }
-    candidates.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    candidates.sort_by(|a, b| b.1.total_cmp(&a.1));
     let (kind, score) = candidates[0];
 
     let threshold = match kind {

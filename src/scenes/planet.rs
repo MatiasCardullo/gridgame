@@ -31,7 +31,6 @@ use crate::core::map_common::{build_panel_layout, handle_window_drag};
 const PLANET_DATA_DIR: &str = "planet_data";
 const MESH_POINTS_PATH: &str = "planet_data/planet_mesh_points.csv";
 const PLANET_NOISE_PATH: &str = "planet_data/planet_noise.json";
-const HEX_GRID_CACHE_PATH: &str = "planet_data/planet_hex_grid.bin";
 const SIM_GRID_CACHE_PATH: &str = "planet_data/planet_sim_grid.bin";
 const PLANET_RESOURCES_PATH: &str = "planet_data/planet_resources.bin";
 const PLANET_BUILDINGS_PATH: &str = "planet_data/planet_buildings.json";
@@ -43,9 +42,7 @@ const FALLBACK_RELIEF_SUBDIVISIONS: usize = 1;
 const REGEN_FACE_GRAIN: usize = 12;
 const ICOSAHEDRON_FACE_COUNT: usize = 20;
 const SUBFACE_HOVER_MAX_DISTANCE: f32 = 5.6;
-const NEAR_GRID_DISTANCE: f32 = 2.4;
-const HOVER_GRID_HEXES_ACROSS: i32 = 320;
-const SIM_GRID_HEXES_ACROSS: i32 = 128;
+const SIM_GRID_HEXES_ACROSS: i32 = 160;
 const PLANET_OVERLAY_OFFSET: f32 = 0.01;
 const PLANET_SIM_SEED: u64 = 0xDA7A_51C4_1234_8B9E;
 const MINE_EXTRACT_RATE_PER_SEC: f32 = 6.0;
@@ -170,30 +167,37 @@ enum PlanetLoadStatus {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 enum PlanetBuildingKind {
     Base,
+    Builder,
+    Housing,
+    Factory,
     Mine,
+    Warehouse,
+    Logistics,
+    Route,
 }
 
 impl PlanetBuildingKind {
     fn label(self) -> &'static str {
         match self {
             PlanetBuildingKind::Base => "Base",
+            PlanetBuildingKind::Builder => "Builder",
+            PlanetBuildingKind::Housing => "Housing",
+            PlanetBuildingKind::Factory => "Factory",
             PlanetBuildingKind::Mine => "Mine",
+            PlanetBuildingKind::Warehouse => "Warehouse",
+            PlanetBuildingKind::Logistics => "Logistics",
+            PlanetBuildingKind::Route => "Route",
         }
     }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct PlanetBuildingRecord {
-    visual_cell: u32,
-    sim_cell: u32,
+    #[serde(default, alias = "visual_cell")]
+    cell_index: u32,
     kind: PlanetBuildingKind,
 }
 
-#[derive(Clone, Copy, Debug)]
-struct PlanetPlacedBuilding {
-    sim_cell: u32,
-    kind: PlanetBuildingKind,
-}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct PlanetBuildingsSnapshot {
@@ -234,21 +238,20 @@ pub struct PlanetState {
     pub debug_enabled: bool,
     pub heightmap_texture: Option<Texture2D>,
     pub texture_config: PlanetNoiseConfig,
-    hex_grid: Option<HexGrid>,
-    hex_grid_rx: Option<Receiver<HexGrid>>,
     sim_grid: Option<HexGrid>,
     sim_grid_rx: Option<Receiver<HexGrid>>,
     sim_world: Option<PlanetSimWorld>,
     selected_build_tool: Option<PlanetBuildingKind>,
     panel_collapsed: bool,
-    buildings: HashMap<u32, PlanetPlacedBuilding>,
+    buildings: HashMap<u32, PlanetBuildingKind>,
     buildings_dirty: bool,
     mine_progress: HashMap<u32, f32>,
     stockpiles: HashMap<PlanetResourceKind, u32>,
+    min_cell_edge_dist_unit: f32,
     info_window: WindowState,
-    info_target_visual_cell: Option<u32>,
+    info_target_cell: Option<u32>,
     confirm_window: WindowState,
-    confirm_target_visual_cell: Option<u32>,
+    confirm_target_cell: Option<u32>,
     relief_cache: HashMap<ReliefCacheKey, ReliefCacheEntry>,
     pending_relief_key: Option<ReliefCacheKey>,
     regen_rx: Option<Receiver<RegenMessage>>,
@@ -316,12 +319,6 @@ impl PlanetState {
             .collect::<Vec<_>>();
         let face_centers = build_face_centers(&sector_vertices, &sector_faces);
         let base_faces = build_faces(&base_vertices, &icosahedron_edges());
-        let hex_grid_rx = Some(start_hex_grid_build(
-            HEX_GRID_CACHE_PATH,
-            HOVER_GRID_HEXES_ACROSS,
-            &base_vertices,
-            &base_faces,
-        ));
         let sim_grid_rx = Some(start_hex_grid_build(
             SIM_GRID_CACHE_PATH,
             SIM_GRID_HEXES_ACROSS,
@@ -351,8 +348,6 @@ impl PlanetState {
             debug_enabled: PLANET_DEBUG_UI_ENABLED_DEFAULT,
             heightmap_texture: Some(heightmap_texture),
             texture_config: config,
-            hex_grid: None,
-            hex_grid_rx,
             sim_grid: None,
             sim_grid_rx,
             sim_world: None,
@@ -362,6 +357,7 @@ impl PlanetState {
             buildings_dirty: false,
             mine_progress: HashMap::new(),
             stockpiles: HashMap::new(),
+            min_cell_edge_dist_unit: 0.010,
             info_window: WindowState {
                 title: String::new(),
                 rect: Rect::new(40.0, 120.0, 260.0, 170.0),
@@ -371,7 +367,7 @@ impl PlanetState {
                 drag_offset: Vec2::ZERO,
                 show_units: false,
             },
-            info_target_visual_cell: None,
+            info_target_cell: None,
             confirm_window: WindowState {
                 title: "Confirm".to_string(),
                 rect: Rect::new(40.0, 120.0, 250.0, 120.0),
@@ -381,7 +377,7 @@ impl PlanetState {
                 drag_offset: Vec2::ZERO,
                 show_units: false,
             },
-            confirm_target_visual_cell: None,
+            confirm_target_cell: None,
             relief_cache: HashMap::new(),
             pending_relief_key: None,
             regen_rx: None,
@@ -523,13 +519,7 @@ impl PlanetState {
         };
         self.buildings.clear();
         for record in snapshot.buildings.into_iter() {
-            self.buildings.insert(
-                record.visual_cell,
-                PlanetPlacedBuilding {
-                    sim_cell: record.sim_cell,
-                    kind: record.kind,
-                },
-            );
+            self.buildings.insert(record.cell_index, record.kind);
         }
         self.buildings_dirty = false;
     }
@@ -543,10 +533,9 @@ impl PlanetState {
             buildings: self
                 .buildings
                 .iter()
-                .map(|(visual_cell, placed)| PlanetBuildingRecord {
-                    visual_cell: *visual_cell,
-                    sim_cell: placed.sim_cell,
-                    kind: placed.kind,
+                .map(|(cell_index, kind)| PlanetBuildingRecord {
+                    cell_index: *cell_index,
+                    kind: *kind,
                 })
                 .collect(),
         };
@@ -556,17 +545,17 @@ impl PlanetState {
         }
     }
 
-    fn can_place_building(&self, visual_cell: u32, sim_cell: u32, kind: PlanetBuildingKind) -> bool {
-        if self.buildings.contains_key(&visual_cell) {
+    fn can_place_building(&self, cell_index: u32, kind: PlanetBuildingKind) -> bool {
+        if self.buildings.contains_key(&cell_index) {
             return false;
         }
-        if !self.can_build_on_sim_cell(sim_cell) {
+        if !self.can_build_on_sim_cell(cell_index) {
             return false;
         }
         match (kind, self.sim_world.as_ref()) {
             (PlanetBuildingKind::Mine, Some(world)) => world
                 .cells
-                .get(sim_cell as usize)
+                .get(cell_index as usize)
                 .and_then(|cell| cell.deposit)
                 .map(|deposit| deposit.remaining_amount > 0)
                 .unwrap_or(false),
@@ -574,25 +563,19 @@ impl PlanetState {
         }
     }
 
-    fn place_building(&mut self, visual_cell: u32, sim_cell: u32, kind: PlanetBuildingKind) -> bool {
-        if !self.can_place_building(visual_cell, sim_cell, kind) {
+    fn place_building(&mut self, cell_index: u32, kind: PlanetBuildingKind) -> bool {
+        if !self.can_place_building(cell_index, kind) {
             return false;
         }
-        self.buildings.insert(
-            visual_cell,
-            PlanetPlacedBuilding {
-                sim_cell,
-                kind,
-            },
-        );
+        self.buildings.insert(cell_index, kind);
         self.buildings_dirty = true;
         true
     }
 
-    fn remove_building(&mut self, visual_cell: u32) -> bool {
-        let removed = self.buildings.remove(&visual_cell).is_some();
+    fn remove_building(&mut self, cell_index: u32) -> bool {
+        let removed = self.buildings.remove(&cell_index).is_some();
         if removed {
-            self.mine_progress.remove(&visual_cell);
+            self.mine_progress.remove(&cell_index);
             self.buildings_dirty = true;
         }
         removed
@@ -602,19 +585,19 @@ impl PlanetState {
         let Some(sim_world) = self.sim_world.as_mut() else {
             return;
         };
-        let mine_cells: Vec<(u32, u32)> = self
+        let mine_cells: Vec<u32> = self
             .buildings
             .iter()
-            .filter_map(|(visual_cell, placed)| {
-                if placed.kind == PlanetBuildingKind::Mine {
-                    Some((*visual_cell, placed.sim_cell))
+            .filter_map(|(cell_index, kind)| {
+                if *kind == PlanetBuildingKind::Mine {
+                    Some(*cell_index)
                 } else {
                     None
                 }
             })
             .collect();
-        for (visual_cell, sim_cell) in mine_cells.into_iter() {
-            let progress = self.mine_progress.entry(visual_cell).or_insert(0.0);
+        for cell_index in mine_cells.into_iter() {
+            let progress = self.mine_progress.entry(cell_index).or_insert(0.0);
             *progress += dt * MINE_EXTRACT_RATE_PER_SEC;
             let units = progress.floor() as u32;
             if units == 0 {
@@ -623,13 +606,13 @@ impl PlanetState {
             *progress -= units as f32;
             let resource_kind = sim_world
                 .cells
-                .get(sim_cell as usize)
+                .get(cell_index as usize)
                 .and_then(|cell| cell.deposit)
                 .map(|deposit| deposit.kind);
             let Some(resource_kind) = resource_kind else {
                 continue;
             };
-            let mined = sim_world.extract_from_cell(sim_cell, units);
+            let mined = sim_world.extract_from_cell(cell_index, units);
             if mined > 0 {
                 *self.stockpiles.entry(resource_kind).or_insert(0) += mined;
             }
@@ -1474,7 +1457,7 @@ fn draw_global_hex_cell(
             (angle, center)
         })
         .collect();
-    ordered.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+    ordered.sort_by(|a, b| a.0.total_cmp(&b.0));
 
     let mut outer_screen: Vec<Vec2> = Vec::with_capacity(ordered.len());
     let mut inner_screen: Vec<Vec2> = Vec::with_capacity(ordered.len());
@@ -1530,40 +1513,113 @@ fn draw_global_hex_cell(
 
 fn draw_sim_buildings(
     visual_grid: &HexGrid,
-    buildings: &HashMap<u32, PlanetPlacedBuilding>,
+    _sim_world: Option<&PlanetSimWorld>,
+    _config: &PlanetNoiseConfig,
+    buildings: &HashMap<u32, PlanetBuildingKind>,
     radius: f32,
+    min_cell_edge_dist_unit: f32,
 ) {
-    for (visual_cell, placed) in buildings.iter() {
-        let Some(dir) = visual_grid.vertices.get(*visual_cell as usize) else {
+    let target_apothem = (min_cell_edge_dist_unit * 0.9 * 0.62).max(0.0005);
+    // Keep buildings above surface but below overlay lines (PLANET_OVERLAY_OFFSET=0.01).
+    let surface_lift = 0.0035;
+    for (cell_index, kind) in buildings.iter() {
+        let Some(vertex_dir) = visual_grid.vertices.get(*cell_index as usize) else {
             continue;
         };
-        let dir = dir.normalize();
-        let center = dir * radius;
-        let tangent = if dir.y.abs() < 0.9 {
-            dir.cross(vec3(0.0, 1.0, 0.0)).normalize()
-        } else {
-            dir.cross(vec3(1.0, 0.0, 0.0)).normalize()
-        };
-        let bitangent = dir.cross(tangent).normalize();
-        let size_outer = 0.013;
-        let size_inner = 0.0085;
-        let color = match placed.kind {
+        let vertex_dir = vertex_dir.normalize();
+        let face_list = &visual_grid.vertex_faces[*cell_index as usize];
+        let sides = face_list.len();
+        if sides < 3 {
+            continue;
+        }
+        let mut centers: Vec<Vec3> = Vec::with_capacity(face_list.len());
+        for &face_index in face_list.iter() {
+            centers.push(visual_grid.face_centers[face_index as usize]);
+        }
+        let mut tangent_x = Vec3::ZERO;
+        for center in centers.iter() {
+            let candidate = *center - vertex_dir * vertex_dir.dot(*center);
+            if candidate.length() > 1e-6 {
+                tangent_x = candidate.normalize();
+                break;
+            }
+        }
+        if tangent_x.length() < 1e-6 {
+            continue;
+        }
+        let tangent_y = vertex_dir.cross(tangent_x).normalize();
+        if tangent_y.length() < 1e-6 {
+            continue;
+        }
+        let mut ordered: Vec<f32> = centers
+            .iter()
+            .map(|center| {
+                let p = vec2(center.dot(tangent_x), center.dot(tangent_y));
+                p.y.atan2(p.x)
+            })
+            .collect();
+        ordered.sort_by(|a, b| a.total_cmp(b));
+        let start_angle = ordered[0];
+        let angle_step = std::f32::consts::TAU / sides as f32;
+        let cos_half = (std::f32::consts::PI / sides as f32).cos().max(1e-4);
+        let outer_radius = target_apothem / cos_half;
+        let mut outer_dirs: Vec<Vec3> = Vec::with_capacity(sides);
+        for i in 0..sides {
+            let a = start_angle + i as f32 * angle_step;
+            let ring = tangent_x * a.cos() + tangent_y * a.sin();
+            outer_dirs.push((vertex_dir + ring * outer_radius).normalize());
+        }
+
+        let color = match kind {
             PlanetBuildingKind::Base => Color::from_rgba(80, 220, 220, 255),
+            PlanetBuildingKind::Builder => Color::from_rgba(255, 214, 102, 255),
+            PlanetBuildingKind::Housing => Color::from_rgba(118, 203, 152, 255),
+            PlanetBuildingKind::Factory => Color::from_rgba(170, 170, 196, 255),
             PlanetBuildingKind::Mine => Color::from_rgba(240, 170, 90, 255),
+            PlanetBuildingKind::Warehouse => Color::from_rgba(116, 176, 224, 255),
+            PlanetBuildingKind::Logistics => Color::from_rgba(255, 128, 128, 255),
+            PlanetBuildingKind::Route => Color::from_rgba(220, 220, 120, 255),
         };
-        let mut outer = [Vec3::ZERO; 6];
-        let mut inner = [Vec3::ZERO; 6];
-        for i in 0..6 {
-            let a = i as f32 * std::f32::consts::TAU / 6.0;
-            let ring = tangent * a.cos() + bitangent * a.sin();
-            outer[i] = center + ring * size_outer;
-            inner[i] = center + ring * size_inner;
+        let base_radius = radius + surface_lift;
+        let height_scale = match kind {
+            PlanetBuildingKind::Route => 0.42,
+            PlanetBuildingKind::Logistics => 0.74,
+            PlanetBuildingKind::Warehouse => 0.70,
+            PlanetBuildingKind::Housing => 0.82,
+            PlanetBuildingKind::Builder => 0.90,
+            PlanetBuildingKind::Mine => 1.00,
+            PlanetBuildingKind::Factory => 1.08,
+            PlanetBuildingKind::Base => 1.15,
+        };
+        let apex_height = ((target_apothem * radius * 1.9) * height_scale).max(0.008);
+        let apex = vertex_dir * (base_radius + apex_height);
+        let base_center = vertex_dir * base_radius;
+        let base_color = Color::new(color.r * 0.75, color.g * 0.75, color.b * 0.75, 1.0);
+        let mut vertices: Vec<Vertex> = Vec::with_capacity(sides * 6);
+        let mut indices: Vec<u16> = Vec::with_capacity(sides * 6);
+        for i in 0..outer_dirs.len() {
+            let j = (i + 1) % outer_dirs.len();
+            let p0 = outer_dirs[i] * base_radius;
+            let p1 = outer_dirs[j] * base_radius;
+
+            let tri0 = vertices.len() as u16;
+            vertices.push(Vertex::new2(apex, vec2(0.0, 0.0), color));
+            vertices.push(Vertex::new2(p0, vec2(0.0, 0.0), color));
+            vertices.push(Vertex::new2(p1, vec2(0.0, 0.0), color));
+            indices.extend_from_slice(&[tri0, tri0 + 1, tri0 + 2]);
+
+            let tri1 = vertices.len() as u16;
+            vertices.push(Vertex::new2(base_center, vec2(0.0, 0.0), base_color));
+            vertices.push(Vertex::new2(p1, vec2(0.0, 0.0), base_color));
+            vertices.push(Vertex::new2(p0, vec2(0.0, 0.0), base_color));
+            indices.extend_from_slice(&[tri1, tri1 + 1, tri1 + 2]);
         }
-        for i in 0..6 {
-            let j = (i + 1) % 6;
-            draw_line_3d(outer[i], outer[j], color);
-            draw_line_3d(inner[i], inner[j], Color::new(color.r, color.g, color.b, 0.8));
-        }
+        let mesh = Mesh {
+            vertices,
+            indices,
+            texture: None,
+        };
+        draw_mesh(&mesh);
     }
 }
 
@@ -1591,6 +1647,189 @@ fn hovered_hex_vertex(hex_grid: &HexGrid, hover_dir: Vec3, base_face_index: usiz
         }
     }
     Some(best_index)
+}
+
+// Computes the minimum center-to-edge distance (apothem) across all grid cells on the unit sphere.
+fn min_cell_edge_distance_unit(hex_grid: &HexGrid) -> f32 {
+    let mut min_dist = f32::MAX;
+    for (vertex_index, vertex_dir) in hex_grid.vertices.iter().enumerate() {
+        let face_list = &hex_grid.vertex_faces[vertex_index];
+        if face_list.len() < 3 {
+            continue;
+        }
+        let vertex_dir = vertex_dir.normalize();
+        let mut centers: Vec<Vec3> = Vec::with_capacity(face_list.len());
+        for &face_index in face_list.iter() {
+            centers.push(hex_grid.face_centers[face_index as usize]);
+        }
+
+        let mut tangent_x = Vec3::ZERO;
+        for center in centers.iter() {
+            let candidate = *center - vertex_dir * vertex_dir.dot(*center);
+            if candidate.length() > 1e-6 {
+                tangent_x = candidate.normalize();
+                break;
+            }
+        }
+        if tangent_x.length() < 1e-6 {
+            continue;
+        }
+        let tangent_y = vertex_dir.cross(tangent_x).normalize();
+        if tangent_y.length() < 1e-6 {
+            continue;
+        }
+
+        let mut ordered: Vec<(f32, Vec2)> = centers
+            .iter()
+            .map(|center| {
+                let p = vec2(center.dot(tangent_x), center.dot(tangent_y));
+                (p.y.atan2(p.x), p)
+            })
+            .collect();
+        ordered.sort_by(|a, b| a.0.total_cmp(&b.0));
+
+        for i in 0..ordered.len() {
+            let a = ordered[i].1;
+            let b = ordered[(i + 1) % ordered.len()].1;
+            let edge = b - a;
+            let denom = edge.length_squared();
+            if denom <= 1e-12 {
+                continue;
+            }
+            let t = (-a).dot(edge) / denom;
+            let t_clamped = t.clamp(0.0, 1.0);
+            let closest = a + edge * t_clamped;
+            min_dist = min_dist.min(closest.length());
+        }
+    }
+    if min_dist.is_finite() && min_dist > 0.0 {
+        min_dist
+    } else {
+        0.010
+    }
+}
+
+// Draws a filled triangle into an RGBA8 image buffer.
+fn draw_triangle_rgba(
+    pixels: &mut [u8],
+    width: usize,
+    height: usize,
+    a: Vec2,
+    b: Vec2,
+    c: Vec2,
+    color: (u8, u8, u8, u8),
+) {
+    let min_x = a.x.min(b.x.min(c.x)).floor().max(0.0) as i32;
+    let max_x = a.x.max(b.x.max(c.x)).ceil().min((width - 1) as f32) as i32;
+    let min_y = a.y.min(b.y.min(c.y)).floor().max(0.0) as i32;
+    let max_y = a.y.max(b.y.max(c.y)).ceil().min((height - 1) as f32) as i32;
+    let area = (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x);
+    if area.abs() < 1e-6 {
+        return;
+    }
+    for y in min_y..=max_y {
+        for x in min_x..=max_x {
+            let p = vec2(x as f32 + 0.5, y as f32 + 0.5);
+            let w0 = (b.x - a.x) * (p.y - a.y) - (b.y - a.y) * (p.x - a.x);
+            let w1 = (c.x - b.x) * (p.y - b.y) - (c.y - b.y) * (p.x - b.x);
+            let w2 = (a.x - c.x) * (p.y - c.y) - (a.y - c.y) * (p.x - c.x);
+            if (w0 >= 0.0 && w1 >= 0.0 && w2 >= 0.0) || (w0 <= 0.0 && w1 <= 0.0 && w2 <= 0.0) {
+                let idx = ((y as usize) * width + x as usize) * 4;
+                pixels[idx] = color.0;
+                pixels[idx + 1] = color.1;
+                pixels[idx + 2] = color.2;
+                pixels[idx + 3] = color.3;
+            }
+        }
+    }
+}
+
+// Draws a filled convex polygon (fan triangulation) into an RGBA8 image buffer.
+fn draw_polygon_filled_rgba(
+    pixels: &mut [u8],
+    width: usize,
+    height: usize,
+    poly: &[Vec2],
+    color: (u8, u8, u8, u8),
+) {
+    if poly.len() < 3 {
+        return;
+    }
+    for i in 1..(poly.len() - 1) {
+        draw_triangle_rgba(pixels, width, height, poly[0], poly[i], poly[i + 1], color);
+    }
+}
+
+fn regular_polygon(center: Vec2, radius: f32, sides: usize) -> Vec<Vec2> {
+    let mut poly = Vec::with_capacity(sides);
+    for i in 0..sides {
+        let a = (std::f32::consts::TAU * i as f32 / sides as f32) - std::f32::consts::FRAC_PI_2;
+        poly.push(center + vec2(a.cos(), a.sin()) * radius);
+    }
+    poly
+}
+
+// Saves a flat equilateral-triangle PNG filled with a regular hex grid (cells_per_side per edge).
+fn save_test_triangle_hex_grid_png(path: &str, cells_per_side: i32, size: u16) {
+    let side_len = cells_per_side.max(1);
+    let n = side_len - 1;
+    let pad = 24.0;
+    let w = size as usize;
+    let h = size as usize;
+    let mut pixels = vec![0u8; w * h * 4];
+    for i in 0..(w * h) {
+        let idx = i * 4;
+        pixels[idx] = 15;
+        pixels[idx + 1] = 19;
+        pixels[idx + 2] = 25;
+        pixels[idx + 3] = 255;
+    }
+
+    let sqrt3 = 3.0_f32.sqrt();
+    let mut centers: Vec<Vec2> = Vec::new();
+    let mut min = vec2(f32::MAX, f32::MAX);
+    let mut max = vec2(-f32::MAX, -f32::MAX);
+    for r in 0..side_len {
+        for q in 0..(side_len - r) {
+            let x = sqrt3 * (q as f32 + 0.5 * r as f32);
+            let y = 1.5 * r as f32;
+            let p = vec2(x, y);
+            min.x = min.x.min(p.x);
+            min.y = min.y.min(p.y);
+            max.x = max.x.max(p.x);
+            max.y = max.y.max(p.y);
+            centers.push(p);
+        }
+    }
+    let span = (max - min).max(vec2(1e-6, 1e-6));
+    let sx = (size as f32 - pad * 2.0) / span.x;
+    let sy = (size as f32 - pad * 2.0) / span.y;
+    let scale = sx.min(sy);
+    let hex_radius = scale * 0.9;
+    let mut px_centers: Vec<(i32, i32, Vec2)> = Vec::with_capacity(centers.len());
+    for r in 0..side_len {
+        for q in 0..(side_len - r) {
+            let p = vec2(sqrt3 * (q as f32 + 0.5 * r as f32), 1.5 * r as f32);
+            let x = pad + (p.x - min.x) * scale;
+            let y = pad + (p.y - min.y) * scale;
+            px_centers.push((q, r, vec2(x, y)));
+        }
+    }
+    for (q, r, c) in px_centers.iter() {
+        let is_corner = (*q == 0 && *r == 0) || (*q == n && *r == 0) || (*q == 0 && *r == n);
+        let sides = if is_corner { 5 } else { 6 };
+        let poly = regular_polygon(*c, hex_radius, sides);
+        draw_polygon_filled_rgba(&mut pixels, w, h, &poly, (80, 130, 95, 255));
+    }
+    if let Some(parent) = std::path::Path::new(path).parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let image = Image {
+        bytes: pixels,
+        width: size,
+        height: size,
+    };
+    image.export_png(path);
 }
 
 // Draws a great-circle arc between two points on the sphere.
@@ -1910,19 +2149,19 @@ pub fn run(
     if !state.relief_available && state.show_relief {
         state.show_relief = false;
     }
-    if state.hex_grid.is_none() {
-        if let Some(rx) = state.hex_grid_rx.as_ref() {
-            if let Ok(grid) = rx.try_recv() {
-                state.hex_grid = Some(grid);
-                state.hex_grid_rx = None;
-            }
-        }
-    }
     if state.sim_grid.is_none() {
         if let Some(rx) = state.sim_grid_rx.as_ref() {
             if let Ok(grid) = rx.try_recv() {
+                let t0 = Instant::now();
+                let min_edge = min_cell_edge_distance_unit(&grid);
                 state.sim_grid = Some(grid);
                 state.sim_grid_rx = None;
+                state.min_cell_edge_dist_unit = min_edge;
+                planet_perf_log(&format!(
+                    "sim grid metrics min_cell_edge_dist_unit={:.7} took_ms={}",
+                    min_edge,
+                    t0.elapsed().as_millis()
+                ));
             }
         }
     }
@@ -1982,6 +2221,24 @@ pub fn run(
     }
     if is_key_pressed(KeyCode::Key3) {
         state.selected_build_tool = Some(PlanetBuildingKind::Mine);
+    }
+    if is_key_pressed(KeyCode::Key4) {
+        state.selected_build_tool = Some(PlanetBuildingKind::Builder);
+    }
+    if is_key_pressed(KeyCode::Key5) {
+        state.selected_build_tool = Some(PlanetBuildingKind::Housing);
+    }
+    if is_key_pressed(KeyCode::Key6) {
+        state.selected_build_tool = Some(PlanetBuildingKind::Factory);
+    }
+    if is_key_pressed(KeyCode::Key7) {
+        state.selected_build_tool = Some(PlanetBuildingKind::Warehouse);
+    }
+    if is_key_pressed(KeyCode::Key8) {
+        state.selected_build_tool = Some(PlanetBuildingKind::Logistics);
+    }
+    if is_key_pressed(KeyCode::Key9) {
+        state.selected_build_tool = Some(PlanetBuildingKind::Route);
     }
     state.tick_mining(frame_time);
 
@@ -2096,11 +2353,11 @@ pub fn run(
         }
     }
     
-    let vertices = &state.sector_vertices;
-    let base_vertices = &state.base_vertices;
+    let vertices = state.sector_vertices.clone();
+    let base_vertices = state.base_vertices.clone();
     let edges = icosahedron_edges();
     let faces = state.sector_faces.clone();
-    let base_faces = build_faces(base_vertices, &edges);
+    let base_faces = build_faces(&base_vertices, &edges);
     let edge_color = Color::from_rgba(200, 220, 250, 255);
     let hover_color = Color::from_rgba(255, 200, 120, 255);
     let grid_color = Color::from_rgba(70, 78, 86, 255);
@@ -2124,27 +2381,16 @@ pub fn run(
     let mut hovered_subface: Option<usize> = None;
     let mut hovered_base_face: Option<usize> = None;
     let mut hover_hit: Option<Vec3> = None;
-    let mut hovered_visual_cell: Option<u32> = None;
-    let mut hovered_sim_cell: Option<u32> = None;
+    let mut hovered_cell: Option<u32> = None;
     if let Some((origin, dir)) = ray_from_mouse(&camera, mouse) {
         if let Some(hit) = ray_sphere_intersection(origin, dir, radius) {
             hover_hit = Some(hit);
-            hovered_base_face = hovered_face(hit, &base_faces, base_vertices);
+            hovered_base_face = hovered_face(hit, &base_faces, &base_vertices);
             if use_subface_hover {
-                hovered_subface = hovered_face(hit, &faces, vertices);
-            }
-            if let (Some(hex_grid), Some(base_face)) = (state.hex_grid.as_ref(), hovered_base_face) {
-                hovered_visual_cell = hovered_hex_vertex(hex_grid, hit.normalize(), base_face);
+                hovered_subface = hovered_face(hit, &faces, &vertices);
             }
             if let (Some(sim_grid), Some(base_face)) = (state.sim_grid.as_ref(), hovered_base_face) {
-                let sim_dir = if let (Some(hex_grid), Some(visual_cell)) =
-                    (state.hex_grid.as_ref(), hovered_visual_cell)
-                {
-                    hex_grid.vertices[visual_cell as usize].normalize()
-                } else {
-                    hit.normalize()
-                };
-                hovered_sim_cell = hovered_hex_vertex(sim_grid, sim_dir, base_face);
+                hovered_cell = hovered_hex_vertex(sim_grid, hit.normalize(), base_face);
             }
         }
     }
@@ -2166,74 +2412,94 @@ pub fn run(
         draw_arc_on_sphere(b, c, line_radius, segments, hover_color);
         draw_arc_on_sphere(c, a, line_radius, segments, hover_color);
     }
-    let panel_buttons: [(Option<PlanetBuildingKind>, &'static str); 3] = [
+    let panel_buttons: [(Option<PlanetBuildingKind>, &'static str); 9] = [
         (None, "Demolish"),
         (Some(PlanetBuildingKind::Base), "Base"),
+        (Some(PlanetBuildingKind::Builder), "Builder"),
+        (Some(PlanetBuildingKind::Housing), "Housing"),
+        (Some(PlanetBuildingKind::Factory), "Factory"),
         (Some(PlanetBuildingKind::Mine), "Mine"),
+        (Some(PlanetBuildingKind::Warehouse), "Warehouse"),
+        (Some(PlanetBuildingKind::Logistics), "Logistics"),
+        (Some(PlanetBuildingKind::Route), "Route"),
     ];
     let panel_layout = build_panel_layout(panel_buttons.len(), state.panel_collapsed);
     let ui_capturing = panel_layout.rect.contains(mouse)
         || (state.info_window.open && state.info_window.rect.contains(mouse))
         || (state.confirm_window.open && state.confirm_window.rect.contains(mouse));
-    let show_hover_grid = state.distance <= NEAR_GRID_DISTANCE;
+    let show_hover_grid = hovered_cell.is_some();
     if is_mouse_button_pressed(MouseButton::Left) && !ui_capturing {
-        if let Some(visual_cell) = hovered_visual_cell {
-            if let Some(placed) = state.buildings.get(&visual_cell) {
-                state.info_window.title = placed.kind.label().to_string();
+        if let Some(cell_index) = hovered_cell {
+            if let Some(kind) = state.buildings.get(&cell_index) {
+                state.info_window.title = kind.label().to_string();
                 state.info_window.rect = Rect::new(mouse.x + 12.0, mouse.y + 12.0, 280.0, 190.0);
                 state.info_window.open = true;
-                state.info_target_visual_cell = Some(visual_cell);
+                state.info_target_cell = Some(cell_index);
             } else if let Some(face_index) = hovered_subface {
                 let face = faces[face_index];
-                let normal = face_normal(vertices, face);
+                let normal = face_normal(&vertices, face);
                 state.target_rot = quat_from_forward_up(normal, vec3(0.0, 1.0, 0.0));
             } else if let Some(face_index) = hovered_base_face {
                 let face = base_faces[face_index];
-                let normal = face_normal(base_vertices, face);
+                let normal = face_normal(&base_vertices, face);
                 state.target_rot = quat_from_forward_up(normal, vec3(0.0, 1.0, 0.0));
             }
         } else if let Some(face_index) = hovered_subface {
             let face = faces[face_index];
-            let normal = face_normal(vertices, face);
+            let normal = face_normal(&vertices, face);
             state.target_rot = quat_from_forward_up(normal, vec3(0.0, 1.0, 0.0));
         } else if let Some(face_index) = hovered_base_face {
             let face = base_faces[face_index];
-            let normal = face_normal(base_vertices, face);
+            let normal = face_normal(&base_vertices, face);
             state.target_rot = quat_from_forward_up(normal, vec3(0.0, 1.0, 0.0));
         }
     }
-    if let Some(visual_grid) = state.hex_grid.as_ref() {
-        draw_sim_buildings(visual_grid, &state.buildings, line_radius + 0.012);
+    if let Some(sim_grid) = state.sim_grid.as_ref() {
+        draw_sim_buildings(
+            sim_grid,
+            state.sim_world.as_ref(),
+            &state.config,
+            &state.buildings,
+            radius,
+            state.min_cell_edge_dist_unit,
+        );
     }
     if is_mouse_button_pressed(MouseButton::Right) && !ui_capturing {
-        if let (Some(visual_cell), Some(sim_cell)) = (hovered_visual_cell, hovered_sim_cell) {
+        if let Some(cell_index) = hovered_cell {
             if let Some(kind) = state.selected_build_tool {
-                let _ = state.place_building(visual_cell, sim_cell, kind);
-            } else if state.buildings.contains_key(&visual_cell) {
+                let _ = state.place_building(cell_index, kind);
+            } else if state.buildings.contains_key(&cell_index) {
                 state.confirm_window.open = true;
                 state.confirm_window.title = "Confirm".to_string();
                 state.confirm_window.rect = Rect::new(mouse.x + 12.0, mouse.y + 12.0, 250.0, 120.0);
-                state.confirm_target_visual_cell = Some(visual_cell);
+                state.confirm_target_cell = Some(cell_index);
             }
         }
     }
     if is_key_pressed(KeyCode::Delete) {
-        if let Some(visual_cell) = hovered_visual_cell {
-            let _ = state.remove_building(visual_cell);
+        if let Some(cell_index) = hovered_cell {
+            let _ = state.remove_building(cell_index);
         }
     }
-
+    if is_key_pressed(KeyCode::P) {
+        save_test_triangle_hex_grid_png(
+            "planet_data/zone_maps/test_triangle_hex_160.png",
+            160,
+            2048,
+        );
+        planet_perf_log("saved test triangle hex png 160");
+    }
     set_default_camera();
     if show_hover_grid {
-        if let Some(hex_grid) = state.hex_grid.as_ref() {
+        if let Some(sim_grid) = state.sim_grid.as_ref() {
             let _ = draw_global_hex_cell(
-                hex_grid,
+                sim_grid,
                 &camera,
                 grid_color,
                 1.2,
                 line_radius,
                 radius,
-                hovered_visual_cell,
+                hovered_cell,
                 hover_hit,
                 hovered_base_face,
             );
@@ -2250,7 +2516,13 @@ pub fn run(
         state.selected_build_tool,
         |kind| match kind {
             PlanetBuildingKind::Base => Color::from_rgba(80, 220, 220, 255),
+            PlanetBuildingKind::Builder => Color::from_rgba(255, 214, 102, 255),
+            PlanetBuildingKind::Housing => Color::from_rgba(118, 203, 152, 255),
+            PlanetBuildingKind::Factory => Color::from_rgba(170, 170, 196, 255),
             PlanetBuildingKind::Mine => Color::from_rgba(240, 170, 90, 255),
+            PlanetBuildingKind::Warehouse => Color::from_rgba(116, 176, 224, 255),
+            PlanetBuildingKind::Logistics => Color::from_rgba(255, 128, 128, 255),
+            PlanetBuildingKind::Route => Color::from_rgba(220, 220, 120, 255),
         },
     );
     if panel_result.toggled {
@@ -2303,14 +2575,14 @@ pub fn run(
         );
         if close {
             state.info_window.open = false;
-            state.info_target_visual_cell = None;
+            state.info_target_cell = None;
         } else {
             let tx = state.info_window.rect.x + 10.0;
             let mut ty = state.info_window.rect.y + WINDOW_TITLE_HEIGHT + 18.0;
-            if let Some(visual_cell) = state.info_target_visual_cell {
-                if let Some(placed) = state.buildings.get(&visual_cell) {
+            if let Some(cell_index) = state.info_target_cell {
+                if let Some(kind) = state.buildings.get(&cell_index) {
                     draw_text(
-                        &format!("Visual cell: {}", visual_cell),
+                        &format!("Cell: {}", cell_index),
                         tx,
                         ty,
                         ctx.font_sm,
@@ -2318,7 +2590,7 @@ pub fn run(
                     );
                     ty += 20.0;
                     draw_text(
-                        &format!("Kind: {}", placed.kind.label()),
+                        &format!("Kind: {}", kind.label()),
                         tx,
                         ty,
                         ctx.font_sm,
@@ -2326,7 +2598,7 @@ pub fn run(
                     );
                     ty += 20.0;
                     if let Some(sim_world) = state.sim_world.as_ref() {
-                        if let Some(cell) = sim_world.cells.get(placed.sim_cell as usize) {
+                        if let Some(cell) = sim_world.cells.get(cell_index as usize) {
                             draw_text(
                                 &format!(
                                     "Surface: {}  Buildable:{}",
@@ -2357,7 +2629,7 @@ pub fn run(
                     );
                     if clicked {
                         state.confirm_window.open = true;
-                        state.confirm_target_visual_cell = Some(visual_cell);
+                        state.confirm_target_cell = Some(cell_index);
                     }
                 }
             }
@@ -2379,11 +2651,11 @@ pub fn run(
         );
         if close {
             state.confirm_window.open = false;
-            state.confirm_target_visual_cell = None;
+            state.confirm_target_cell = None;
         } else {
             let tx = state.confirm_window.rect.x + 10.0;
             let ty = state.confirm_window.rect.y + WINDOW_TITLE_HEIGHT + 22.0;
-            let label = if let Some(cell) = state.confirm_target_visual_cell {
+            let label = if let Some(cell) = state.confirm_target_cell {
                 format!("Demolish building in cell {}?", cell)
             } else {
                 "Demolish building?".to_string()
@@ -2397,14 +2669,14 @@ pub fn run(
                 ui_button(rect_ok, "Delete", mouse, ctx.font_sm, ctx.button_colors);
             if clicked_cancel {
                 state.confirm_window.open = false;
-                state.confirm_target_visual_cell = None;
+                state.confirm_target_cell = None;
             }
             if clicked_ok {
-                if let Some(cell) = state.confirm_target_visual_cell {
+                if let Some(cell) = state.confirm_target_cell {
                     let _ = state.remove_building(cell);
                 }
                 state.confirm_window.open = false;
-                state.confirm_target_visual_cell = None;
+                state.confirm_target_cell = None;
             }
         }
     }
@@ -2451,21 +2723,17 @@ pub fn run(
             },
         );
     }
-    if let (Some(sim_world), Some(sim_cell)) = (state.sim_world.as_ref(), hovered_sim_cell) {
-        if let Some(cell) = sim_world.cells.get(sim_cell as usize) {
-            let buildable = if state.can_build_on_sim_cell(sim_cell) {
+    if let (Some(sim_world), Some(cell_index)) = (state.sim_world.as_ref(), hovered_cell) {
+        if let Some(cell) = sim_world.cells.get(cell_index as usize) {
+            let buildable = if state.can_build_on_sim_cell(cell_index) {
                 "yes"
             } else {
                 "no"
             };
-            let visual_txt = hovered_visual_cell
-                .map(|v| v.to_string())
-                .unwrap_or_else(|| "-".to_string());
             draw_text_ex(
                 &format!(
-                    "Cell v:{} -> s:{}  {}  Buildable:{}",
-                    visual_txt,
-                    sim_cell,
+                    "Cell {}  {}  Buildable:{}",
+                    cell_index,
                     surface_label(cell.surface),
                     buildable
                 ),
@@ -2507,7 +2775,10 @@ pub fn run(
         Some(kind) => kind.label(),
     };
     draw_text_ex(
-        &format!("Tool: {}   [1 None] [2 Base] [3 Mine] [RMB place] [Del remove]", tool_label),
+        &format!(
+            "Tool: {}   [1 None] [2 Base] [3 Mine] [4 Builder] [5 Housing] [6 Factory] [7 Warehouse] [8 Logistics] [9 Route] [RMB place] [Del remove]",
+            tool_label
+        ),
         20.0,
         screen_height() - 56.0,
         TextParams {

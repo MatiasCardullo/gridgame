@@ -22,6 +22,8 @@ Hex-grid strategy game built with Rust and Macroquad. Build structures, extract 
 5. Arrow keys: rotate planet camera.
 6. `R`: rotate placement.
 7. `Esc`: back to menu (saves the game).
+8. Planet scene: `1` no tool, `2` base, `3` mine, right click places building, `Delete` removes building.
+9. Planet scene map export: `M` saves hovered zone PNG, `Shift+M` saves all zone PNGs to `planet_data/zone_maps/`.
 
 **Notes**
 1. Mines can expand their attached zones from the block window.
@@ -32,8 +34,7 @@ Hex-grid strategy game built with Rust and Macroquad. Build structures, extract 
 **Planet Scene Data**
 1. Terrain parameters and sector values are saved in `planet_data/planet_noise.json`.
 2. The 2D heightmap texture is regenerated from that JSON when needed (no separate texture cache files).
-3. Hover grid cache: `planet_data/planet_hex_grid.bin` (`freq=320`).
-4. Simulation grid cache: `planet_data/planet_sim_grid.bin` (`freq=128` by default).
+3. Planet grid cache: `planet_data/planet_sim_grid.bin` (single grid used for hover + simulation).
 5. Per-cell resource snapshot (depletable state): `planet_data/planet_resources.bin`.
 6. Planet buildings snapshot: `planet_data/planet_buildings.json`.
 7. Optional runtime artifacts:

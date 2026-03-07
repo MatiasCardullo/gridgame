@@ -150,6 +150,38 @@ fn start_hex_grid_build(
     rx
 }
 
+struct SimWorldBuildResult {
+    generation: u64,
+    grid: HexGrid,
+    world: PlanetSimWorld,
+    min_cell_edge_dist_unit: f32,
+    took_ms: u128,
+}
+
+fn start_sim_world_build(
+    path: &'static str,
+    grid: HexGrid,
+    config: PlanetNoiseConfig,
+    seed: u64,
+    generation: u64,
+) -> Receiver<SimWorldBuildResult> {
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let t0 = Instant::now();
+        let min_cell_edge_dist_unit = min_cell_edge_distance_unit(&grid);
+        let world = build_or_load_sim_world(path, &grid, &config, seed);
+        let took_ms = t0.elapsed().as_millis();
+        let _ = tx.send(SimWorldBuildResult {
+            generation,
+            grid,
+            world,
+            min_cell_edge_dist_unit,
+            took_ms,
+        });
+    });
+    rx
+}
+
 enum PlanetLoadEvent {
     StepStart(String),
     StepDone,
@@ -191,11 +223,38 @@ impl PlanetBuildingKind {
     }
 }
 
+fn building_storage_capacity(kind: PlanetBuildingKind) -> u32 {
+    match kind {
+        PlanetBuildingKind::Base => 1_600,
+        PlanetBuildingKind::Builder => 500,
+        PlanetBuildingKind::Housing => 350,
+        PlanetBuildingKind::Factory => 1_000,
+        PlanetBuildingKind::Mine => 600,
+        PlanetBuildingKind::Warehouse => 4_000,
+        PlanetBuildingKind::Logistics => 900,
+        PlanetBuildingKind::Route => 200,
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct PlanetBuildingRecord {
     #[serde(default, alias = "visual_cell")]
     cell_index: u32,
     kind: PlanetBuildingKind,
+    #[serde(default)]
+    storage: Vec<PlanetBuildingStorageRecord>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct PlanetBuildingStorageRecord {
+    resource_id: u8,
+    amount: u32,
+}
+
+#[derive(Clone, Debug)]
+struct PlanetBuildingState {
+    kind: PlanetBuildingKind,
+    storage: HashMap<PlanetResourceKind, u32>,
 }
 
 
@@ -241,12 +300,13 @@ pub struct PlanetState {
     sim_grid: Option<HexGrid>,
     sim_grid_rx: Option<Receiver<HexGrid>>,
     sim_world: Option<PlanetSimWorld>,
+    sim_world_rx: Option<Receiver<SimWorldBuildResult>>,
+    sim_world_generation: u64,
     selected_build_tool: Option<PlanetBuildingKind>,
     panel_collapsed: bool,
-    buildings: HashMap<u32, PlanetBuildingKind>,
+    buildings: HashMap<u32, PlanetBuildingState>,
     buildings_dirty: bool,
     mine_progress: HashMap<u32, f32>,
-    stockpiles: HashMap<PlanetResourceKind, u32>,
     min_cell_edge_dist_unit: f32,
     info_window: WindowState,
     info_target_cell: Option<u32>,
@@ -351,12 +411,13 @@ impl PlanetState {
             sim_grid: None,
             sim_grid_rx,
             sim_world: None,
+            sim_world_rx: None,
+            sim_world_generation: 0,
             selected_build_tool: Some(PlanetBuildingKind::Mine),
             panel_collapsed: false,
             buildings: HashMap::new(),
             buildings_dirty: false,
             mine_progress: HashMap::new(),
-            stockpiles: HashMap::new(),
             min_cell_edge_dist_unit: 0.010,
             info_window: WindowState {
                 title: String::new(),
@@ -422,6 +483,7 @@ impl PlanetState {
             sim_world.save_if_dirty(PLANET_RESOURCES_PATH);
         }
         self.sim_world = None;
+        self.sim_world_generation = self.sim_world_generation.wrapping_add(1);
         self.rebuild_fallback_relief_meshes();
         self.relief_cache.clear();
         self.relief_cache.insert(
@@ -519,7 +581,22 @@ impl PlanetState {
         };
         self.buildings.clear();
         for record in snapshot.buildings.into_iter() {
-            self.buildings.insert(record.cell_index, record.kind);
+            let mut storage: HashMap<PlanetResourceKind, u32> = HashMap::new();
+            for entry in record.storage.into_iter() {
+                let Some(kind) = resource_kind_from_id(entry.resource_id) else {
+                    continue;
+                };
+                if entry.amount > 0 {
+                    storage.insert(kind, entry.amount);
+                }
+            }
+            self.buildings.insert(
+                record.cell_index,
+                PlanetBuildingState {
+                    kind: record.kind,
+                    storage,
+                },
+            );
         }
         self.buildings_dirty = false;
     }
@@ -533,9 +610,18 @@ impl PlanetState {
             buildings: self
                 .buildings
                 .iter()
-                .map(|(cell_index, kind)| PlanetBuildingRecord {
+                .map(|(cell_index, building)| PlanetBuildingRecord {
                     cell_index: *cell_index,
-                    kind: *kind,
+                    kind: building.kind,
+                    storage: building
+                        .storage
+                        .iter()
+                        .filter(|(_, amount)| **amount > 0)
+                        .map(|(kind, amount)| PlanetBuildingStorageRecord {
+                            resource_id: resource_kind_to_id(*kind),
+                            amount: *amount,
+                        })
+                        .collect(),
                 })
                 .collect(),
         };
@@ -567,7 +653,13 @@ impl PlanetState {
         if !self.can_place_building(cell_index, kind) {
             return false;
         }
-        self.buildings.insert(cell_index, kind);
+        self.buildings.insert(
+            cell_index,
+            PlanetBuildingState {
+                kind,
+                storage: HashMap::new(),
+            },
+        );
         self.buildings_dirty = true;
         true
     }
@@ -581,15 +673,45 @@ impl PlanetState {
         removed
     }
 
+    // Returns available storage capacity for a placed building.
+    fn storage_space_left(&self, cell_index: u32) -> u32 {
+        let Some(building) = self.buildings.get(&cell_index) else {
+            return 0;
+        };
+        let capacity = building_storage_capacity(building.kind);
+        let used: u32 = building.storage.values().copied().sum();
+        capacity.saturating_sub(used)
+    }
+
+    // Stores mined units into one building inventory, capped by its capacity.
+    fn push_to_building_storage(
+        &mut self,
+        cell_index: u32,
+        resource: PlanetResourceKind,
+        amount: u32,
+    ) -> u32 {
+        let Some(building) = self.buildings.get_mut(&cell_index) else {
+            return 0;
+        };
+        let capacity = building_storage_capacity(building.kind);
+        let used: u32 = building.storage.values().copied().sum();
+        let free = capacity.saturating_sub(used);
+        let stored = amount.min(free);
+        if stored > 0 {
+            *building.storage.entry(resource).or_insert(0) += stored;
+        }
+        stored
+    }
+
     fn tick_mining(&mut self, dt: f32) {
-        let Some(sim_world) = self.sim_world.as_mut() else {
+        if self.sim_world.is_none() {
             return;
         };
         let mine_cells: Vec<u32> = self
             .buildings
             .iter()
-            .filter_map(|(cell_index, kind)| {
-                if *kind == PlanetBuildingKind::Mine {
+            .filter_map(|(cell_index, building)| {
+                if building.kind == PlanetBuildingKind::Mine {
                     Some(*cell_index)
                 } else {
                     None
@@ -604,17 +726,31 @@ impl PlanetState {
                 continue;
             }
             *progress -= units as f32;
-            let resource_kind = sim_world
+            let resource_kind = self
+                .sim_world
+                .as_ref()
+                .and_then(|sim_world| {
+                    sim_world
                 .cells
                 .get(cell_index as usize)
                 .and_then(|cell| cell.deposit)
-                .map(|deposit| deposit.kind);
+                .map(|deposit| deposit.kind)
+                });
             let Some(resource_kind) = resource_kind else {
                 continue;
             };
-            let mined = sim_world.extract_from_cell(cell_index, units);
-            if mined > 0 {
-                *self.stockpiles.entry(resource_kind).or_insert(0) += mined;
+            let available = self.storage_space_left(cell_index);
+            let to_extract = units.min(available);
+            if to_extract == 0 {
+                continue;
+            }
+            let mined = self
+                .sim_world
+                .as_mut()
+                .map(|sim_world| sim_world.extract_from_cell(cell_index, to_extract))
+                .unwrap_or(0);
+            if mined > 0 && self.push_to_building_storage(cell_index, resource_kind, mined) > 0 {
+                self.buildings_dirty = true;
             }
         }
     }
@@ -1515,14 +1651,15 @@ fn draw_sim_buildings(
     visual_grid: &HexGrid,
     _sim_world: Option<&PlanetSimWorld>,
     _config: &PlanetNoiseConfig,
-    buildings: &HashMap<u32, PlanetBuildingKind>,
+    buildings: &HashMap<u32, PlanetBuildingState>,
     radius: f32,
     min_cell_edge_dist_unit: f32,
 ) {
     let target_apothem = (min_cell_edge_dist_unit * 0.9 * 0.62).max(0.0005);
     // Keep buildings above surface but below overlay lines (PLANET_OVERLAY_OFFSET=0.01).
     let surface_lift = 0.0035;
-    for (cell_index, kind) in buildings.iter() {
+    for (cell_index, building) in buildings.iter() {
+        let kind = building.kind;
         let Some(vertex_dir) = visual_grid.vertices.get(*cell_index as usize) else {
             continue;
         };
@@ -1983,6 +2120,37 @@ fn resource_label(kind: PlanetResourceKind) -> &'static str {
     }
 }
 
+fn resource_kind_to_id(kind: PlanetResourceKind) -> u8 {
+    match kind {
+        PlanetResourceKind::Iron => 0,
+        PlanetResourceKind::Copper => 1,
+        PlanetResourceKind::Gold => 2,
+        PlanetResourceKind::Lead => 3,
+        PlanetResourceKind::Zinc => 4,
+        PlanetResourceKind::Lithium => 5,
+        PlanetResourceKind::Phosphate => 6,
+        PlanetResourceKind::Stone => 7,
+        PlanetResourceKind::FreshWater => 8,
+        PlanetResourceKind::Salt => 9,
+    }
+}
+
+fn resource_kind_from_id(id: u8) -> Option<PlanetResourceKind> {
+    match id {
+        0 => Some(PlanetResourceKind::Iron),
+        1 => Some(PlanetResourceKind::Copper),
+        2 => Some(PlanetResourceKind::Gold),
+        3 => Some(PlanetResourceKind::Lead),
+        4 => Some(PlanetResourceKind::Zinc),
+        5 => Some(PlanetResourceKind::Lithium),
+        6 => Some(PlanetResourceKind::Phosphate),
+        7 => Some(PlanetResourceKind::Stone),
+        8 => Some(PlanetResourceKind::FreshWater),
+        9 => Some(PlanetResourceKind::Salt),
+        _ => None,
+    }
+}
+
 // Computes a consistent outward normal for a face.
 fn face_normal(vertices: &[Vec3], face: [usize; 3]) -> Vec3 {
     let a = vertices[face[0]];
@@ -2149,36 +2317,64 @@ pub fn run(
     if !state.relief_available && state.show_relief {
         state.show_relief = false;
     }
-    if state.sim_grid.is_none() {
+    if state.sim_grid.is_none() && state.sim_world_rx.is_none() {
         if let Some(rx) = state.sim_grid_rx.as_ref() {
             if let Ok(grid) = rx.try_recv() {
-                let t0 = Instant::now();
-                let min_edge = min_cell_edge_distance_unit(&grid);
                 state.sim_grid = Some(grid);
                 state.sim_grid_rx = None;
-                state.min_cell_edge_dist_unit = min_edge;
+                planet_perf_log("sim grid ready; scheduling sim world build");
+            }
+        }
+    }
+
+    if let Some(rx) = state.sim_world_rx.as_ref() {
+        if let Ok(result) = rx.try_recv() {
+            state.sim_world_rx = None;
+            state.min_cell_edge_dist_unit = result.min_cell_edge_dist_unit;
+            let freq = result.grid.freq;
+            let cell_count = result.grid.vertices.len();
+            state.sim_grid = Some(result.grid);
+            planet_perf_log(&format!(
+                "sim grid metrics min_cell_edge_dist_unit={:.7} took_ms={}",
+                state.min_cell_edge_dist_unit,
+                result.took_ms
+            ));
+            if result.generation == state.sim_world_generation {
+                state.sim_world = Some(result.world);
                 planet_perf_log(&format!(
-                    "sim grid metrics min_cell_edge_dist_unit={:.7} took_ms={}",
-                    min_edge,
-                    t0.elapsed().as_millis()
+                    "sim world ready freq={} cells={} generation={} took_ms={}",
+                    freq,
+                    cell_count,
+                    result.generation,
+                    result.took_ms
+                ));
+            } else {
+                planet_perf_log(&format!(
+                    "sim world stale ignored built_generation={} expected_generation={}",
+                    result.generation,
+                    state.sim_world_generation
                 ));
             }
         }
     }
-    if state.sim_world.is_none() {
-        if let Some(sim_grid) = state.sim_grid.as_ref() {
-            let t0 = Instant::now();
-            state.sim_world = Some(build_or_load_sim_world(
+
+    if state.sim_world.is_none() && state.sim_world_rx.is_none() {
+        if let Some(sim_grid) = state.sim_grid.take() {
+            let generation = state.sim_world_generation;
+            let freq = sim_grid.freq;
+            let cell_count = sim_grid.vertices.len();
+            state.sim_world_rx = Some(start_sim_world_build(
                 PLANET_RESOURCES_PATH,
                 sim_grid,
-                &state.config,
+                state.config,
                 PLANET_SIM_SEED,
+                generation,
             ));
             planet_perf_log(&format!(
-                "sim world ready freq={} cells={} took_ms={}",
-                sim_grid.freq,
-                sim_grid.vertices.len(),
-                t0.elapsed().as_millis()
+                "sim world build started freq={} cells={} generation={}",
+                freq,
+                cell_count,
+                generation
             ));
         }
     }
@@ -2220,16 +2416,16 @@ pub fn run(
         state.selected_build_tool = Some(PlanetBuildingKind::Base);
     }
     if is_key_pressed(KeyCode::Key3) {
-        state.selected_build_tool = Some(PlanetBuildingKind::Mine);
-    }
-    if is_key_pressed(KeyCode::Key4) {
         state.selected_build_tool = Some(PlanetBuildingKind::Builder);
     }
-    if is_key_pressed(KeyCode::Key5) {
+    if is_key_pressed(KeyCode::Key4) {
         state.selected_build_tool = Some(PlanetBuildingKind::Housing);
     }
-    if is_key_pressed(KeyCode::Key6) {
+    if is_key_pressed(KeyCode::Key5) {
         state.selected_build_tool = Some(PlanetBuildingKind::Factory);
+    }
+    if is_key_pressed(KeyCode::Key6) {
+        state.selected_build_tool = Some(PlanetBuildingKind::Mine);
     }
     if is_key_pressed(KeyCode::Key7) {
         state.selected_build_tool = Some(PlanetBuildingKind::Warehouse);
@@ -2430,8 +2626,8 @@ pub fn run(
     let show_hover_grid = hovered_cell.is_some();
     if is_mouse_button_pressed(MouseButton::Left) && !ui_capturing {
         if let Some(cell_index) = hovered_cell {
-            if let Some(kind) = state.buildings.get(&cell_index) {
-                state.info_window.title = kind.label().to_string();
+            if let Some(building) = state.buildings.get(&cell_index) {
+                state.info_window.title = building.kind.label().to_string();
                 state.info_window.rect = Rect::new(mouse.x + 12.0, mouse.y + 12.0, 280.0, 190.0);
                 state.info_window.open = true;
                 state.info_target_cell = Some(cell_index);
@@ -2580,7 +2776,7 @@ pub fn run(
             let tx = state.info_window.rect.x + 10.0;
             let mut ty = state.info_window.rect.y + WINDOW_TITLE_HEIGHT + 18.0;
             if let Some(cell_index) = state.info_target_cell {
-                if let Some(kind) = state.buildings.get(&cell_index) {
+                if let Some(building) = state.buildings.get(&cell_index) {
                     draw_text(
                         &format!("Cell: {}", cell_index),
                         tx,
@@ -2590,7 +2786,7 @@ pub fn run(
                     );
                     ty += 20.0;
                     draw_text(
-                        &format!("Kind: {}", kind.label()),
+                        &format!("Kind: {}", building.kind.label()),
                         tx,
                         ty,
                         ctx.font_sm,
@@ -2618,6 +2814,36 @@ pub fn run(
                             draw_text(&dep, tx, ty, ctx.font_sm, ctx.colors_rt.text_secondary);
                             ty += 26.0;
                         }
+                    }
+                    let mut storage_lines: Vec<String> = building
+                        .storage
+                        .iter()
+                        .filter(|(_, amount)| **amount > 0)
+                        .map(|(kind, amount)| format!("{}: {}", resource_label(*kind), amount))
+                        .collect();
+                    storage_lines.sort();
+                    let cap = building_storage_capacity(building.kind);
+                    let used: u32 = building.storage.values().copied().sum();
+                    draw_text(
+                        &format!("Storage: {}/{}", used, cap),
+                        tx,
+                        ty,
+                        ctx.font_sm,
+                        ctx.colors_rt.text_secondary,
+                    );
+                    ty += 20.0;
+                    if storage_lines.is_empty() {
+                        draw_text("Stored: empty", tx, ty, ctx.font_sm, ctx.colors_rt.text_secondary);
+                        ty += 22.0;
+                    } else {
+                        draw_text(
+                            &format!("Stored: {}", storage_lines.join(" | ")),
+                            tx,
+                            ty,
+                            ctx.font_sm,
+                            ctx.colors_rt.text_secondary,
+                        );
+                        ty += 22.0;
                     }
                     let demolish_rect = Rect::new(tx, ty, 120.0, 28.0);
                     let (clicked, _) = ui_button(
@@ -2769,56 +2995,6 @@ pub fn run(
                 },
             );
         }
-    }
-    let tool_label = match state.selected_build_tool {
-        None => "None",
-        Some(kind) => kind.label(),
-    };
-    draw_text_ex(
-        &format!(
-            "Tool: {}   [1 None] [2 Base] [3 Mine] [4 Builder] [5 Housing] [6 Factory] [7 Warehouse] [8 Logistics] [9 Route] [RMB place] [Del remove]",
-            tool_label
-        ),
-        20.0,
-        screen_height() - 56.0,
-        TextParams {
-            font: greek_font,
-            font_size: 20,
-            color: Color::from_rgba(180, 210, 230, 255),
-            ..Default::default()
-        },
-    );
-    let mut stock_lines: Vec<String> = state
-        .stockpiles
-        .iter()
-        .filter(|(_, amount)| **amount > 0)
-        .map(|(kind, amount)| format!("{}: {}", resource_label(*kind), amount))
-        .collect();
-    stock_lines.sort();
-    if stock_lines.is_empty() {
-        draw_text_ex(
-            "Stockpile: empty",
-            20.0,
-            screen_height() - 34.0,
-            TextParams {
-                font: greek_font,
-                font_size: 18,
-                color: Color::from_rgba(150, 185, 210, 255),
-                ..Default::default()
-            },
-        );
-    } else {
-        draw_text_ex(
-            &format!("Stockpile: {}", stock_lines.join(" | ")),
-            20.0,
-            screen_height() - 34.0,
-            TextParams {
-                font: greek_font,
-                font_size: 18,
-                color: Color::from_rgba(150, 185, 210, 255),
-                ..Default::default()
-            },
-        );
     }
 }
 

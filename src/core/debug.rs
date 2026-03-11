@@ -7,7 +7,7 @@ use crate::core::ui::ui_button;
 use crate::core::FrameContext;
 use crate::scenes::planet::PlanetState;
 
-pub const PLANET_DEBUG_UI_ENABLED_DEFAULT: bool = false;
+pub const PLANET_DEBUG_UI_ENABLED_DEFAULT: bool = true;
 pub const PLANET_PERF_LOG_PATH: &str = "planet_data/planet_perf.log";
 pub const SAVE_MESH_POINTS_RUNTIME: bool = false;
 

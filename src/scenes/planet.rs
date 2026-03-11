@@ -64,6 +64,141 @@ fn quat_from_forward_up(forward: Vec3, up: Vec3) -> Quat {
     Quat::from_mat3(&mat)
 }
 
+#[derive(Clone, Debug)]
+struct DebugCameraRig {
+    enabled: bool,
+    show_original_frustum: bool,
+    position: Vec3,
+    yaw: f32,
+    pitch: f32,
+    looking: bool,
+    last_mouse: Vec2,
+    move_speed: f32,
+}
+
+fn forward_from_yaw_pitch(yaw: f32, pitch: f32) -> Vec3 {
+    vec3(
+        yaw.sin() * pitch.cos(),
+        pitch.sin(),
+        yaw.cos() * pitch.cos(),
+    )
+    .normalize()
+}
+
+fn yaw_pitch_from_forward(forward: Vec3) -> (f32, f32) {
+    let dir = forward.normalize();
+    let yaw = dir.x.atan2(dir.z);
+    let pitch = dir.y.clamp(-1.0, 1.0).asin();
+    (yaw, pitch)
+}
+
+fn update_debug_camera_rig(rig: &mut DebugCameraRig, frame_time: f32, mouse: Vec2) {
+    if is_mouse_button_down(MouseButton::Right) {
+        if !rig.looking {
+            rig.looking = true;
+            rig.last_mouse = mouse;
+        } else {
+            let delta = mouse - rig.last_mouse;
+            rig.yaw -= delta.x * 0.004;
+            rig.pitch = (rig.pitch - delta.y * 0.004).clamp(-1.54, 1.54);
+            rig.last_mouse = mouse;
+        }
+    } else {
+        rig.looking = false;
+    }
+
+    let forward = forward_from_yaw_pitch(rig.yaw, rig.pitch);
+    let world_up = vec3(0.0, 1.0, 0.0);
+    let right = world_up.cross(forward).normalize_or_zero();
+    let mut move_dir = Vec3::ZERO;
+    if is_key_down(KeyCode::W) {
+        move_dir += forward;
+    }
+    if is_key_down(KeyCode::S) {
+        move_dir -= forward;
+    }
+    if is_key_down(KeyCode::D) {
+        move_dir += right;
+    }
+    if is_key_down(KeyCode::A) {
+        move_dir -= right;
+    }
+    if is_key_down(KeyCode::Space) {
+        move_dir += world_up;
+    }
+    if is_key_down(KeyCode::LeftControl) {
+        move_dir -= world_up;
+    }
+    if move_dir.length_squared() > 0.0 {
+        let boost = if is_key_down(KeyCode::LeftShift) { 3.0 } else { 1.0 };
+        rig.position += move_dir.normalize() * rig.move_speed * boost * frame_time;
+    }
+    let (_, wheel_y) = mouse_wheel();
+    if wheel_y.abs() > 0.001 {
+        rig.move_speed = (rig.move_speed + wheel_y * 0.8).clamp(0.5, 60.0);
+    }
+}
+
+fn debug_camera_from_rig(rig: &DebugCameraRig) -> Camera3D {
+    let forward = forward_from_yaw_pitch(rig.yaw, rig.pitch);
+    Camera3D {
+        position: rig.position,
+        target: rig.position + forward,
+        up: vec3(0.0, 1.0, 0.0),
+        fovy: 45.0,
+        z_near: 0.05,
+        z_far: 200.0,
+        ..Default::default()
+    }
+}
+
+fn draw_camera_frustum(camera: &Camera3D, color: Color, far_visual: f32) {
+    let aspect = (screen_width() / screen_height().max(1.0)).max(0.01);
+    let near_d = camera.z_near.max(0.01);
+    let far_d = far_visual.max(near_d + 0.01);
+    let fovy = camera.fovy.to_radians();
+    let tan_half = (fovy * 0.5).tan();
+
+    let forward = (camera.target - camera.position).normalize_or_zero();
+    let right = forward.cross(camera.up).normalize_or_zero();
+    let up = right.cross(forward).normalize_or_zero();
+    if forward.length_squared() == 0.0 || right.length_squared() == 0.0 || up.length_squared() == 0.0 {
+        return;
+    }
+
+    let near_center = camera.position + forward * near_d;
+    let far_center = camera.position + forward * far_d;
+    let near_h = tan_half * near_d;
+    let near_w = near_h * aspect;
+    let far_h = tan_half * far_d;
+    let far_w = far_h * aspect;
+
+    let ntl = near_center + up * near_h - right * near_w;
+    let ntr = near_center + up * near_h + right * near_w;
+    let nbl = near_center - up * near_h - right * near_w;
+    let nbr = near_center - up * near_h + right * near_w;
+    let ftl = far_center + up * far_h - right * far_w;
+    let ftr = far_center + up * far_h + right * far_w;
+    let fbl = far_center - up * far_h - right * far_w;
+    let fbr = far_center - up * far_h + right * far_w;
+
+    draw_line_3d(ntl, ntr, color);
+    draw_line_3d(ntr, nbr, color);
+    draw_line_3d(nbr, nbl, color);
+    draw_line_3d(nbl, ntl, color);
+
+    draw_line_3d(ftl, ftr, color);
+    draw_line_3d(ftr, fbr, color);
+    draw_line_3d(fbr, fbl, color);
+    draw_line_3d(fbl, ftl, color);
+
+    draw_line_3d(ntl, ftl, color);
+    draw_line_3d(ntr, ftr, color);
+    draw_line_3d(nbl, fbl, color);
+    draw_line_3d(nbr, fbr, color);
+    draw_line_3d(camera.position, near_center, Color::from_rgba(255, 220, 120, 255));
+}
+
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct PlanetNoiseSnapshot {
@@ -295,6 +430,7 @@ pub struct PlanetState {
     pub show_relief: bool,
     pub relief_available: bool,
     pub debug_enabled: bool,
+    debug_camera: DebugCameraRig,
     pub heightmap_texture: Option<Texture2D>,
     pub texture_config: PlanetNoiseConfig,
     sim_grid: Option<HexGrid>,
@@ -386,6 +522,9 @@ impl PlanetState {
             &base_faces,
         ));
         let initial_rot = Quat::from_rotation_y(0.0) * Quat::from_rotation_x(0.3);
+        let initial_camera_pos = (initial_rot * vec3(0.0, 0.0, 1.0)) * 6.0;
+        let initial_forward = (-initial_camera_pos).normalize_or_zero();
+        let (initial_yaw, initial_pitch) = yaw_pitch_from_forward(initial_forward);
         let mut state = Self {
             camera_rot: initial_rot,
             target_rot: initial_rot,
@@ -406,6 +545,16 @@ impl PlanetState {
             show_relief: false,
             relief_available: false,
             debug_enabled: PLANET_DEBUG_UI_ENABLED_DEFAULT,
+            debug_camera: DebugCameraRig {
+                enabled: false,
+                show_original_frustum: true,
+                position: initial_camera_pos,
+                yaw: initial_yaw,
+                pitch: initial_pitch,
+                looking: false,
+                last_mouse: Vec2::ZERO,
+                move_speed: 6.0,
+            },
             heightmap_texture: Some(heightmap_texture),
             texture_config: config,
             sim_grid: None,
@@ -1718,6 +1867,101 @@ fn draw_sim_buildings(
             PlanetBuildingKind::Route => Color::from_rgba(220, 220, 120, 255),
         };
         let base_radius = radius + surface_lift;
+        if kind == PlanetBuildingKind::Route {
+            let route_lift = surface_lift + 0.0005;
+            let route_radius = radius + route_lift;
+            let route_base_color = color;
+
+            let mut vertices: Vec<Vertex> = Vec::with_capacity(sides * 3 + 72);
+            let mut indices: Vec<u16> = Vec::with_capacity(sides * 3 + 144);
+
+            // Flat route plate on top of the cell (replaces old pyramid shape).
+            let plate_center = vertex_dir * route_radius + 0.0001;
+            let plate_center_ix = vertices.len() as u16;
+            vertices.push(Vertex::new2(plate_center, vec2(0.0, 0.0), route_base_color));
+            for dir in outer_dirs.iter() {
+                vertices.push(Vertex::new2(*dir * route_radius, vec2(0.0, 0.0), route_base_color));
+            }
+            for i in 0..sides {
+                let a = plate_center_ix + 1 + i as u16;
+                let b = plate_center_ix + 1 + ((i + 1) % sides) as u16;
+                indices.extend_from_slice(&[plate_center_ix, a, b]);
+            }
+
+            // Build flat rectangular strips toward neighboring occupied cells.
+            let mut neighbors: Vec<u32> = Vec::new();
+            let mut seen_neighbors: std::collections::HashSet<u32> = std::collections::HashSet::new();
+            for &face_index in face_list.iter() {
+                let Some(face) = visual_grid.faces.get(face_index as usize) else {
+                    continue;
+                };
+                for &candidate in face.iter() {
+                    if candidate == *cell_index {
+                        continue;
+                    }
+                    if !seen_neighbors.insert(candidate) {
+                        continue;
+                    }
+                    if let Some(neighbor_building) = buildings.get(&candidate) {
+                        // Avoid duplicate strip for route-route pairs.
+                        if neighbor_building.kind == PlanetBuildingKind::Route && candidate < *cell_index {
+                            continue;
+                        }
+                        neighbors.push(candidate);
+                    }
+                }
+            }
+
+            let strip_half_width = (target_apothem * radius * 0.05).max(0.001125);
+            let strip_color = Color::new(color.r * 0.96, color.g * 0.96, color.b * 0.96, 1.0);
+            for neighbor in neighbors.into_iter() {
+                let Some(neighbor_dir) = visual_grid.vertices.get(neighbor as usize) else {
+                    continue;
+                };
+                let neighbor_dir = neighbor_dir.normalize();
+                let start = vertex_dir * route_radius;
+                let end = neighbor_dir * route_radius;
+                let strip_mid_dir = (vertex_dir + neighbor_dir).normalize();
+                let strip_forward = (end - start).normalize();
+                let strip_forward = (strip_forward - strip_mid_dir * strip_forward.dot(strip_mid_dir)).normalize();
+                if strip_forward.length() < 1e-6 {
+                    continue;
+                }
+                let strip_side = strip_mid_dir.cross(strip_forward).normalize();
+                if strip_side.length() < 1e-6 {
+                    continue;
+                }
+
+                let p0 = start + strip_side * strip_half_width;
+                let p1 = start - strip_side * strip_half_width;
+                let p2 = end - strip_side * strip_half_width;
+                let p3 = end + strip_side * strip_half_width;
+                let start_ix = vertices.len() as u16;
+                vertices.push(Vertex::new2(p0, vec2(0.0, 0.0), strip_color));
+                vertices.push(Vertex::new2(p1, vec2(0.0, 0.0), strip_color));
+                vertices.push(Vertex::new2(p2, vec2(0.0, 0.0), strip_color));
+                vertices.push(Vertex::new2(p3, vec2(0.0, 0.0), strip_color));
+                indices.extend_from_slice(&[
+                    start_ix,
+                    start_ix + 1,
+                    start_ix + 2,
+                    start_ix,
+                    start_ix + 2,
+                    start_ix + 3,
+                ]);
+            }
+
+            if !indices.is_empty() {
+                let mesh = Mesh {
+                    vertices,
+                    indices,
+                    texture: None,
+                };
+                draw_mesh(&mesh);
+            }
+            continue;
+        }
+
         let height_scale = match kind {
             PlanetBuildingKind::Route => 0.42,
             PlanetBuildingKind::Logistics => 0.74,
@@ -2112,6 +2356,7 @@ fn resource_label(kind: PlanetResourceKind) -> &'static str {
         PlanetResourceKind::Gold => "Gold",
         PlanetResourceKind::Lead => "Lead",
         PlanetResourceKind::Zinc => "Zinc",
+        PlanetResourceKind::Aluminum => "Aluminum",
         PlanetResourceKind::Lithium => "Lithium",
         PlanetResourceKind::Phosphate => "Phosphate",
         PlanetResourceKind::Stone => "Stone",
@@ -2127,6 +2372,7 @@ fn resource_kind_to_id(kind: PlanetResourceKind) -> u8 {
         PlanetResourceKind::Gold => 2,
         PlanetResourceKind::Lead => 3,
         PlanetResourceKind::Zinc => 4,
+        PlanetResourceKind::Aluminum => 10,
         PlanetResourceKind::Lithium => 5,
         PlanetResourceKind::Phosphate => 6,
         PlanetResourceKind::Stone => 7,
@@ -2142,6 +2388,7 @@ fn resource_kind_from_id(id: u8) -> Option<PlanetResourceKind> {
         2 => Some(PlanetResourceKind::Gold),
         3 => Some(PlanetResourceKind::Lead),
         4 => Some(PlanetResourceKind::Zinc),
+        10 => Some(PlanetResourceKind::Aluminum),
         5 => Some(PlanetResourceKind::Lithium),
         6 => Some(PlanetResourceKind::Phosphate),
         7 => Some(PlanetResourceKind::Stone),
@@ -2391,7 +2638,25 @@ pub fn run(
     }
 
     let mouse = vec2(mouse_position().0, mouse_position().1);
-    if is_mouse_button_down(MouseButton::Middle) {
+    let was_debug_camera_enabled = state.debug_camera.enabled;
+    if is_key_pressed(KeyCode::F6) {
+        state.debug_camera.enabled = !state.debug_camera.enabled;
+    }
+    if is_key_pressed(KeyCode::F7) {
+        state.debug_camera.show_original_frustum = !state.debug_camera.show_original_frustum;
+    }
+
+    let orbit_camera_pos = (state.camera_rot * vec3(0.0, 0.0, 1.0)) * state.distance;
+    if !was_debug_camera_enabled && state.debug_camera.enabled {
+        let orbit_forward = (-orbit_camera_pos).normalize_or_zero();
+        let (yaw, pitch) = yaw_pitch_from_forward(orbit_forward);
+        state.debug_camera.position = orbit_camera_pos;
+        state.debug_camera.yaw = yaw;
+        state.debug_camera.pitch = pitch;
+        state.debug_camera.looking = false;
+    }
+
+    if !state.debug_camera.enabled && is_mouse_button_down(MouseButton::Middle) {
         if !state.dragging {
             state.dragging = true;
             state.last_mouse = mouse;
@@ -2452,7 +2717,7 @@ pub fn run(
     if is_key_down(KeyCode::Down) {
         pitch_input -= 1.0;
     }
-    if yaw_input != 0.0 || pitch_input != 0.0 {
+    if !state.debug_camera.enabled && (yaw_input != 0.0 || pitch_input != 0.0) {
         let speed = 1.6;
         let up_dir = state.target_rot * vec3(0.0, 1.0, 0.0);
         let right_dir = state.target_rot * vec3(1.0, 0.0, 0.0);
@@ -2462,7 +2727,7 @@ pub fn run(
     }
 
     let (_wx, wy) = mouse_wheel();
-    if wy.abs() > 0.001 {
+    if !state.debug_camera.enabled && wy.abs() > 0.001 {
         state.target_distance = (state.target_distance - wy * 0.001 * state.target_distance).clamp(1.8, 100.0);
     }
     state.distance += (state.target_distance - state.distance) * (0.01 * state.distance).clamp(0.05, 100.0);
@@ -2502,22 +2767,41 @@ pub fn run(
         || (state.target_distance - state.distance).abs() > 0.02
         || rot_delta > 0.001;
 
-    let camera_pos = (state.camera_rot * vec3(0.0, 0.0, 1.0)) * state.distance;
-    let camera = Camera3D {
-        position: camera_pos,
+    let orbit_camera_pos = (state.camera_rot * vec3(0.0, 0.0, 1.0)) * state.distance;
+    let orbit_camera = Camera3D {
+        position: orbit_camera_pos,
         target: vec3(0.0, 0.0, 0.0),
         up: state.camera_rot * vec3(0.0, 1.0, 0.0),
         fovy: 45.0,
+        z_near: 0.05,
+        z_far: 200.0,
         ..Default::default()
     };
-    set_camera(&camera);
+    if state.debug_camera.enabled {
+        update_debug_camera_rig(&mut state.debug_camera, frame_time, mouse);
+    }
+    let active_camera = if state.debug_camera.enabled {
+        debug_camera_from_rig(&state.debug_camera)
+    } else {
+        Camera3D {
+            position: orbit_camera.position,
+            target: orbit_camera.target,
+            up: orbit_camera.up,
+            fovy: orbit_camera.fovy,
+            z_near: orbit_camera.z_near,
+            z_far: orbit_camera.z_far,
+            ..Default::default()
+        }
+    };
+    let culling_camera = &orbit_camera;
+    set_camera(&active_camera);
 
     let radius = 1.6;
     let line_radius = radius + PLANET_OVERLAY_OFFSET;
     let zoom_t = ((state.distance - 2.0) / 18.0).clamp(0.0, 1.0);
     let segments = ((32.0 - 16.0 * zoom_t).round() as i32).clamp(10, 32) as usize;
     let show_labels = false;
-    let camera_dir = camera_pos.normalize();
+    let camera_dir = culling_camera.position.normalize();
     let use_fallback_relief = camera_animating || state.regen_in_progress;
     for mesh in state.base_texture_meshes.iter() {
         if mesh.vertices.is_empty() {
@@ -2536,7 +2820,7 @@ pub fn run(
                 continue;
             }
             if let Some(center) = state.face_centers.get(index) {
-                if !point_in_frustum(&camera, *center * radius, 0.6) {
+                if !point_in_frustum(culling_camera, *center * radius, 0.6) {
                     continue;
                 }
             }
@@ -2547,6 +2831,11 @@ pub fn run(
             }
             draw_mesh(mesh);
         }
+    }
+    if state.debug_camera.enabled && state.debug_camera.show_original_frustum {
+        let frustum_color = Color::from_rgba(255, 180, 80, 220);
+        let far_visual = (state.distance * 1.8).clamp(4.0, 40.0);
+        draw_camera_frustum(&orbit_camera, frustum_color, far_visual);
     }
     
     let vertices = state.sector_vertices.clone();
@@ -2563,7 +2852,7 @@ pub fn run(
     let mut screen_points: Vec<Option<Vec2>> = vec![None; base_vertices.len()];
     for (index, v) in base_vertices.iter().enumerate() {
         projected_base[index] = v.normalize() * line_radius;
-        screen_points[index] = project_to_screen(&camera, projected_base[index]);
+        screen_points[index] = project_to_screen(&active_camera, projected_base[index]);
     }
     for (index, v) in vertices.iter().enumerate() {
         projected_sector[index] = v.normalize() * line_radius;
@@ -2578,7 +2867,8 @@ pub fn run(
     let mut hovered_base_face: Option<usize> = None;
     let mut hover_hit: Option<Vec3> = None;
     let mut hovered_cell: Option<u32> = None;
-    if let Some((origin, dir)) = ray_from_mouse(&camera, mouse) {
+    if !state.debug_camera.enabled {
+    if let Some((origin, dir)) = ray_from_mouse(&active_camera, mouse) {
         if let Some(hit) = ray_sphere_intersection(origin, dir, radius) {
             hover_hit = Some(hit);
             hovered_base_face = hovered_face(hit, &base_faces, &base_vertices);
@@ -2589,6 +2879,7 @@ pub fn run(
                 hovered_cell = hovered_hex_vertex(sim_grid, hit.normalize(), base_face);
             }
         }
+    }
     }
     if let Some(face_index) = hovered_base_face {
         let face = base_faces[face_index];
@@ -2624,7 +2915,7 @@ pub fn run(
         || (state.info_window.open && state.info_window.rect.contains(mouse))
         || (state.confirm_window.open && state.confirm_window.rect.contains(mouse));
     let show_hover_grid = hovered_cell.is_some();
-    if is_mouse_button_pressed(MouseButton::Left) && !ui_capturing {
+    if !state.debug_camera.enabled && is_mouse_button_pressed(MouseButton::Left) && !ui_capturing {
         if let Some(cell_index) = hovered_cell {
             if let Some(building) = state.buildings.get(&cell_index) {
                 state.info_window.title = building.kind.label().to_string();
@@ -2660,7 +2951,7 @@ pub fn run(
             state.min_cell_edge_dist_unit,
         );
     }
-    if is_mouse_button_pressed(MouseButton::Right) && !ui_capturing {
+    if !state.debug_camera.enabled && is_mouse_button_pressed(MouseButton::Right) && !ui_capturing {
         if let Some(cell_index) = hovered_cell {
             if let Some(kind) = state.selected_build_tool {
                 let _ = state.place_building(cell_index, kind);
@@ -2672,7 +2963,7 @@ pub fn run(
             }
         }
     }
-    if is_key_pressed(KeyCode::Delete) {
+    if !state.debug_camera.enabled && is_key_pressed(KeyCode::Delete) {
         if let Some(cell_index) = hovered_cell {
             let _ = state.remove_building(cell_index);
         }
@@ -2690,7 +2981,7 @@ pub fn run(
         if let Some(sim_grid) = state.sim_grid.as_ref() {
             let _ = draw_global_hex_cell(
                 sim_grid,
-                &camera,
+                &active_camera,
                 grid_color,
                 1.2,
                 line_radius,
@@ -2995,6 +3286,18 @@ pub fn run(
                 },
             );
         }
+    }
+    if state.debug_camera.enabled {
+        draw_text(
+            &format!(
+                "DebugCam F6=off F7=frustum RMB=look WASD/SPACE/CTRL move SHIFT sprint speed:{:.1}",
+                state.debug_camera.move_speed
+            ),
+            20.0,
+            screen_height() - 18.0,
+            ctx.font_sm,
+            Color::from_rgba(255, 220, 150, 255),
+        );
     }
 }
 

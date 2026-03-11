@@ -47,6 +47,7 @@ pub enum TileType {
     Gold,
     Zinc,
     Lead,
+    Aluminum,
     Water,
 }
 
@@ -59,6 +60,7 @@ pub enum ItemType {
     Gold,
     Zinc,
     Lead,
+    Aluminum,
     Water,
 }
 
@@ -220,6 +222,7 @@ pub struct AppConfig {
     pub weight_gold: f32,
     pub weight_zinc: f32,
     pub weight_lead: f32,
+    pub weight_aluminum: f32,
     pub weight_water: f32,
     pub line_thickness: f32,
     pub arrow_scale: f32,
@@ -241,6 +244,7 @@ impl Default for AppConfig {
             weight_gold: 0.15,
             weight_zinc: 0.15,
             weight_lead: 0.1,
+            weight_aluminum: 0.1,
             weight_water: 0.25,
             line_thickness: 1.0,
             arrow_scale: 1.0,
@@ -296,6 +300,7 @@ pub struct RuntimeColors {
     pub tile_gold: Color,
     pub tile_zinc: Color,
     pub tile_lead: Color,
+    pub tile_aluminum: Color,
     pub tile_water: Color,
 }
 
@@ -332,6 +337,7 @@ pub struct AppColors {
     pub tile_gold: ColorRgba,
     pub tile_zinc: ColorRgba,
     pub tile_lead: ColorRgba,
+    pub tile_aluminum: ColorRgba,
     pub tile_water: ColorRgba,
 }
 
@@ -367,6 +373,7 @@ impl Default for AppColors {
             tile_gold: ColorRgba { r: 190, g: 150, b: 70, a: 255 },
             tile_zinc: ColorRgba { r: 135, g: 140, b: 150, a: 255 },
             tile_lead: ColorRgba { r: 95, g: 95, b: 115, a: 255 },
+            tile_aluminum: ColorRgba { r: 175, g: 185, b: 200, a: 255 },
             tile_water: ColorRgba { r: 60, g: 110, b: 160, a: 255 },
         }
     }
@@ -405,6 +412,7 @@ impl AppColors {
             tile_gold: self.tile_gold.to_color(),
             tile_zinc: self.tile_zinc.to_color(),
             tile_lead: self.tile_lead.to_color(),
+            tile_aluminum: self.tile_aluminum.to_color(),
             tile_water: self.tile_water.to_color(),
         }
     }
@@ -643,6 +651,7 @@ pub fn tile_color(kind: TileType, colors: &RuntimeColors) -> Color {
         TileType::Gold => colors.tile_gold,
         TileType::Zinc => colors.tile_zinc,
         TileType::Lead => colors.tile_lead,
+        TileType::Aluminum => colors.tile_aluminum,
         TileType::Water => colors.tile_water,
     }
 }
@@ -672,6 +681,7 @@ pub fn item_from_tile(kind: TileType) -> ItemType {
         TileType::Gold => ItemType::Gold,
         TileType::Zinc => ItemType::Zinc,
         TileType::Lead => ItemType::Lead,
+        TileType::Aluminum => ItemType::Aluminum,
         TileType::Water => ItemType::Water,
     }
 }
@@ -782,6 +792,7 @@ pub fn tile_kind_weighted(dist: i32, radius: i32, config: &AppConfig) -> TileTyp
     let mut w_g = config.weight_gold.max(0.0);
     let mut w_z = config.weight_zinc.max(0.0);
     let mut w_l = config.weight_lead.max(0.0);
+    let mut w_al = config.weight_aluminum.max(0.0);
     let w_a = config.weight_water.max(0.0);
     let bonus = center_bias * config.tile_center_bonus.max(0.0);
     w_i += bonus * 0.35;
@@ -789,7 +800,8 @@ pub fn tile_kind_weighted(dist: i32, radius: i32, config: &AppConfig) -> TileTyp
     w_g += bonus * 0.2;
     w_z += bonus * 0.12;
     w_l += bonus * 0.08;
-    let total = (w_i + w_c + w_g + w_z + w_l + w_a).max(0.001);
+    w_al += bonus * 0.15;
+    let total = (w_i + w_c + w_g + w_z + w_l + w_al + w_a).max(0.001);
     let roll = rand::gen_range(0.0, total);
     if roll < w_i {
         TileType::Iron
@@ -801,6 +813,8 @@ pub fn tile_kind_weighted(dist: i32, radius: i32, config: &AppConfig) -> TileTyp
         TileType::Zinc
     } else if roll < w_i + w_c + w_g + w_z + w_l {
         TileType::Lead
+    } else if roll < w_i + w_c + w_g + w_z + w_l + w_al {
+        TileType::Aluminum
     } else {
         TileType::Water
     }
@@ -815,6 +829,7 @@ pub fn tile_amount(kind: TileType, dist: i32, radius: i32) -> i32 {
         TileType::Gold => (45, 95),
         TileType::Zinc => (55, 110),
         TileType::Lead => (50, 105),
+        TileType::Aluminum => (58, 116),
         TileType::Water => (100, 200),
     };
     let span = (max_base - min_base) as f32;

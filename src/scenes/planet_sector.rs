@@ -52,6 +52,7 @@ fn item_label(kind: ItemType) -> &'static str {
         ItemType::Gold => "Gold",
         ItemType::Zinc => "Zinc",
         ItemType::Lead => "Lead",
+        ItemType::Aluminum => "Aluminum",
         ItemType::Water => "Water",
     }
 }
@@ -64,6 +65,7 @@ fn tile_label(kind: TileType) -> &'static str {
         TileType::Gold => "Gold",
         TileType::Zinc => "Zinc",
         TileType::Lead => "Lead",
+        TileType::Aluminum => "Aluminum",
         TileType::Water => "Water",
     }
 }
@@ -234,6 +236,7 @@ pub fn run(
                                 | TileType::Gold
                                 | TileType::Zinc
                                 | TileType::Lead
+                                | TileType::Aluminum
                         ) && t.amount > 0
                     })
                     .unwrap_or(false);
@@ -417,6 +420,7 @@ pub fn run(
                         | TileType::Gold
                         | TileType::Zinc
                         | TileType::Lead
+                        | TileType::Aluminum
                 ) && t.amount > 0
             })
             .unwrap_or(false);

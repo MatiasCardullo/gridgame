@@ -224,6 +224,17 @@ pub fn run(
     }
     y += row_gap;
 
+    let (dec, inc) = draw_stepper("Peso Aluminum", &format!("{:.2}", config.weight_aluminum), y);
+    if dec {
+        changed = true;
+        config.weight_aluminum = (config.weight_aluminum - 0.05).max(0.0);
+    }
+    if inc {
+        changed = true;
+        config.weight_aluminum = (config.weight_aluminum + 0.05).min(1.0);
+    }
+    y += row_gap;
+
     let (dec, inc) = draw_stepper("Peso Water", &format!("{:.2}", config.weight_water), y);
     if dec {
         changed = true;

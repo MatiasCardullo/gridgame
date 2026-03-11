@@ -153,6 +153,7 @@ pub fn color_target_name(target: ColorTarget) -> &'static str {
         ColorTarget::TileGold => "Gold",
         ColorTarget::TileZinc => "Zinc",
         ColorTarget::TileLead => "Lead",
+        ColorTarget::TileAluminum => "Aluminum",
         ColorTarget::TileWater => "Water",
     }
 }
@@ -189,6 +190,7 @@ pub fn color_target_mut(target: ColorTarget, colors: &mut AppColors) -> &mut Col
         ColorTarget::TileGold => &mut colors.tile_gold,
         ColorTarget::TileZinc => &mut colors.tile_zinc,
         ColorTarget::TileLead => &mut colors.tile_lead,
+        ColorTarget::TileAluminum => &mut colors.tile_aluminum,
         ColorTarget::TileWater => &mut colors.tile_water,
     }
 }
@@ -238,11 +240,12 @@ pub enum ColorTarget {
     TileGold,
     TileZinc,
     TileLead,
+    TileAluminum,
     TileWater,
 }
 
 // Ordered list of selectable color targets.
-pub fn color_target_list() -> [ColorTarget; 30] {
+pub fn color_target_list() -> [ColorTarget; 31] {
     [
         ColorTarget::Background,
         ColorTarget::Grid,
@@ -273,6 +276,7 @@ pub fn color_target_list() -> [ColorTarget; 30] {
         ColorTarget::TileGold,
         ColorTarget::TileZinc,
         ColorTarget::TileLead,
+        ColorTarget::TileAluminum,
         ColorTarget::TileWater,
     ]
 }

@@ -79,6 +79,7 @@ pub enum PlanetResourceKind {
     Gold,
     Lead,
     Zinc,
+    Aluminum,
     Lithium,
     Phosphate,
     Stone,
@@ -94,6 +95,7 @@ impl PlanetResourceKind {
             PlanetResourceKind::Gold => 2,
             PlanetResourceKind::Lead => 3,
             PlanetResourceKind::Zinc => 4,
+            PlanetResourceKind::Aluminum => 10,
             PlanetResourceKind::Lithium => 5,
             PlanetResourceKind::Phosphate => 6,
             PlanetResourceKind::Stone => 7,
@@ -109,6 +111,7 @@ impl PlanetResourceKind {
             2 => Some(PlanetResourceKind::Gold),
             3 => Some(PlanetResourceKind::Lead),
             4 => Some(PlanetResourceKind::Zinc),
+            10 => Some(PlanetResourceKind::Aluminum),
             5 => Some(PlanetResourceKind::Lithium),
             6 => Some(PlanetResourceKind::Phosphate),
             7 => Some(PlanetResourceKind::Stone),
@@ -366,6 +369,14 @@ fn generate_deposit(
     } else {
         0.0
     };
+    let p_aluminum = if matches!(surface, PlanetSurfaceClass::Land | PlanetSurfaceClass::Coast) {
+        lithology_match(lithology, LithologyKind::Clastic, 0.55)
+            + lithology_match(lithology, LithologyKind::IgneousFelsic, 0.45)
+            + (1.0 - metric.slope * 4.5).clamp(0.0, 1.0) * 0.4
+            + metric.dryness * 0.22
+    } else {
+        0.0
+    };
     let p_lithium = if matches!(surface, PlanetSurfaceClass::Land) {
         lithology_match(lithology, LithologyKind::Evaporite, 0.75)
             + metric.dryness * 0.65
@@ -407,6 +418,7 @@ fn generate_deposit(
         (PlanetResourceKind::Gold, p_gold * 0.55),
         (PlanetResourceKind::Lead, p_lead),
         (PlanetResourceKind::Zinc, p_zinc),
+        (PlanetResourceKind::Aluminum, p_aluminum),
         (PlanetResourceKind::Lithium, p_lithium),
         (PlanetResourceKind::Phosphate, p_phosphate),
         (PlanetResourceKind::Stone, p_stone),
@@ -426,6 +438,7 @@ fn generate_deposit(
         PlanetResourceKind::Salt => 0.66,
         PlanetResourceKind::FreshWater => 0.63,
         PlanetResourceKind::Stone => 0.55,
+        PlanetResourceKind::Aluminum => 0.64,
         _ => 0.62,
     };
     if score < threshold {
@@ -440,6 +453,7 @@ fn generate_deposit(
         PlanetResourceKind::FreshWater => 18_000,
         PlanetResourceKind::Stone => 28_000,
         PlanetResourceKind::Salt => 14_000,
+        PlanetResourceKind::Aluminum => 20_000,
         _ => 16_000,
     };
     let richness = (0.6 + score * 0.8).clamp(0.55, 1.55);

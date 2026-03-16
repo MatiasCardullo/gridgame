@@ -9,21 +9,26 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Instant, SystemTime};
 
-use crate::core::{FrameContext, Scene};
+use crate::core::{AutoSupplyRole, FrameContext, Scene, StationPick};
 use crate::core::debug::{
     draw_planet_controls, format_log_timestamp, planet_perf_log, PLANET_DEBUG_UI_ENABLED_DEFAULT,
     SAVE_MESH_POINTS_RUNTIME,
 };
 use crate::core::planet_grid::{
     HexGrid, align_vertices_to_poles, build_faces, build_frequency_geodesic, build_geodesic_sphere,
-    build_hex_grid_from_data, icosahedron_edges, icosahedron_vertices, load_hex_grid_cache,
-    save_hex_grid_cache,
+    build_hex_grid_from_data, build_vertex_neighbors, icosahedron_edges, icosahedron_vertices,
+    load_hex_grid_cache, save_hex_grid_cache,
 };
 use crate::core::planet_resources::{
     PlanetResourceKind, PlanetSimWorld, PlanetSurfaceClass, build_or_load_sim_world,
 };
 use crate::core::planet_texture::{
     PlanetNoiseConfig, color_from_height, height_value, load_or_build_heightmap, texture_params_match,
+};
+use crate::core::planet_units::{
+    PlanetBuildingAccess, PlanetResourceStack, PlanetUnit, PlanetUnitRecord, PlanetUnitsSnapshot,
+    UnitOps, combine_paths, find_route_path_cells, resource_kind_from_id, resource_kind_to_id,
+    storage_total, update_units_and_construction,
 };
 use crate::core::ui::{draw_build_panel, draw_window, ui_button, WindowState, WindowStyle, WINDOW_TITLE_HEIGHT};
 use crate::core::map_common::{build_panel_layout, handle_window_drag};
@@ -34,6 +39,7 @@ const PLANET_NOISE_PATH: &str = "planet_data/planet_noise.json";
 const SIM_GRID_CACHE_PATH: &str = "planet_data/planet_sim_grid.bin";
 const PLANET_RESOURCES_PATH: &str = "planet_data/planet_resources.bin";
 const PLANET_BUILDINGS_PATH: &str = "planet_data/planet_buildings.json";
+const PLANET_UNITS_PATH: &str = "planet_data/planet_units.json";
 const HEIGHTMAP_SIZE: u16 = 2048;
 const TEXTURE_BASE_SUBDIVISIONS: usize = 2;
 const TEXTURE_LAYER_OFFSET: f32 = 0.004;
@@ -197,6 +203,76 @@ fn draw_camera_frustum(camera: &Camera3D, color: Color, far_visual: f32) {
     draw_line_3d(nbl, fbl, color);
     draw_line_3d(nbr, fbr, color);
     draw_line_3d(camera.position, near_center, Color::from_rgba(255, 220, 120, 255));
+}
+
+// Draws a rectangular prism aligned to a local forward/side/normal basis.
+fn draw_oriented_prism(
+    center: Vec3,
+    forward: Vec3,
+    side: Vec3,
+    normal: Vec3,
+    size: Vec3,
+    color: Color,
+    outline: Color,
+) {
+    let hx = size.x * 0.5;
+    let hy = size.y * 0.5;
+    let hz = size.z * 0.5;
+    let fx = forward * hx;
+    let sy = side * hy;
+    let nz = normal * hz;
+
+    let p000 = center - fx - sy - nz;
+    let p001 = center - fx - sy + nz;
+    let p010 = center - fx + sy - nz;
+    let p011 = center - fx + sy + nz;
+    let p100 = center + fx - sy - nz;
+    let p101 = center + fx - sy + nz;
+    let p110 = center + fx + sy - nz;
+    let p111 = center + fx + sy + nz;
+
+    let mut vertices = vec![
+        Vertex::new2(p000, vec2(0.0, 0.0), color),
+        Vertex::new2(p001, vec2(0.0, 0.0), color),
+        Vertex::new2(p010, vec2(0.0, 0.0), color),
+        Vertex::new2(p011, vec2(0.0, 0.0), color),
+        Vertex::new2(p100, vec2(0.0, 0.0), color),
+        Vertex::new2(p101, vec2(0.0, 0.0), color),
+        Vertex::new2(p110, vec2(0.0, 0.0), color),
+        Vertex::new2(p111, vec2(0.0, 0.0), color),
+    ];
+    let indices: Vec<u16> = vec![
+        0, 1, 3, 0, 3, 2, // -X
+        4, 6, 7, 4, 7, 5, // +X
+        0, 4, 5, 0, 5, 1, // -Y
+        2, 3, 7, 2, 7, 6, // +Y
+        0, 2, 6, 0, 6, 4, // -Z
+        1, 5, 7, 1, 7, 3, // +Z
+    ];
+    let mesh = Mesh {
+        vertices: std::mem::take(&mut vertices),
+        indices,
+        texture: None,
+    };
+    draw_mesh(&mesh);
+
+    let edges = [
+        (p000, p001),
+        (p001, p011),
+        (p011, p010),
+        (p010, p000),
+        (p100, p101),
+        (p101, p111),
+        (p111, p110),
+        (p110, p100),
+        (p000, p100),
+        (p001, p101),
+        (p010, p110),
+        (p011, p111),
+    ];
+    for (a, b) in edges {
+        draw_line_3d(a, b, outline);
+    }
 }
 
 
@@ -371,6 +447,116 @@ fn building_storage_capacity(kind: PlanetBuildingKind) -> u32 {
     }
 }
 
+// Returns construction time in seconds for planet buildings.
+fn planet_build_time(kind: PlanetBuildingKind) -> f32 {
+    match kind {
+        PlanetBuildingKind::Base => 0.0,
+        PlanetBuildingKind::Builder => 5.0,
+        PlanetBuildingKind::Housing => 6.0,
+        PlanetBuildingKind::Factory => 8.0,
+        PlanetBuildingKind::Mine => 9.0,
+        PlanetBuildingKind::Warehouse => 7.0,
+        PlanetBuildingKind::Logistics => 8.0,
+        PlanetBuildingKind::Route => 0.5,
+    }
+}
+
+// Returns construction material requirements per planet building kind.
+fn planet_build_requirements(kind: PlanetBuildingKind) -> Vec<PlanetResourceStack> {
+    match kind {
+        PlanetBuildingKind::Base => vec![],
+        PlanetBuildingKind::Builder => vec![
+            PlanetResourceStack {
+                resource_id: resource_kind_to_id(PlanetResourceKind::Stone),
+                amount: 8,
+            },
+            PlanetResourceStack {
+                resource_id: resource_kind_to_id(PlanetResourceKind::Iron),
+                amount: 4,
+            },
+            PlanetResourceStack {
+                resource_id: resource_kind_to_id(PlanetResourceKind::Copper),
+                amount: 2,
+            },
+        ],
+        PlanetBuildingKind::Housing => vec![
+            PlanetResourceStack {
+                resource_id: resource_kind_to_id(PlanetResourceKind::Stone),
+                amount: 10,
+            },
+            PlanetResourceStack {
+                resource_id: resource_kind_to_id(PlanetResourceKind::Copper),
+                amount: 4,
+            },
+        ],
+        PlanetBuildingKind::Factory => vec![
+            PlanetResourceStack {
+                resource_id: resource_kind_to_id(PlanetResourceKind::Iron),
+                amount: 12,
+            },
+            PlanetResourceStack {
+                resource_id: resource_kind_to_id(PlanetResourceKind::Copper),
+                amount: 8,
+            },
+        ],
+        PlanetBuildingKind::Mine => vec![
+            PlanetResourceStack {
+                resource_id: resource_kind_to_id(PlanetResourceKind::Stone),
+                amount: 12,
+            },
+            PlanetResourceStack {
+                resource_id: resource_kind_to_id(PlanetResourceKind::Iron),
+                amount: 6,
+            },
+            PlanetResourceStack {
+                resource_id: resource_kind_to_id(PlanetResourceKind::Copper),
+                amount: 4,
+            },
+        ],
+        PlanetBuildingKind::Warehouse => vec![
+            PlanetResourceStack {
+                resource_id: resource_kind_to_id(PlanetResourceKind::Stone),
+                amount: 12,
+            },
+            PlanetResourceStack {
+                resource_id: resource_kind_to_id(PlanetResourceKind::Iron),
+                amount: 6,
+            },
+        ],
+        PlanetBuildingKind::Logistics => vec![
+            PlanetResourceStack {
+                resource_id: resource_kind_to_id(PlanetResourceKind::Iron),
+                amount: 10,
+            },
+            PlanetResourceStack {
+                resource_id: resource_kind_to_id(PlanetResourceKind::Copper),
+                amount: 6,
+            },
+        ],
+        PlanetBuildingKind::Route => vec![PlanetResourceStack {
+            resource_id: resource_kind_to_id(PlanetResourceKind::Stone),
+            amount: 3,
+        }],
+    }
+}
+
+// Adds a resource amount to building storage.
+fn add_storage_amount(
+    storage: &mut HashMap<PlanetResourceKind, u32>,
+    kind: PlanetResourceKind,
+    amount: u32,
+) {
+    if amount == 0 {
+        return;
+    }
+    *storage.entry(kind).or_insert(0) += amount;
+}
+
+// Returns true if a building is still under construction.
+fn planet_is_under_construction(building: &PlanetBuildingState) -> bool {
+    building.build_time > 0.0 && building.build_progress < building.build_time
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct PlanetBuildingRecord {
     #[serde(default, alias = "visual_cell")]
@@ -378,6 +564,18 @@ struct PlanetBuildingRecord {
     kind: PlanetBuildingKind,
     #[serde(default)]
     storage: Vec<PlanetBuildingStorageRecord>,
+    #[serde(default)]
+    build_progress: f32,
+    #[serde(default)]
+    build_time: f32,
+    #[serde(default)]
+    build_paid: bool,
+    #[serde(default)]
+    build_claimed: bool,
+    #[serde(default)]
+    builder_units_desired: i32,
+    #[serde(default)]
+    builder_units_created: i32,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -390,8 +588,93 @@ struct PlanetBuildingStorageRecord {
 struct PlanetBuildingState {
     kind: PlanetBuildingKind,
     storage: HashMap<PlanetResourceKind, u32>,
+    build_progress: f32,
+    build_time: f32,
+    build_paid: bool,
+    build_claimed: bool,
+    builder_units_desired: i32,
+    builder_units_created: i32,
 }
 
+impl PlanetBuildingAccess for PlanetBuildingState {
+    type Kind = PlanetBuildingKind;
+
+    fn kind(&self) -> Self::Kind {
+        self.kind
+    }
+
+    fn storage(&self) -> &HashMap<PlanetResourceKind, u32> {
+        &self.storage
+    }
+
+    fn storage_mut(&mut self) -> &mut HashMap<PlanetResourceKind, u32> {
+        &mut self.storage
+    }
+
+    fn build_progress(&self) -> f32 {
+        self.build_progress
+    }
+
+    fn build_time(&self) -> f32 {
+        self.build_time
+    }
+
+    fn set_build_progress(&mut self, value: f32) {
+        self.build_progress = value;
+    }
+
+    fn build_paid(&self) -> bool {
+        self.build_paid
+    }
+
+    fn set_build_paid(&mut self, value: bool) {
+        self.build_paid = value;
+    }
+
+    fn build_claimed(&self) -> bool {
+        self.build_claimed
+    }
+
+    fn set_build_claimed(&mut self, value: bool) {
+        self.build_claimed = value;
+    }
+
+    fn builder_units_desired(&self) -> i32 {
+        self.builder_units_desired
+    }
+}
+
+fn is_route_kind(kind: PlanetBuildingKind) -> bool {
+    kind == PlanetBuildingKind::Route
+}
+
+fn is_builder_kind(kind: PlanetBuildingKind) -> bool {
+    kind == PlanetBuildingKind::Builder
+}
+
+fn is_base_kind(kind: PlanetBuildingKind) -> bool {
+    kind == PlanetBuildingKind::Base
+}
+
+fn is_warehouse_kind(kind: PlanetBuildingKind) -> bool {
+    kind == PlanetBuildingKind::Warehouse
+}
+
+fn is_logistics_kind(kind: PlanetBuildingKind) -> bool {
+    kind == PlanetBuildingKind::Logistics
+}
+
+fn unit_ops() -> UnitOps<PlanetBuildingKind> {
+    UnitOps {
+        is_route: is_route_kind,
+        is_builder: is_builder_kind,
+        is_base: is_base_kind,
+        is_warehouse: is_warehouse_kind,
+        is_logistics: is_logistics_kind,
+        build_requirements: planet_build_requirements,
+        storage_capacity: building_storage_capacity,
+    }
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct PlanetBuildingsSnapshot {
@@ -435,6 +718,7 @@ pub struct PlanetState {
     pub texture_config: PlanetNoiseConfig,
     sim_grid: Option<HexGrid>,
     sim_grid_rx: Option<Receiver<HexGrid>>,
+    sim_neighbors: Option<Vec<Vec<u32>>>,
     sim_world: Option<PlanetSimWorld>,
     sim_world_rx: Option<Receiver<SimWorldBuildResult>>,
     sim_world_generation: u64,
@@ -442,6 +726,11 @@ pub struct PlanetState {
     panel_collapsed: bool,
     buildings: HashMap<u32, PlanetBuildingState>,
     buildings_dirty: bool,
+    units: Vec<PlanetUnit>,
+    units_dirty: bool,
+    station_in: Option<u32>,
+    station_out: Option<u32>,
+    station_pick: Option<StationPick>,
     mine_progress: HashMap<u32, f32>,
     min_cell_edge_dist_unit: f32,
     info_window: WindowState,
@@ -459,6 +748,7 @@ pub struct PlanetState {
     last_hitch_log_at: f64,
     last_resource_save_at: f64,
     last_buildings_save_at: f64,
+    last_units_save_at: f64,
     regen_generation: Arc<AtomicU64>,
 }
 
@@ -559,6 +849,7 @@ impl PlanetState {
             texture_config: config,
             sim_grid: None,
             sim_grid_rx,
+            sim_neighbors: None,
             sim_world: None,
             sim_world_rx: None,
             sim_world_generation: 0,
@@ -566,6 +857,11 @@ impl PlanetState {
             panel_collapsed: false,
             buildings: HashMap::new(),
             buildings_dirty: false,
+            units: Vec::new(),
+            units_dirty: false,
+            station_in: None,
+            station_out: None,
+            station_pick: None,
             mine_progress: HashMap::new(),
             min_cell_edge_dist_unit: 0.010,
             info_window: WindowState {
@@ -599,9 +895,11 @@ impl PlanetState {
             last_hitch_log_at: 0.0,
             last_resource_save_at: 0.0,
             last_buildings_save_at: 0.0,
+            last_units_save_at: 0.0,
             regen_generation: Arc::new(AtomicU64::new(0)),
         };
         state.load_buildings_snapshot(PLANET_BUILDINGS_PATH);
+        state.load_units_snapshot(PLANET_UNITS_PATH);
         state
     }
 
@@ -739,11 +1037,27 @@ impl PlanetState {
                     storage.insert(kind, entry.amount);
                 }
             }
+            let build_time = if record.build_time <= 0.0 {
+                planet_build_time(record.kind)
+            } else {
+                record.build_time
+            };
+            let build_progress = if record.build_paid {
+                record.build_progress.min(build_time)
+            } else {
+                record.build_progress
+            };
             self.buildings.insert(
                 record.cell_index,
                 PlanetBuildingState {
                     kind: record.kind,
                     storage,
+                    build_progress,
+                    build_time,
+                    build_paid: record.build_paid,
+                    build_claimed: record.build_claimed,
+                    builder_units_desired: record.builder_units_desired,
+                    builder_units_created: record.builder_units_created,
                 },
             );
         }
@@ -771,12 +1085,103 @@ impl PlanetState {
                             amount: *amount,
                         })
                         .collect(),
+                    build_progress: building.build_progress,
+                    build_time: building.build_time,
+                    build_paid: building.build_paid,
+                    build_claimed: building.build_claimed,
+                    builder_units_desired: building.builder_units_desired,
+                    builder_units_created: building.builder_units_created,
                 })
                 .collect(),
         };
         if let Ok(json) = serde_json::to_string_pretty(&snapshot) {
             let _ = fs::write(path, json);
             self.buildings_dirty = false;
+        }
+    }
+
+    // Loads unit snapshot from disk.
+    fn load_units_snapshot(&mut self, path: &str) {
+        let Ok(contents) = fs::read_to_string(path) else {
+            return;
+        };
+        let Ok(snapshot) = serde_json::from_str::<PlanetUnitsSnapshot>(&contents) else {
+            return;
+        };
+        self.units.clear();
+        for record in snapshot.units.into_iter() {
+            let supply_types = record
+                .supply_types
+                .into_iter()
+                .filter_map(resource_kind_from_id)
+                .collect::<Vec<_>>();
+            let cargo = record
+                .cargo
+                .into_iter()
+                .filter(|stack| stack.amount > 0)
+                .collect::<Vec<_>>();
+            let supply_reqs = record
+                .supply_reqs
+                .into_iter()
+                .filter(|stack| stack.amount > 0)
+                .collect::<Vec<_>>();
+            self.units.push(PlanetUnit {
+                path: record.path,
+                index: record.index,
+                progress: record.progress,
+                speed: record.speed,
+                forward: record.forward,
+                capacity: record.capacity,
+                cargo,
+                depot: record.depot,
+                station_in: record.station_in,
+                station_out: record.station_out,
+                auto_supply: record.auto_supply,
+                supply_types,
+                auto_supply_role: record.auto_supply_role,
+                supply_reqs,
+                waiting_for_supply: record.waiting_for_supply,
+            });
+        }
+        self.units_dirty = false;
+    }
+
+    // Saves units when dirty.
+    fn save_units_if_dirty(&mut self, path: &str) {
+        if !self.units_dirty {
+            return;
+        }
+        ensure_planet_data_dir();
+        let snapshot = PlanetUnitsSnapshot {
+            units: self
+                .units
+                .iter()
+                .map(|unit| PlanetUnitRecord {
+                    depot: unit.depot,
+                    station_in: unit.station_in,
+                    station_out: unit.station_out,
+                    index: unit.index,
+                    progress: unit.progress,
+                    speed: unit.speed,
+                    forward: unit.forward,
+                    capacity: unit.capacity,
+                    auto_supply: unit.auto_supply,
+                    auto_supply_role: unit.auto_supply_role,
+                    waiting_for_supply: unit.waiting_for_supply,
+                    path: unit.path.clone(),
+                    cargo: unit.cargo.clone(),
+                    supply_types: unit
+                        .supply_types
+                        .iter()
+                        .map(|kind| resource_kind_to_id(*kind))
+                        .collect(),
+                    supply_reqs: unit.supply_reqs.clone(),
+                })
+                .collect(),
+        };
+        if let Ok(json) = serde_json::to_string_pretty(&snapshot) {
+            let _ = fs::write(path, json);
+            self.units_dirty = false;
         }
     }
 
@@ -802,11 +1207,30 @@ impl PlanetState {
         if !self.can_place_building(cell_index, kind) {
             return false;
         }
+        let mut storage = HashMap::new();
+        let build_time = planet_build_time(kind);
+        let mut build_paid = false;
+        let mut build_progress = 0.0;
+        if kind == PlanetBuildingKind::Base {
+            build_paid = true;
+            build_progress = build_time;
+            add_storage_amount(&mut storage, PlanetResourceKind::Stone, 1_800);
+            add_storage_amount(&mut storage, PlanetResourceKind::Iron, 80);
+            add_storage_amount(&mut storage, PlanetResourceKind::Copper, 40);
+            add_storage_amount(&mut storage, PlanetResourceKind::Lead, 20);
+            add_storage_amount(&mut storage, PlanetResourceKind::Zinc, 10);
+        }
         self.buildings.insert(
             cell_index,
             PlanetBuildingState {
                 kind,
-                storage: HashMap::new(),
+                storage,
+                build_progress,
+                build_time,
+                build_paid,
+                build_claimed: false,
+                builder_units_desired: 0,
+                builder_units_created: 0,
             },
         );
         self.buildings_dirty = true;
@@ -817,6 +1241,15 @@ impl PlanetState {
         let removed = self.buildings.remove(&cell_index).is_some();
         if removed {
             self.mine_progress.remove(&cell_index);
+            let before = self.units.len();
+            self.units.retain(|unit| {
+                unit.depot != cell_index
+                    && unit.station_in != cell_index
+                    && unit.station_out != cell_index
+            });
+            if self.units.len() != before {
+                self.units_dirty = true;
+            }
             self.buildings_dirty = true;
         }
         removed
@@ -860,7 +1293,7 @@ impl PlanetState {
             .buildings
             .iter()
             .filter_map(|(cell_index, building)| {
-                if building.kind == PlanetBuildingKind::Mine {
+                if building.kind == PlanetBuildingKind::Mine && !planet_is_under_construction(building) {
                     Some(*cell_index)
                 } else {
                     None
@@ -901,6 +1334,31 @@ impl PlanetState {
             if mined > 0 && self.push_to_building_storage(cell_index, resource_kind, mined) > 0 {
                 self.buildings_dirty = true;
             }
+        }
+    }
+
+    // Advances construction and unit simulation for the planet scene.
+    fn update_units_and_construction(&mut self, dt: f32) {
+        let Some(sim_grid) = self.sim_grid.as_ref() else {
+            return;
+        };
+        let Some(neighbors) = self.sim_neighbors.as_ref() else {
+            return;
+        };
+        let ops = unit_ops();
+        let result = update_units_and_construction(
+            &mut self.units,
+            &mut self.buildings,
+            sim_grid,
+            neighbors,
+            dt,
+            &ops,
+        );
+        if result.units_dirty {
+            self.units_dirty = true;
+        }
+        if result.buildings_dirty {
+            self.buildings_dirty = true;
         }
     }
 
@@ -2365,39 +2823,6 @@ fn resource_label(kind: PlanetResourceKind) -> &'static str {
     }
 }
 
-fn resource_kind_to_id(kind: PlanetResourceKind) -> u8 {
-    match kind {
-        PlanetResourceKind::Iron => 0,
-        PlanetResourceKind::Copper => 1,
-        PlanetResourceKind::Gold => 2,
-        PlanetResourceKind::Lead => 3,
-        PlanetResourceKind::Zinc => 4,
-        PlanetResourceKind::Aluminum => 10,
-        PlanetResourceKind::Lithium => 5,
-        PlanetResourceKind::Phosphate => 6,
-        PlanetResourceKind::Stone => 7,
-        PlanetResourceKind::FreshWater => 8,
-        PlanetResourceKind::Salt => 9,
-    }
-}
-
-fn resource_kind_from_id(id: u8) -> Option<PlanetResourceKind> {
-    match id {
-        0 => Some(PlanetResourceKind::Iron),
-        1 => Some(PlanetResourceKind::Copper),
-        2 => Some(PlanetResourceKind::Gold),
-        3 => Some(PlanetResourceKind::Lead),
-        4 => Some(PlanetResourceKind::Zinc),
-        10 => Some(PlanetResourceKind::Aluminum),
-        5 => Some(PlanetResourceKind::Lithium),
-        6 => Some(PlanetResourceKind::Phosphate),
-        7 => Some(PlanetResourceKind::Stone),
-        8 => Some(PlanetResourceKind::FreshWater),
-        9 => Some(PlanetResourceKind::Salt),
-        _ => None,
-    }
-}
-
 // Computes a consistent outward normal for a face.
 fn face_normal(vertices: &[Vec3], face: [usize; 3]) -> Vec3 {
     let a = vertices[face[0]];
@@ -2558,6 +2983,7 @@ pub fn run(
             sim_world.save_if_dirty(PLANET_RESOURCES_PATH);
         }
         state.save_buildings_if_dirty(PLANET_BUILDINGS_PATH);
+        state.save_units_if_dirty(PLANET_UNITS_PATH);
         *scene = Scene::MainMenu;
         return;
     }
@@ -2567,8 +2993,19 @@ pub fn run(
     if state.sim_grid.is_none() && state.sim_world_rx.is_none() {
         if let Some(rx) = state.sim_grid_rx.as_ref() {
             if let Ok(grid) = rx.try_recv() {
+                let faces_usize: Vec<[usize; 3]> = grid
+                    .faces
+                    .iter()
+                    .map(|face| [face[0] as usize, face[1] as usize, face[2] as usize])
+                    .collect();
+                let neighbors = build_vertex_neighbors(&faces_usize, grid.vertices.len());
+                let neighbors = neighbors
+                    .into_iter()
+                    .map(|list| list.into_iter().map(|v| v as u32).collect())
+                    .collect();
                 state.sim_grid = Some(grid);
                 state.sim_grid_rx = None;
+                state.sim_neighbors = Some(neighbors);
                 planet_perf_log("sim grid ready; scheduling sim world build");
             }
         }
@@ -2636,6 +3073,10 @@ pub fn run(
         state.save_buildings_if_dirty(PLANET_BUILDINGS_PATH);
         state.last_buildings_save_at = now;
     }
+    if now - state.last_units_save_at > 5.0 {
+        state.save_units_if_dirty(PLANET_UNITS_PATH);
+        state.last_units_save_at = now;
+    }
 
     let mouse = vec2(mouse_position().0, mouse_position().1);
     let was_debug_camera_enabled = state.debug_camera.enabled;
@@ -2701,6 +3142,7 @@ pub fn run(
     if is_key_pressed(KeyCode::Key9) {
         state.selected_build_tool = Some(PlanetBuildingKind::Route);
     }
+    state.update_units_and_construction(frame_time);
     state.tick_mining(frame_time);
 
     let mut yaw_input = 0.0;
@@ -2917,11 +3359,22 @@ pub fn run(
     let show_hover_grid = hovered_cell.is_some();
     if !state.debug_camera.enabled && is_mouse_button_pressed(MouseButton::Left) && !ui_capturing {
         if let Some(cell_index) = hovered_cell {
-            if let Some(building) = state.buildings.get(&cell_index) {
+            if let Some(pick) = state.station_pick {
+                if let Some(building) = state.buildings.get(&cell_index) {
+                    if !planet_is_under_construction(building) {
+                        match pick {
+                            StationPick::In => state.station_in = Some(cell_index),
+                            StationPick::Out => state.station_out = Some(cell_index),
+                        }
+                        state.station_pick = None;
+                    }
+                }
+            } else if let Some(building) = state.buildings.get(&cell_index) {
                 state.info_window.title = building.kind.label().to_string();
                 state.info_window.rect = Rect::new(mouse.x + 12.0, mouse.y + 12.0, 280.0, 190.0);
                 state.info_window.open = true;
                 state.info_target_cell = Some(cell_index);
+                state.info_window.show_units = false;
             } else if let Some(face_index) = hovered_subface {
                 let face = faces[face_index];
                 let normal = face_normal(&vertices, face);
@@ -2950,6 +3403,54 @@ pub fn run(
             radius,
             state.min_cell_edge_dist_unit,
         );
+        let unit_color = ctx.colors_rt.port_out;
+        let unit_outline = ctx.colors_rt.text_primary;
+        let target_apothem = (state.min_cell_edge_dist_unit * 0.9 * 0.62).max(0.0005);
+        let route_half_width = (target_apothem * radius * 0.05).max(0.001125);
+        let unit_width = route_half_width * 2.0;
+        let unit_length = unit_width * 0.9;
+        let unit_height = unit_width * 0.35;
+        for unit in state.units.iter() {
+            if unit.path.len() < 2 {
+                continue;
+            }
+            let next_index = if unit.forward {
+                if unit.index + 1 < unit.path.len() {
+                    unit.index + 1
+                } else {
+                    unit.index
+                }
+            } else if unit.index > 0 {
+                unit.index - 1
+            } else {
+                unit.index
+            };
+            let Some(a) = sim_grid.vertices.get(unit.path[unit.index] as usize) else {
+                continue;
+            };
+            let Some(b) = sim_grid.vertices.get(unit.path[next_index] as usize) else {
+                continue;
+            };
+            let t = unit.progress.clamp(0.0, 1.0);
+            let dir = a.lerp(*b, t).normalize_or_zero();
+            let unit_lift = 0.0035 + 0.0005 + unit_height * 0.5 + 0.0002;
+            let world = dir * (radius + unit_lift);
+            if point_in_frustum(&active_camera, world, 0.3) {
+                let normal = dir.normalize_or_zero();
+                let mut forward = (*b - *a).normalize_or_zero();
+                forward = (forward - normal * forward.dot(normal)).normalize_or_zero();
+                if forward.length() < 1e-5 {
+                    forward = if normal.y.abs() < 0.9 {
+                        vec3(0.0, 1.0, 0.0).cross(normal).normalize_or_zero()
+                    } else {
+                        vec3(1.0, 0.0, 0.0).cross(normal).normalize_or_zero()
+                    };
+                }
+                let side = normal.cross(forward).normalize_or_zero();
+                let size = vec3(unit_length, unit_width, unit_height);
+                draw_oriented_prism(world, forward, side, normal, size, unit_color, unit_outline);
+            }
+        }
     }
     if !state.debug_camera.enabled && is_mouse_button_pressed(MouseButton::Right) && !ui_capturing {
         if let Some(cell_index) = hovered_cell {
@@ -3046,7 +3547,30 @@ pub fn run(
             ctx.colors_rt.text_primary,
         );
     }
+    let mut spawn_request: Option<(u32, u32, u32, PlanetBuildingKind)> = None;
     if state.info_window.open {
+        if let Some(cell_index) = state.info_target_cell {
+            if let Some(building) = state.buildings.get(&cell_index) {
+                if matches!(building.kind, PlanetBuildingKind::Logistics | PlanetBuildingKind::Builder) {
+                    let total_units = if building.kind == PlanetBuildingKind::Logistics {
+                        state.units.iter().filter(|unit| unit.depot == cell_index).count()
+                    } else {
+                        building.builder_units_desired.max(0) as usize
+                    };
+                    let visible_lines = total_units.min(6) as f32;
+                    let extra = if state.info_window.show_units {
+                        let extra_lines = if total_units > 6 { 1.0 } else { 0.0 };
+                        38.0 + (visible_lines + extra_lines) * 18.0
+                    } else {
+                        0.0
+                    };
+                    state.info_window.rect.h = 190.0 + extra;
+                } else {
+                    state.info_window.rect.h = state.info_window.rect.h.min(190.0);
+                    state.info_window.show_units = false;
+                }
+            }
+        }
         handle_window_drag(&mut state.info_window, mouse);
         let close = draw_window(
             &state.info_window,
@@ -3067,7 +3591,8 @@ pub fn run(
             let tx = state.info_window.rect.x + 10.0;
             let mut ty = state.info_window.rect.y + WINDOW_TITLE_HEIGHT + 18.0;
             if let Some(cell_index) = state.info_target_cell {
-                if let Some(building) = state.buildings.get(&cell_index) {
+                if let Some(building) = state.buildings.get_mut(&cell_index) {
+                    let under_construction = planet_is_under_construction(building);
                     draw_text(
                         &format!("Cell: {}", cell_index),
                         tx,
@@ -3106,6 +3631,65 @@ pub fn run(
                             ty += 26.0;
                         }
                     }
+                    if under_construction {
+                        draw_text(
+                            "Under construction",
+                            tx,
+                            ty,
+                            ctx.font_sm,
+                            ctx.colors_rt.text_secondary,
+                        );
+                        ty += 18.0;
+                        let reqs = planet_build_requirements(building.kind);
+                        if reqs.is_empty() {
+                            draw_text(
+                                "Materials: free",
+                                tx,
+                                ty,
+                                ctx.font_sm,
+                                ctx.colors_rt.text_secondary,
+                            );
+                            ty += 18.0;
+                        } else {
+                            let mut req_lines: Vec<String> = reqs
+                                .iter()
+                                .filter_map(|req| {
+                                    resource_kind_from_id(req.resource_id)
+                                        .map(|kind| format!("{} {}", resource_label(kind), req.amount))
+                                })
+                                .collect();
+                            req_lines.sort();
+                            draw_text(
+                                &format!("Needs: {}", req_lines.join(" | ")),
+                                tx,
+                                ty,
+                                ctx.font_sm,
+                                ctx.colors_rt.text_secondary,
+                            );
+                            ty += 18.0;
+                        }
+                        draw_text(
+                            &format!("Paid: {}", if building.build_paid { "yes" } else { "no" }),
+                            tx,
+                            ty,
+                            ctx.font_sm,
+                            ctx.colors_rt.text_secondary,
+                        );
+                        ty += 18.0;
+                        if building.build_time > 0.0 {
+                            draw_text(
+                                &format!(
+                                    "Progress: {:.1}/{:.1}",
+                                    building.build_progress, building.build_time
+                                ),
+                                tx,
+                                ty,
+                                ctx.font_sm,
+                                ctx.colors_rt.text_secondary,
+                            );
+                            ty += 20.0;
+                        }
+                    }
                     let mut storage_lines: Vec<String> = building
                         .storage
                         .iter()
@@ -3136,6 +3720,215 @@ pub fn run(
                         );
                         ty += 22.0;
                     }
+                    match building.kind {
+                        PlanetBuildingKind::Logistics => {
+                            if under_construction {
+                                draw_text(
+                                    "Available after completion",
+                                    tx,
+                                    ty,
+                                    ctx.font_sm,
+                                    ctx.colors_rt.text_secondary,
+                                );
+                                ty += 20.0;
+                            } else {
+                                let a_text = match state.station_in {
+                                    Some(a) => format!("In: {}", a),
+                                    None => "In: (none)".to_string(),
+                                };
+                                let b_text = match state.station_out {
+                                    Some(b) => format!("Out: {}", b),
+                                    None => "Out: (none)".to_string(),
+                                };
+                                draw_text(&a_text, tx, ty, ctx.font_sm, ctx.colors_rt.text_secondary);
+                                ty += 18.0;
+                                draw_text(&b_text, tx, ty, ctx.font_sm, ctx.colors_rt.text_secondary);
+                                ty += 22.0;
+
+                                let rect_set_a = Rect::new(tx, ty, 80.0, 26.0);
+                                let rect_set_b = Rect::new(tx + 90.0, ty, 80.0, 26.0);
+                                let (clicked_a, _) = ui_button(
+                                    rect_set_a,
+                                    "Set In",
+                                    mouse,
+                                    ctx.font_sm,
+                                    ctx.button_colors,
+                                );
+                                let (clicked_b, _) = ui_button(
+                                    rect_set_b,
+                                    "Set Out",
+                                    mouse,
+                                    ctx.font_sm,
+                                    ctx.button_colors,
+                                );
+                                if clicked_a {
+                                    state.station_pick = Some(StationPick::In);
+                                }
+                                if clicked_b {
+                                    state.station_pick = Some(StationPick::Out);
+                                }
+                                ty += 34.0;
+
+                                let rect_spawn = Rect::new(tx, ty, 150.0, 28.0);
+                                let (clicked, _) = ui_button(
+                                    rect_spawn,
+                                    "Create unit",
+                                    mouse,
+                                    ctx.font_sm,
+                                    ctx.button_colors,
+                                );
+                                if clicked {
+                                    if let (Some(a), Some(b)) = (state.station_in, state.station_out) {
+                                        spawn_request = Some((cell_index, a, b, building.kind));
+                                    }
+                                }
+                                ty += 34.0;
+
+                                let label = if state.info_window.show_units {
+                                    "Hide list"
+                                } else {
+                                    "Unit list"
+                                };
+                                let rect_list = Rect::new(tx, ty, 150.0, 26.0);
+                                let (clicked_list, _) = ui_button(
+                                    rect_list,
+                                    label,
+                                    mouse,
+                                    ctx.font_sm,
+                                    ctx.button_colors,
+                                );
+                                if clicked_list {
+                                    state.info_window.show_units = !state.info_window.show_units;
+                                }
+                                ty += 30.0;
+
+                                if state.info_window.show_units {
+                                    let owned_units: Vec<(usize, &PlanetUnit)> = state
+                                        .units
+                                        .iter()
+                                        .enumerate()
+                                        .filter(|(_, unit)| unit.depot == cell_index)
+                                        .collect();
+                                    let total_units = owned_units.len();
+                                    draw_text(
+                                        &format!("Units: {}", total_units),
+                                        tx,
+                                        ty,
+                                        ctx.font_sm,
+                                        ctx.colors_rt.text_secondary,
+                                    );
+                                    ty += 18.0;
+                                    for (index, unit) in owned_units.iter().take(6) {
+                                        let total = storage_total(&unit.cargo);
+                                        let info = format!(
+                                            "#{} load {}/{}",
+                                            index + 1,
+                                            total,
+                                            unit.capacity
+                                        );
+                                        draw_text(&info, tx, ty, ctx.font_sm, ctx.colors_rt.text_secondary);
+                                        ty += 18.0;
+                                    }
+                                    if total_units > 6 {
+                                        draw_text(
+                                            &format!("+{} more", total_units - 6),
+                                            tx,
+                                            ty,
+                                            ctx.font_sm,
+                                            ctx.colors_rt.text_secondary,
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                        PlanetBuildingKind::Builder => {
+                            if under_construction {
+                                draw_text(
+                                    "Available after completion",
+                                    tx,
+                                    ty,
+                                    ctx.font_sm,
+                                    ctx.colors_rt.text_secondary,
+                                );
+                                ty += 20.0;
+                            } else {
+                                let rect_spawn = Rect::new(tx, ty, 150.0, 28.0);
+                                let (clicked, _) = ui_button(
+                                    rect_spawn,
+                                    "Create unit",
+                                    mouse,
+                                    ctx.font_sm,
+                                    ctx.button_colors,
+                                );
+                                if clicked {
+                                    building.builder_units_desired =
+                                        building.builder_units_desired.saturating_add(1);
+                                    building.builder_units_created =
+                                        building.builder_units_created.saturating_add(1);
+                                    state.buildings_dirty = true;
+                                }
+                                ty += 34.0;
+
+                                let label = if state.info_window.show_units {
+                                    "Hide list"
+                                } else {
+                                    "Unit list"
+                                };
+                                let rect_list = Rect::new(tx, ty, 150.0, 26.0);
+                                let (clicked_list, _) = ui_button(
+                                    rect_list,
+                                    label,
+                                    mouse,
+                                    ctx.font_sm,
+                                    ctx.button_colors,
+                                );
+                                if clicked_list {
+                                    state.info_window.show_units = !state.info_window.show_units;
+                                }
+                                ty += 30.0;
+
+                                if state.info_window.show_units {
+                                    let active_units = state
+                                        .units
+                                        .iter()
+                                        .filter(|unit| {
+                                            unit.depot == cell_index
+                                                && unit.auto_supply_role == AutoSupplyRole::Builder
+                                        })
+                                        .count();
+                                    let total_units = building.builder_units_desired.max(0) as usize;
+                                    draw_text(
+                                        &format!("Units: {}", total_units),
+                                        tx,
+                                        ty,
+                                        ctx.font_sm,
+                                        ctx.colors_rt.text_secondary,
+                                    );
+                                    ty += 18.0;
+                                    for index in 0..total_units.min(6) {
+                                        let status = if index < active_units {
+                                            "active"
+                                        } else {
+                                            "inactive"
+                                        };
+                                        let info = format!("#{} {}", index + 1, status);
+                                        draw_text(&info, tx, ty, ctx.font_sm, ctx.colors_rt.text_secondary);
+                                        ty += 18.0;
+                                    }
+                                    if total_units > 6 {
+                                        draw_text(
+                                            &format!("+{} more", total_units - 6),
+                                            tx,
+                                            ty,
+                                            ctx.font_sm,
+                                            ctx.colors_rt.text_secondary,
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
                     let demolish_rect = Rect::new(tx, ty, 120.0, 28.0);
                     let (clicked, _) = ui_button(
                         demolish_rect,
@@ -3149,6 +3942,51 @@ pub fn run(
                         state.confirm_target_cell = Some(cell_index);
                     }
                 }
+            }
+        }
+    }
+    if let Some((depot, a, b, kind)) = spawn_request {
+        if let Some(neighbors) = state.sim_neighbors.as_ref() {
+            let ops = unit_ops();
+            let path = if kind == PlanetBuildingKind::Logistics {
+                let first =
+                    find_route_path_cells(depot, a, &state.buildings, neighbors, &ops).unwrap_or_default();
+                let second =
+                    find_route_path_cells(a, b, &state.buildings, neighbors, &ops).unwrap_or_default();
+                let third =
+                    find_route_path_cells(b, a, &state.buildings, neighbors, &ops).unwrap_or_default();
+                if first.is_empty() || second.is_empty() || third.is_empty() {
+                    Vec::new()
+                } else {
+                    let mut combined = combine_paths(combine_paths(first, second), third);
+                    if let Some(out_index) = combined.iter().position(|cell| *cell == b) {
+                        combined.insert(out_index + 1, b);
+                    }
+                    combined
+                }
+            } else {
+                find_route_path_cells(a, b, &state.buildings, neighbors, &ops).unwrap_or_default()
+            };
+            if !path.is_empty() {
+                let speed = if kind == PlanetBuildingKind::Builder { 4.5 } else { 3.0 };
+                state.units.push(PlanetUnit {
+                    path,
+                    index: 0,
+                    progress: 0.0,
+                    speed,
+                    forward: true,
+                    capacity: 20,
+                    cargo: Vec::new(),
+                    depot,
+                    station_in: a,
+                    station_out: b,
+                    auto_supply: false,
+                    supply_types: Vec::new(),
+                    auto_supply_role: AutoSupplyRole::Base,
+                    supply_reqs: Vec::new(),
+                    waiting_for_supply: false,
+                });
+                state.units_dirty = true;
             }
         }
     }

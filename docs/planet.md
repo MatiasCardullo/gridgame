@@ -35,6 +35,9 @@
   - a single planet grid (`freq=160` default) used for hover + gameplay simulation,
   - per-cell simulation world (surface class + deposit state),
   - regeneration cache and async state.
+- Persisted gameplay data:
+  - buildings: `planet_data/planet_buildings.json`
+  - units: `planet_data/planet_units.json`
 
 ### Async Loader
 - `PlanetLoader` starts a thread that:
@@ -106,14 +109,22 @@
 - Builds or loads per-cell simulation snapshot (`planet_data/planet_resources.bin`).
 - Classifies cells as `Land`, `Coast`, or `Water` from noise/sea-level, then derives lithology and deposits.
 - Buildability currently allows only `Land`.
+- Construction economy mirrors `planet_sector.rs`:
+  - New buildings start unpaid/under construction.
+  - Materials are required before build progress advances.
+  - Auto-supply units claim build targets and deliver materials.
+- Route-only logistics:
+  - Units traverse `Route` cells (endpoints can be non-route).
+  - Builder units and Base auto-supply use route paths.
 
 8. Left click:
 - Reorients the camera to the selected face normal.
+- If a logistics station pick is active, left click selects the station cell.
 
 9. UI:
 - Debug controls (`draw_planet_controls`).
 - Text for the hovered sector/zone name plus hovered sim-cell info (surface/buildability/deposit).
-- Basic build/mining controls:
+- Build/mining controls:
   - `1`: no tool
   - `2`: `Base`
   - `3`: `Mine`
@@ -122,6 +133,10 @@
   - `M`: export hovered base-face zone PNG to `planet_data/zone_maps/`
   - `Shift+M`: export PNGs for all base-face zones
   - Mines extract continuously from cell deposits and reduce persisted `remaining_amount`.
+- Building windows now include:
+  - Construction status + requirements.
+  - Logistics station `In/Out` picking and manual unit creation.
+  - Builder unit creation and unit list status.
 
 ## 5) Key Picking/Coordinate Functions
 - `project_to_screen`: world -> screen with clipping.
@@ -130,12 +145,7 @@
 - `face_name`: greek label for base faces/subfaces.
 
 ## TODO (Migration from `planet_sector.rs`)
-- Add full construction economy: requirements, payment/claim, build progress/time.
-- Move per-building inventories and capacities from 2D sector logic.
-- Migrate logistics units, route blocks, and station in/out behavior.
-- Migrate auto-supply behavior (`Base` / `Builder`) and its priorities.
 - Implement mining expansion (`mine_extra`) and multi-cell extraction behavior.
-- Add advanced building windows (unit list, spawn controls, supply toggles).
 - Persist full planet gameplay state in a dedicated 3D save format.
 - Add per-building placement rules and validation beyond the current `Land` gate.
 - Draw logistics routes and flow overlays directly on the sphere.

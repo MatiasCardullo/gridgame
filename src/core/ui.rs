@@ -91,6 +91,48 @@ pub fn ui_button(
     (hover && is_mouse_button_pressed(MouseButton::Left), hover)
 }
 
+pub fn ui_checkbox(
+    rect: Rect,
+    checked: bool,
+    label: &str,
+    mouse: Vec2,
+    font_size: f32,
+    colors: UiButtonColors,
+) -> (bool, bool) {
+    let box_rect = Rect::new(rect.x, rect.y, 20.0, 20.0);
+    let hover = rect.contains(mouse);
+    let fill = if hover { colors.hover } else { colors.base };
+    draw_rectangle(box_rect.x, box_rect.y, box_rect.w, box_rect.h, fill);
+    draw_rectangle_lines(box_rect.x, box_rect.y, box_rect.w, box_rect.h, 1.5, colors.border);
+    if checked {
+        draw_line(
+            box_rect.x + 4.0,
+            box_rect.y + 10.0,
+            box_rect.x + 9.0,
+            box_rect.y + 15.0,
+            2.0,
+            colors.text,
+        );
+        draw_line(
+            box_rect.x + 9.0,
+            box_rect.y + 15.0,
+            box_rect.x + 16.0,
+            box_rect.y + 5.0,
+            2.0,
+            colors.text,
+        );
+    }
+    let text_dim = measure_text(label, None, font_size as u16, 1.0);
+    draw_text(
+        label,
+        box_rect.x + 28.0,
+        rect.y + (20.0 + text_dim.height) * 0.5 - 3.0,
+        font_size,
+        colors.text,
+    );
+    (hover && is_mouse_button_pressed(MouseButton::Left), hover)
+}
+
 // Draw a horizontal progress bar with background and fill colors.
 pub fn draw_progress_bar(rect: Rect, progress: f32, fg: Color, bg: Color) {
     let clamped = progress.clamp(0.0, 1.0);

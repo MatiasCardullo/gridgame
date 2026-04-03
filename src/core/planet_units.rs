@@ -1,22 +1,122 @@
-﻿use std::collections::HashMap;
+use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::core::AutoSupplyRole;
 use crate::core::planet_grid::HexGrid;
 use crate::core::planet_resources::PlanetResourceKind;
 
-#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlanetResourceStack {
     pub resource_id: u8,
     pub amount: u32,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PlanetUnitPresetId {
+    Hauler,
+    BuilderSupply,
+    Shuttle,
+}
+
+impl PlanetUnitPresetId {
+    pub fn label(self) -> &'static str {
+        match self {
+            PlanetUnitPresetId::Hauler => "Hauler",
+            PlanetUnitPresetId::BuilderSupply => "Builder Supply",
+            PlanetUnitPresetId::Shuttle => "Shuttle",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum UnitNodeSlot {
+    Depot,
+    Pickup,
+    Dropoff,
+    Refuel,
+    Construction,
+    Wait,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub enum UnitConditionExpr {
+    CargoEmpty,
+    CargoFull,
+    CargoAtLeast(u32),
+    HasAnyCargo,
+    FuelBelowRatio(f32),
+    AtTarget,
+    CanLoadAtTarget,
+    CanUnloadAtTarget,
+    Always,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub enum UnitAction {
+    GoToNode(UnitNodeSlot),
+    PickupAtNode(UnitNodeSlot),
+    DeliverAtNode(UnitNodeSlot),
+    BuildAtNode(UnitNodeSlot),
+    RefuelAtNode(UnitNodeSlot),
+    WaitAtNode(UnitNodeSlot),
+    Idle,
+}
+
+impl UnitAction {
+    pub fn label(&self) -> &'static str {
+        match self {
+            UnitAction::GoToNode(_) => "Go",
+            UnitAction::PickupAtNode(_) => "Pickup",
+            UnitAction::DeliverAtNode(_) => "Deliver",
+            UnitAction::BuildAtNode(_) => "Build",
+            UnitAction::RefuelAtNode(_) => "Refuel",
+            UnitAction::WaitAtNode(_) => "Wait",
+            UnitAction::Idle => "Idle",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct UnitRule {
+    pub priority: i32,
+    pub condition: UnitConditionExpr,
+    pub action: UnitAction,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PlanetUnitBehavior {
+    pub rules: Vec<UnitRule>,
+    pub fallback: UnitAction,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlanetUnitNodeConfig {
+    pub pickup: Option<u32>,
+    pub dropoff: Option<u32>,
+    pub refuel: Option<u32>,
+    pub construction: Option<u32>,
+    pub wait: Option<u32>,
+}
+
+impl PlanetUnitNodeConfig {
+    pub fn get(&self, slot: UnitNodeSlot, depot: u32) -> Option<u32> {
+        match slot {
+            UnitNodeSlot::Depot => Some(depot),
+            UnitNodeSlot::Pickup => self.pickup,
+            UnitNodeSlot::Dropoff => self.dropoff,
+            UnitNodeSlot::Refuel => self.refuel,
+            UnitNodeSlot::Construction => self.construction,
+            UnitNodeSlot::Wait => self.wait.or(Some(depot)),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct PlanetUnitRecord {
     pub depot: u32,
-    pub station_in: u32,
-    pub station_out: u32,
+    pub preset_id: PlanetUnitPresetId,
+    pub behavior: PlanetUnitBehavior,
+    pub nodes: PlanetUnitNodeConfig,
     #[serde(default)]
     pub index: usize,
     #[serde(default)]
@@ -24,42 +124,72 @@ pub struct PlanetUnitRecord {
     #[serde(default)]
     pub speed: f32,
     #[serde(default)]
-    pub forward: bool,
-    #[serde(default)]
     pub capacity: u32,
     #[serde(default)]
-    pub auto_supply: bool,
+    pub fuel: f32,
     #[serde(default)]
-    pub auto_supply_role: AutoSupplyRole,
+    pub fuel_capacity: f32,
     #[serde(default)]
-    pub waiting_for_supply: bool,
+    pub fuel_burn_rate: f32,
     #[serde(default)]
     pub path: Vec<u32>,
     #[serde(default)]
     pub cargo: Vec<PlanetResourceStack>,
     #[serde(default)]
-    pub supply_types: Vec<u8>,
+    pub current_action: Option<UnitAction>,
     #[serde(default)]
-    pub supply_reqs: Vec<PlanetResourceStack>,
+    pub current_target: Option<u32>,
+    #[serde(default)]
+    pub assignment_check_timer: f32,
 }
 
 #[derive(Clone, Debug)]
 pub struct PlanetUnit {
+    pub depot: u32,
+    pub preset_id: PlanetUnitPresetId,
+    pub behavior: PlanetUnitBehavior,
+    pub nodes: PlanetUnitNodeConfig,
     pub path: Vec<u32>,
     pub index: usize,
     pub progress: f32,
     pub speed: f32,
-    pub forward: bool,
     pub capacity: u32,
+    pub fuel: f32,
+    pub fuel_capacity: f32,
+    pub fuel_burn_rate: f32,
     pub cargo: Vec<PlanetResourceStack>,
-    pub depot: u32,
-    pub station_in: u32,
-    pub station_out: u32,
-    pub auto_supply: bool,
-    pub supply_types: Vec<PlanetResourceKind>,
-    pub auto_supply_role: AutoSupplyRole,
-    pub supply_reqs: Vec<PlanetResourceStack>,
-    pub waiting_for_supply: bool,
+    pub current_action: Option<UnitAction>,
+    pub current_target: Option<u32>,
+    pub assignment_check_timer: f32,
+}
+
+impl PlanetUnit {
+    pub fn current_cell(&self) -> u32 {
+        self.path
+            .get(self.index)
+            .copied()
+            .or_else(|| self.path.last().copied())
+            .unwrap_or(self.depot)
+    }
+
+    pub fn fuel_ratio(&self) -> f32 {
+        if self.fuel_capacity <= 0.0 {
+            0.0
+        } else {
+            (self.fuel / self.fuel_capacity).clamp(0.0, 1.0)
+        }
+    }
+
+    pub fn references_cell(&self, cell: u32) -> bool {
+        self.depot == cell
+            || self.nodes.pickup == Some(cell)
+            || self.nodes.dropoff == Some(cell)
+            || self.nodes.refuel == Some(cell)
+            || self.nodes.construction == Some(cell)
+            || self.nodes.wait == Some(cell)
+            || self.current_target == Some(cell)
+            || self.path.contains(&cell)
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -81,7 +211,9 @@ pub trait PlanetBuildingAccess {
     fn set_build_paid(&mut self, value: bool);
     fn build_claimed(&self) -> bool;
     fn set_build_claimed(&mut self, value: bool);
-    fn builder_units_desired(&self) -> i32;
+    fn auto_units_enabled(&self) -> bool {
+        true
+    }
 }
 
 pub struct UnitOps<K> {
@@ -89,7 +221,7 @@ pub struct UnitOps<K> {
     pub is_builder: fn(K) -> bool,
     pub is_base: fn(K) -> bool,
     pub is_warehouse: fn(K) -> bool,
-    pub is_logistics: fn(K) -> bool,
+    pub is_refuel: fn(K) -> bool,
     pub build_requirements: fn(K) -> Vec<PlanetResourceStack>,
     pub storage_capacity: fn(K) -> u32,
 }
@@ -136,6 +268,105 @@ pub fn storage_total(stacks: &[PlanetResourceStack]) -> u32 {
     stacks.iter().map(|stack| stack.amount).sum()
 }
 
+pub fn default_behavior_for_preset(preset_id: PlanetUnitPresetId) -> PlanetUnitBehavior {
+    match preset_id {
+        PlanetUnitPresetId::Hauler => PlanetUnitBehavior {
+            rules: vec![
+                UnitRule { priority: 100, condition: UnitConditionExpr::FuelBelowRatio(0.25), action: UnitAction::RefuelAtNode(UnitNodeSlot::Refuel) },
+                UnitRule { priority: 80, condition: UnitConditionExpr::CargoEmpty, action: UnitAction::PickupAtNode(UnitNodeSlot::Pickup) },
+                UnitRule { priority: 70, condition: UnitConditionExpr::HasAnyCargo, action: UnitAction::DeliverAtNode(UnitNodeSlot::Dropoff) },
+            ],
+            fallback: UnitAction::WaitAtNode(UnitNodeSlot::Depot),
+        },
+        PlanetUnitPresetId::BuilderSupply => PlanetUnitBehavior {
+            rules: vec![
+                UnitRule { priority: 100, condition: UnitConditionExpr::FuelBelowRatio(0.25), action: UnitAction::RefuelAtNode(UnitNodeSlot::Refuel) },
+                UnitRule { priority: 80, condition: UnitConditionExpr::CargoEmpty, action: UnitAction::PickupAtNode(UnitNodeSlot::Pickup) },
+                UnitRule { priority: 70, condition: UnitConditionExpr::HasAnyCargo, action: UnitAction::BuildAtNode(UnitNodeSlot::Construction) },
+            ],
+            fallback: UnitAction::WaitAtNode(UnitNodeSlot::Depot),
+        },
+        PlanetUnitPresetId::Shuttle => PlanetUnitBehavior {
+            rules: vec![
+                UnitRule { priority: 100, condition: UnitConditionExpr::FuelBelowRatio(0.25), action: UnitAction::RefuelAtNode(UnitNodeSlot::Refuel) },
+                UnitRule { priority: 80, condition: UnitConditionExpr::CargoEmpty, action: UnitAction::GoToNode(UnitNodeSlot::Pickup) },
+                UnitRule { priority: 70, condition: UnitConditionExpr::HasAnyCargo, action: UnitAction::GoToNode(UnitNodeSlot::Dropoff) },
+            ],
+            fallback: UnitAction::WaitAtNode(UnitNodeSlot::Depot),
+        },
+    }
+}
+
+pub fn unit_for_preset(preset_id: PlanetUnitPresetId, depot: u32, nodes: PlanetUnitNodeConfig) -> PlanetUnit {
+    let speed = match preset_id {
+        PlanetUnitPresetId::BuilderSupply => 4.5,
+        PlanetUnitPresetId::Hauler => 3.0,
+        PlanetUnitPresetId::Shuttle => 3.5,
+    };
+    let capacity = match preset_id {
+        PlanetUnitPresetId::BuilderSupply => 40,
+        PlanetUnitPresetId::Hauler | PlanetUnitPresetId::Shuttle => 20,
+    };
+    PlanetUnit {
+        depot,
+        preset_id,
+        behavior: default_behavior_for_preset(preset_id),
+        nodes,
+        path: vec![depot],
+        index: 0,
+        progress: 0.0,
+        speed,
+        capacity,
+        fuel: 100.0,
+        fuel_capacity: 100.0,
+        fuel_burn_rate: 1.2,
+        cargo: Vec::new(),
+        current_action: None,
+        current_target: None,
+        assignment_check_timer: 0.0,
+    }
+}
+
+fn next_builder_assignment<B: PlanetBuildingAccess>(
+    depot: u32,
+    buildings: &HashMap<u32, B>,
+    exclude: Option<u32>,
+    reserved_targets: &[u32],
+    neighbors: &[Vec<u32>],
+    ops: &UnitOps<B::Kind>,
+) -> Option<(u32, u32)> {
+    for target in buildings
+        .iter()
+        .filter(|(cell_index, building)| {
+            Some(**cell_index) != exclude
+                && !reserved_targets.contains(cell_index)
+                && planet_is_under_construction(*building)
+                && !building.build_paid()
+                && !(ops.build_requirements)(building.kind()).is_empty()
+        })
+        .map(|(cell_index, _)| *cell_index)
+    {
+        let reqs = buildings
+            .get(&target)
+            .map(|building| (ops.build_requirements)(building.kind()))
+            .unwrap_or_default();
+        let missing = missing_requirements_for_target(buildings, target, &reqs);
+        if let Some(source) = nearest_supply_with_items(buildings, target, &missing, ops) {
+            if let Some(source_building) = buildings.get(&source) {
+                let depot_to_source = find_route_path_cells(depot, source, buildings, neighbors, ops);
+                let source_to_target = find_route_path_cells(source, target, buildings, neighbors, ops);
+                if can_fulfill_reqs_from_building(source_building, &reqs)
+                    && depot_to_source.is_some()
+                    && source_to_target.is_some()
+                {
+                    return Some((target, source));
+                }
+            }
+        }
+    }
+    None
+}
+
 fn stack_amount(stacks: &[PlanetResourceStack], kind: PlanetResourceKind) -> u32 {
     let id = resource_kind_to_id(kind);
     stacks
@@ -160,19 +391,12 @@ fn add_stack(
     if let Some(stack) = stacks.iter_mut().find(|stack| stack.resource_id == id) {
         stack.amount += add;
     } else {
-        stacks.push(PlanetResourceStack {
-            resource_id: id,
-            amount: add,
-        });
+        stacks.push(PlanetResourceStack { resource_id: id, amount: add });
     }
     add
 }
 
-fn remove_stack(
-    stacks: &mut Vec<PlanetResourceStack>,
-    kind: PlanetResourceKind,
-    amount: u32,
-) -> u32 {
+fn remove_stack(stacks: &mut Vec<PlanetResourceStack>, kind: PlanetResourceKind, amount: u32) -> u32 {
     if amount == 0 {
         return 0;
     }
@@ -194,11 +418,7 @@ fn remove_stack(
     removed
 }
 
-fn add_storage_amount(
-    storage: &mut HashMap<PlanetResourceKind, u32>,
-    kind: PlanetResourceKind,
-    amount: u32,
-) {
+fn add_storage_amount(storage: &mut HashMap<PlanetResourceKind, u32>, kind: PlanetResourceKind, amount: u32) {
     if amount == 0 {
         return;
     }
@@ -208,6 +428,7 @@ fn add_storage_amount(
 fn planet_is_under_construction<B: PlanetBuildingAccess>(building: &B) -> bool {
     building.build_time() > 0.0 && building.build_progress() < building.build_time()
 }
+
 fn load_unit_from_building<B: PlanetBuildingAccess>(
     building: &mut B,
     cargo: &mut Vec<PlanetResourceStack>,
@@ -267,6 +488,66 @@ fn unload_unit_to_building<B: PlanetBuildingAccess>(
     }
 }
 
+fn apply_cargo_to_construction<B: PlanetBuildingAccess>(
+    buildings: &mut HashMap<u32, B>,
+    target: u32,
+    cargo: &mut Vec<PlanetResourceStack>,
+    ops: &UnitOps<B::Kind>,
+) -> bool {
+    let reqs = match buildings.get(&target) {
+        Some(building) => {
+            if building.build_paid() {
+                return false;
+            }
+            (ops.build_requirements)(building.kind())
+        }
+        None => return false,
+    };
+    if reqs.is_empty() {
+        return false;
+    }
+    for req in reqs.iter() {
+        let Some(kind) = resource_kind_from_id(req.resource_id) else {
+            return false;
+        };
+        if stack_amount(cargo, kind) < req.amount {
+            return false;
+        }
+    }
+    for req in reqs.iter() {
+        let Some(kind) = resource_kind_from_id(req.resource_id) else {
+            continue;
+        };
+        let _ = remove_stack(cargo, kind, req.amount);
+    }
+    if let Some(building) = buildings.get_mut(&target) {
+        building.set_build_paid(true);
+        building.set_build_claimed(false);
+    }
+    true
+}
+
+fn missing_requirements_for_target<B: PlanetBuildingAccess>(
+    buildings: &HashMap<u32, B>,
+    target: u32,
+    reqs: &[PlanetResourceStack],
+) -> Vec<PlanetResourceKind> {
+    let mut missing = Vec::new();
+    let available_from_target = buildings.get(&target);
+    for req in reqs {
+        let Some(kind) = resource_kind_from_id(req.resource_id) else {
+            continue;
+        };
+        let available = available_from_target
+            .and_then(|building| building.storage().get(&kind).copied())
+            .unwrap_or(0);
+        if available < req.amount {
+            missing.push(kind);
+        }
+    }
+    missing
+}
+
 fn can_fulfill_reqs_from_building<B: PlanetBuildingAccess>(
     building: &B,
     reqs: &[PlanetResourceStack],
@@ -286,6 +567,10 @@ fn take_reqs_from_building<B: PlanetBuildingAccess>(
     reqs: &[PlanetResourceStack],
 ) -> bool {
     if !can_fulfill_reqs_from_building(building, reqs) {
+        return false;
+    }
+    let needed_total: u32 = reqs.iter().map(|req| req.amount).sum();
+    if storage_total(cargo).saturating_add(needed_total) > capacity {
         return false;
     }
     for req in reqs {
@@ -310,135 +595,52 @@ fn take_reqs_from_building<B: PlanetBuildingAccess>(
             }
             remaining -= added;
         }
+        if remaining > 0 {
+            return false;
+        }
     }
     true
 }
 
-fn apply_cargo_to_construction<B: PlanetBuildingAccess>(
-    buildings: &mut HashMap<u32, B>,
-    target: u32,
-    cargo: &mut Vec<PlanetResourceStack>,
-    ops: &UnitOps<B::Kind>,
-) {
-    let reqs = match buildings.get(&target) {
-        Some(building) => {
-            if building.build_paid() {
-                return;
-            }
-            (ops.build_requirements)(building.kind())
-        }
-        None => return,
-    };
-    if reqs.is_empty() {
-        return;
-    }
-    for req in reqs.iter() {
-        let Some(kind) = resource_kind_from_id(req.resource_id) else {
-            return;
-        };
-        if stack_amount(cargo, kind) < req.amount {
-            return;
-        }
-    }
-    for req in reqs.iter() {
-        let Some(kind) = resource_kind_from_id(req.resource_id) else {
-            continue;
-        };
-        let _ = remove_stack(cargo, kind, req.amount);
-    }
-    if let Some(building) = buildings.get_mut(&target) {
-        building.set_build_paid(true);
-        building.set_build_claimed(false);
-    }
-}
-
-fn missing_requirements_for_target<B: PlanetBuildingAccess>(
-    buildings: &HashMap<u32, B>,
-    target: u32,
-    reqs: &[PlanetResourceStack],
-) -> Vec<PlanetResourceKind> {
-    let mut missing = Vec::new();
-    let available_from_target = buildings.get(&target);
-    for req in reqs {
-        let Some(kind) = resource_kind_from_id(req.resource_id) else {
-            continue;
-        };
-        let available = available_from_target
-            .and_then(|building| building.storage().get(&kind).copied())
-            .unwrap_or(0);
-        if available < req.amount {
-            missing.push(kind);
-        }
-    }
-    missing
-}
-
 fn nearest_supply_with_items<B: PlanetBuildingAccess>(
     buildings: &HashMap<u32, B>,
-    sim_grid: &HexGrid,
     target: u32,
-    types: &[PlanetResourceKind],
+    kinds: &[PlanetResourceKind],
     ops: &UnitOps<B::Kind>,
 ) -> Option<u32> {
-    let mut best: Option<(f32, u32, i32)> = None;
+    let mut best: Option<(u32, u32)> = None;
     for (cell_index, building) in buildings.iter() {
-        let kind = building.kind();
-        if !(ops.is_warehouse)(kind) && !(ops.is_base)(kind) {
+        let is_supply = (ops.is_warehouse)(building.kind()) || (ops.is_base)(building.kind()) || (ops.is_builder)(building.kind());
+        if !is_supply || planet_is_under_construction(building) {
             continue;
         }
-        let mut total = 0;
-        for kind in types {
-            total += building.storage().get(kind).copied().unwrap_or(0);
-        }
+        let total: u32 = kinds
+            .iter()
+            .map(|kind| building.storage().get(kind).copied().unwrap_or(0))
+            .sum();
         if total == 0 {
             continue;
         }
-        let priority = if (ops.is_warehouse)(kind) { 0 } else { 1 };
-        let dist = cell_distance(sim_grid, *cell_index, target);
-        let better = match best {
-            None => true,
-            Some((best_dist, _, best_prio)) => {
-                if priority < best_prio {
-                    true
-                } else if priority > best_prio {
-                    false
-                } else {
-                    dist < best_dist
-                }
-            }
+        let prio = if (ops.is_warehouse)(building.kind()) {
+            0
+        } else if (ops.is_builder)(building.kind()) {
+            1
+        } else {
+            2
         };
-        if better {
-            best = Some((dist, *cell_index, priority));
+        match best {
+            Some((best_prio, _)) if prio > best_prio => {}
+            _ => best = Some((prio, *cell_index)),
         }
     }
-    best.map(|(_, cell_index, _)| cell_index)
+    best.map(|(_, cell)| if cell == target { target } else { cell })
 }
 
-fn nearest_builder_with_items<B: PlanetBuildingAccess>(
-    buildings: &HashMap<u32, B>,
-    sim_grid: &HexGrid,
-    target: u32,
-    types: &[PlanetResourceKind],
-    ops: &UnitOps<B::Kind>,
-) -> Option<u32> {
-    let mut best: Option<(f32, u32)> = None;
-    for (cell_index, building) in buildings.iter() {
-        if !(ops.is_builder)(building.kind()) {
-            continue;
-        }
-        let mut total = 0;
-        for kind in types {
-            total += building.storage().get(kind).copied().unwrap_or(0);
-        }
-        if total == 0 {
-            continue;
-        }
-        let dist = cell_distance(sim_grid, *cell_index, target);
-        if best.map(|(best_dist, _)| dist < best_dist).unwrap_or(true) {
-            best = Some((dist, *cell_index));
-        }
-    }
-    best.map(|(_, cell_index)| cell_index)
+fn first_refuel_station<B: PlanetBuildingAccess>(buildings: &HashMap<u32, B>, ops: &UnitOps<B::Kind>) -> Option<u32> {
+    buildings
+        .iter()
+        .find(|(_, building)| (ops.is_refuel)(building.kind()) && !planet_is_under_construction(*building))
+        .map(|(cell, _)| *cell)
 }
 
 pub fn find_route_path_cells<B: PlanetBuildingAccess>(
@@ -486,11 +688,7 @@ pub fn find_route_path_cells<B: PlanetBuildingAccess>(
     None
 }
 
-pub fn find_direct_path_cells(
-    start: u32,
-    end: u32,
-    neighbors: &[Vec<u32>],
-) -> Option<Vec<u32>> {
+fn find_direct_path_cells(start: u32, end: u32, neighbors: &[Vec<u32>]) -> Option<Vec<u32>> {
     if start == end {
         return Some(vec![start]);
     }
@@ -521,38 +719,209 @@ pub fn find_direct_path_cells(
     None
 }
 
-pub fn combine_paths(a: Vec<u32>, b: Vec<u32>) -> Vec<u32> {
-    if a.is_empty() {
-        return b;
+fn path_to_target<B: PlanetBuildingAccess>(
+    start: u32,
+    end: u32,
+    buildings: &HashMap<u32, B>,
+    neighbors: &[Vec<u32>],
+    ops: &UnitOps<B::Kind>,
+    allow_offroad: bool,
+) -> Vec<u32> {
+    if allow_offroad {
+        find_route_path_cells(start, end, buildings, neighbors, ops)
+            .or_else(|| find_direct_path_cells(start, end, neighbors))
+            .unwrap_or_else(|| vec![start])
+    } else {
+        find_route_path_cells(start, end, buildings, neighbors, ops).unwrap_or_else(|| vec![start])
     }
-    if b.is_empty() {
-        return a;
-    }
-    let mut combined = a;
-    combined.extend(b.into_iter().skip(1));
-    combined
 }
 
-fn cell_distance(sim_grid: &HexGrid, a: u32, b: u32) -> f32 {
-    let Some(va) = sim_grid.vertices.get(a as usize) else {
-        return f32::MAX;
-    };
-    let Some(vb) = sim_grid.vertices.get(b as usize) else {
-        return f32::MAX;
-    };
-    let dot = va.normalize().dot(vb.normalize()).clamp(-1.0, 1.0);
-    dot.acos()
+fn resolved_target(unit: &PlanetUnit, action: &UnitAction) -> Option<u32> {
+    match action {
+        UnitAction::GoToNode(slot)
+        | UnitAction::PickupAtNode(slot)
+        | UnitAction::DeliverAtNode(slot)
+        | UnitAction::BuildAtNode(slot)
+        | UnitAction::RefuelAtNode(slot)
+        | UnitAction::WaitAtNode(slot) => unit.nodes.get(*slot, unit.depot),
+        UnitAction::Idle => None,
+    }
 }
+
+fn can_load_from_target<B: PlanetBuildingAccess>(
+    unit: &PlanetUnit,
+    target: Option<u32>,
+    buildings: &HashMap<u32, B>,
+) -> bool {
+    let Some(target) = target else {
+        return false;
+    };
+    let Some(building) = buildings.get(&target) else {
+        return false;
+    };
+    storage_total(&unit.cargo) < unit.capacity
+        && building.storage().values().copied().sum::<u32>() > 0
+        && !planet_is_under_construction(building)
+}
+
+fn can_unload_to_target<B: PlanetBuildingAccess>(
+    unit: &PlanetUnit,
+    target: Option<u32>,
+    buildings: &HashMap<u32, B>,
+    ops: &UnitOps<B::Kind>,
+) -> bool {
+    let Some(target) = target else {
+        return false;
+    };
+    let Some(building) = buildings.get(&target) else {
+        return false;
+    };
+    let used: u32 = building.storage().values().copied().sum();
+    storage_total(&unit.cargo) > 0 && used < (ops.storage_capacity)(building.kind())
+}
+
+fn condition_matches<B: PlanetBuildingAccess>(
+    unit: &PlanetUnit,
+    condition: &UnitConditionExpr,
+    target: Option<u32>,
+    buildings: &HashMap<u32, B>,
+    ops: &UnitOps<B::Kind>,
+) -> bool {
+    match condition {
+        UnitConditionExpr::CargoEmpty => storage_total(&unit.cargo) == 0,
+        UnitConditionExpr::CargoFull => storage_total(&unit.cargo) >= unit.capacity,
+        UnitConditionExpr::CargoAtLeast(amount) => storage_total(&unit.cargo) >= *amount,
+        UnitConditionExpr::HasAnyCargo => storage_total(&unit.cargo) > 0,
+        UnitConditionExpr::FuelBelowRatio(ratio) => unit.fuel_ratio() < *ratio,
+        UnitConditionExpr::AtTarget => target == Some(unit.current_cell()),
+        UnitConditionExpr::CanLoadAtTarget => can_load_from_target(unit, target, buildings),
+        UnitConditionExpr::CanUnloadAtTarget => can_unload_to_target(unit, target, buildings, ops),
+        UnitConditionExpr::Always => true,
+    }
+}
+
+fn select_action<B: PlanetBuildingAccess>(
+    unit: &PlanetUnit,
+    buildings: &HashMap<u32, B>,
+    ops: &UnitOps<B::Kind>,
+) -> UnitAction {
+    if unit.preset_id == PlanetUnitPresetId::BuilderSupply {
+        if let Some(target) = unit.nodes.construction {
+            let target_paid = buildings.get(&target).map(|b| b.build_paid()).unwrap_or(true);
+            if target_paid {
+                if storage_total(&unit.cargo) > 0 {
+                    return UnitAction::DeliverAtNode(UnitNodeSlot::Depot);
+                }
+                return UnitAction::GoToNode(UnitNodeSlot::Depot);
+            }
+        }
+    }
+    let mut ordered = unit.behavior.rules.clone();
+    ordered.sort_by(|a, b| b.priority.cmp(&a.priority));
+    for rule in ordered.iter() {
+        let target = resolved_target(unit, &rule.action);
+        if condition_matches(unit, &rule.condition, target, buildings, ops) {
+            return rule.action.clone();
+        }
+    }
+    unit.behavior.fallback.clone()
+}
+
+fn current_target_invalid<B: PlanetBuildingAccess>(
+    unit: &PlanetUnit,
+    action: &UnitAction,
+    buildings: &HashMap<u32, B>,
+) -> bool {
+    let expected = resolved_target(unit, action);
+    if unit.current_target != expected {
+        return true;
+    }
+    if let Some(target) = expected {
+        !buildings.contains_key(&target)
+    } else {
+        false
+    }
+}
+
+fn execute_action_at_target<B: PlanetBuildingAccess>(
+    unit: &mut PlanetUnit,
+    buildings: &mut HashMap<u32, B>,
+    ops: &UnitOps<B::Kind>,
+) -> bool {
+    let Some(action) = unit.current_action.clone() else {
+        return false;
+    };
+    let Some(target) = unit.current_target else {
+        return false;
+    };
+    if unit.current_cell() != target {
+        return false;
+    }
+    match action {
+        UnitAction::PickupAtNode(_) => {
+            if unit.preset_id == PlanetUnitPresetId::BuilderSupply {
+                let Some(construction_target) = unit.nodes.construction else {
+                    return false;
+                };
+                let Some(kind) = buildings.get(&construction_target).map(|b| b.kind()) else {
+                    return false;
+                };
+                let reqs = (ops.build_requirements)(kind);
+                if let Some(building) = buildings.get_mut(&target) {
+                    let before = storage_total(&unit.cargo);
+                    if take_reqs_from_building(building, &mut unit.cargo, unit.capacity, &reqs) {
+                        return storage_total(&unit.cargo) != before;
+                    }
+                    return false;
+                }
+            }
+            if let Some(building) = buildings.get_mut(&target) {
+                let before = storage_total(&unit.cargo);
+                load_unit_from_building(building, &mut unit.cargo, unit.capacity);
+                return storage_total(&unit.cargo) != before;
+            }
+        }
+        UnitAction::DeliverAtNode(_) => {
+            if let Some(building) = buildings.get_mut(&target) {
+                let before = storage_total(&unit.cargo);
+                unload_unit_to_building(
+                    &mut unit.cargo,
+                    building,
+                    (ops.storage_capacity)(building.kind()),
+                );
+                return storage_total(&unit.cargo) != before;
+            }
+        }
+        UnitAction::BuildAtNode(_) => {
+            return apply_cargo_to_construction(buildings, target, &mut unit.cargo, ops);
+        }
+        UnitAction::RefuelAtNode(_) => {
+            if buildings
+                .get(&target)
+                .map(|building| (ops.is_refuel)(building.kind()) && !planet_is_under_construction(building))
+                .unwrap_or(false)
+                && unit.fuel < unit.fuel_capacity
+            {
+                unit.fuel = unit.fuel_capacity;
+                return true;
+            }
+        }
+        UnitAction::GoToNode(_) | UnitAction::WaitAtNode(_) | UnitAction::Idle => {}
+    }
+    false
+}
+
 pub fn update_units_and_construction<B: PlanetBuildingAccess>(
     units: &mut Vec<PlanetUnit>,
     buildings: &mut HashMap<u32, B>,
-    sim_grid: &HexGrid,
+    _sim_grid: &HexGrid,
     neighbors: &[Vec<u32>],
     dt: f32,
     ops: &UnitOps<B::Kind>,
 ) -> UnitUpdateResult {
     let mut buildings_dirty = false;
     let mut units_dirty = false;
+
     let build_cells: Vec<u32> = buildings
         .iter()
         .filter_map(|(cell_index, building)| {
@@ -572,478 +941,271 @@ pub fn update_units_and_construction<B: PlanetBuildingAccess>(
         }
     }
 
+    let mut has_active_base_builder = units.iter().any(|unit| {
+        unit.preset_id == PlanetUnitPresetId::BuilderSupply
+            && buildings
+                .get(&unit.depot)
+                .map(|building| (ops.is_base)(building.kind()))
+                .unwrap_or(false)
+    });
+    let active_construction_targets: Vec<u32> = units
+        .iter()
+        .filter_map(|unit| match unit.preset_id {
+            PlanetUnitPresetId::BuilderSupply => unit.nodes.construction,
+            _ => None,
+        })
+        .collect();
+
+    for target in build_cells.iter().copied() {
+        if has_active_base_builder {
+            break;
+        }
+        let Some(building) = buildings.get(&target) else {
+            continue;
+        };
+        if building.build_paid() || building.build_claimed() || active_construction_targets.contains(&target) {
+            continue;
+        }
+        let reqs = (ops.build_requirements)(building.kind());
+        if reqs.is_empty() {
+            continue;
+        }
+        let missing = missing_requirements_for_target(buildings, target, &reqs);
+        if missing.is_empty() {
+            continue;
+        }
+        let Some(source) = nearest_supply_with_items(buildings, target, &missing, ops) else {
+            continue;
+        };
+        let Some(source_building) = buildings.get(&source) else {
+            continue;
+        };
+        if !can_fulfill_reqs_from_building(source_building, &reqs) {
+            continue;
+        }
+        let Some((depot, _)) = buildings
+            .iter()
+            .find(|(_, b)| {
+                (ops.is_base)(b.kind()) && !planet_is_under_construction(*b) && b.auto_units_enabled()
+            })
+        else {
+            continue;
+        };
+        let mut unit = unit_for_preset(
+            PlanetUnitPresetId::BuilderSupply,
+            *depot,
+            PlanetUnitNodeConfig {
+                pickup: Some(source),
+                dropoff: None,
+                refuel: first_refuel_station(buildings, ops),
+                construction: Some(target),
+                wait: None,
+            },
+        );
+        unit.path = vec![*depot];
+        units.push(unit);
+        if let Some(building) = buildings.get_mut(&target) {
+            building.set_build_claimed(true);
+        }
+        has_active_base_builder = true;
+        units_dirty = true;
+        buildings_dirty = true;
+    }
+
     let mut index = 0usize;
     while index < units.len() {
-        let unit = &units[index];
-        if !unit.auto_supply {
-            index += 1;
-            continue;
-        }
-        let needs_supply = buildings
-            .get(&unit.station_out)
-            .map(|building| planet_is_under_construction(building) && !building.build_paid())
-            .unwrap_or(false);
-        if needs_supply {
-            index += 1;
-            continue;
-        }
-        let at_depot = unit.path.get(unit.index).copied() == Some(unit.depot);
-        if at_depot {
-            if let Some(building) = buildings.get_mut(&unit.station_out) {
-                building.set_build_claimed(false);
-                buildings_dirty = true;
-            }
+        if !buildings.contains_key(&units[index].depot) {
             units.remove(index);
             units_dirty = true;
             continue;
         }
-        index += 1;
-    }
+        if units[index].preset_id == PlanetUnitPresetId::BuilderSupply {
+            let depot_kind = buildings.get(&units[index].depot).map(|b| b.kind());
+            let depot_is_base = depot_kind.map(|kind| (ops.is_base)(kind)).unwrap_or(false);
+            let depot_is_builder = depot_kind.map(|kind| (ops.is_builder)(kind)).unwrap_or(false);
 
-    let has_auto_base = units.iter().any(|unit| {
-        unit.auto_supply && unit.auto_supply_role == AutoSupplyRole::Base
-    });
-    let has_builder = buildings.values().any(|building| {
-        (ops.is_builder)(building.kind()) && !planet_is_under_construction(building)
-    });
+            if depot_is_base {
+                units[index].speed = 2.75;
+            } else if depot_is_builder {
+                units[index].speed = 4.5;
+            }
 
-    let mut builder_active: HashMap<u32, usize> = HashMap::new();
-    for unit in units.iter() {
-        if unit.auto_supply && unit.auto_supply_role == AutoSupplyRole::Builder {
-            *builder_active.entry(unit.depot).or_insert(0) += 1;
+            let target_paid = units[index]
+                .nodes
+                .construction
+                .and_then(|target| buildings.get(&target).map(|b| b.build_paid()))
+                .unwrap_or(true);
+            let needs_assignment = depot_is_builder
+                && (target_paid
+                    || units[index].nodes.construction.is_none()
+                    || units[index].nodes.pickup.is_none()
+                    || (storage_total(&units[index].cargo) == 0
+                        && units[index].current_cell() == units[index].depot));
+            if needs_assignment {
+                let previous_target = units[index].nodes.construction;
+                let reserved_targets: Vec<u32> = units
+                    .iter()
+                    .enumerate()
+                    .filter(|(other_index, other_unit)| {
+                        *other_index != index
+                            && other_unit.preset_id == PlanetUnitPresetId::BuilderSupply
+                    })
+                    .filter_map(|(_, other_unit)| other_unit.nodes.construction)
+                    .collect();
+                if let Some((new_target, new_source)) =
+                    next_builder_assignment(
+                        units[index].depot,
+                        buildings,
+                        previous_target,
+                        &reserved_targets,
+                        neighbors,
+                        ops,
+                    )
+                {
+                    units[index].nodes.construction = Some(new_target);
+                    units[index].nodes.pickup = Some(new_source);
+                    units[index].current_action = None;
+                    units[index].current_target = None;
+                    units[index].path = vec![units[index].current_cell()];
+                    units[index].index = 0;
+                    units[index].progress = 0.0;
+                    units[index].assignment_check_timer = 0.0;
+                    units_dirty = true;
+                } else if storage_total(&units[index].cargo) == 0
+                    && units[index].current_cell() == units[index].depot
+                {
+                    units[index].nodes.construction = None;
+                    units[index].nodes.pickup = None;
+                    units[index].current_action = Some(UnitAction::WaitAtNode(UnitNodeSlot::Depot));
+                    units[index].current_target = Some(units[index].depot);
+                    units[index].path = vec![units[index].depot];
+                    units[index].index = 0;
+                    units[index].progress = 0.0;
+                }
+            }
         }
-    }
-
-    let mut spawn_builder_depot = None;
-    for (cell_index, building) in buildings.iter() {
-        if !(ops.is_builder)(building.kind()) {
+        if units[index].preset_id == PlanetUnitPresetId::BuilderSupply
+            && storage_total(&units[index].cargo) == 0
+            && units[index].current_cell() == units[index].depot
+            && buildings
+                .get(&units[index].depot)
+                .map(|building| (ops.is_base)(building.kind()))
+                .unwrap_or(false)
+            && units[index]
+                .nodes
+                .construction
+                .and_then(|target| buildings.get(&target).map(|b| b.build_paid()))
+                .unwrap_or(true)
+        {
+            units.remove(index);
+            units_dirty = true;
             continue;
         }
-        let desired = building.builder_units_desired().max(0) as usize;
-        let active = *builder_active.get(cell_index).unwrap_or(&0);
-        if desired > active {
-            spawn_builder_depot = Some(*cell_index);
-            break;
-        }
-    }
 
-    if let Some(depot) = spawn_builder_depot {
-        let mut best: Option<(i32, f32, u32, u32, Vec<PlanetResourceKind>, Vec<u32>)> = None;
-        for target in build_cells.iter().copied() {
-            let building = match buildings.get(&target) {
-                Some(building) => building,
-                None => continue,
-            };
-            if building.build_paid() || building.build_claimed() {
-                continue;
-            }
-            let priority = if (ops.is_route)(building.kind()) { 0 } else { 1 };
-            let reqs = (ops.build_requirements)(building.kind());
-            if reqs.is_empty() {
-                continue;
-            }
-            let missing = missing_requirements_for_target(buildings, target, &reqs);
-            if missing.is_empty() {
-                continue;
-            }
-            let Some(source) = nearest_supply_with_items(buildings, sim_grid, target, &missing, ops)
-                .or_else(|| nearest_builder_with_items(buildings, sim_grid, target, &missing, ops))
-            else {
-                continue;
-            };
-            if let Some(source_building) = buildings.get(&source) {
-                if !can_fulfill_reqs_from_building(source_building, &reqs) {
-                    continue;
-                }
-            }
-            let path = if depot == source {
-                let first = match find_route_path_cells(depot, target, buildings, neighbors, ops) {
-                    Some(path) => path,
-                    None => continue,
-                };
-                let second = match find_route_path_cells(target, depot, buildings, neighbors, ops) {
-                    Some(path) => path,
-                    None => continue,
-                };
-                combine_paths(first, second)
-            } else {
-                let first = match find_route_path_cells(depot, source, buildings, neighbors, ops) {
-                    Some(path) => path,
-                    None => continue,
-                };
-                let second = match find_route_path_cells(source, target, buildings, neighbors, ops) {
-                    Some(path) => path,
-                    None => continue,
-                };
-                let third = match find_route_path_cells(target, depot, buildings, neighbors, ops) {
-                    Some(path) => path,
-                    None => continue,
-                };
-                combine_paths(combine_paths(first, second), third)
-            };
-            let dist = cell_distance(sim_grid, depot, target);
-            match best {
-                Some((best_prio, _, _, _, _, _)) if priority > best_prio => {}
-                Some((best_prio, best_dist, _, _, _, _))
-                    if priority == best_prio && dist >= best_dist => {}
-                _ => best = Some((priority, dist, target, source, missing, path)),
-            }
-        }
-        if let Some((_, _, target, source, missing, path)) = best {
-            let supply_reqs = (ops.build_requirements)(
-                buildings
-                    .get(&target)
-                    .map(|b| b.kind())
-                    .unwrap_or_else(|| buildings.get(&source).map(|b| b.kind()).unwrap()),
-            );
-            let mut unit = PlanetUnit {
-                path,
-                index: 0,
-                progress: 0.0,
-                speed: 4.5,
-                forward: true,
-                capacity: 30,
-                cargo: Vec::new(),
-                depot,
-                station_in: source,
-                station_out: target,
-                auto_supply: true,
-                supply_types: missing,
-                auto_supply_role: AutoSupplyRole::Builder,
-                supply_reqs,
-                waiting_for_supply: false,
-            };
-            if unit.path.first().copied() == Some(unit.station_in) {
-                if let Some(building) = buildings.get_mut(&unit.station_in) {
-                    if !take_reqs_from_building(
-                        building,
-                        &mut unit.cargo,
-                        unit.capacity,
-                        &unit.supply_reqs,
-                    ) {
-                        unit.waiting_for_supply = true;
-                    }
-                }
-            }
-            if let Some(building) = buildings.get_mut(&target) {
-                building.set_build_claimed(true);
-                buildings_dirty = true;
-            }
-            units.push(unit);
-            units_dirty = true;
-        }
-    }
-
-    if !has_auto_base {
-        let base_cells: Vec<u32> = buildings
-            .iter()
-            .filter_map(|(cell_index, building)| {
-                if (ops.is_base)(building.kind()) {
-                    Some(*cell_index)
-                } else {
-                    None
-                }
-            })
-            .collect();
-        let mut best: Option<(i32, f32, u32, u32, Vec<PlanetResourceKind>, Vec<u32>)> = None;
-        for target in build_cells.iter().copied() {
-            let building = match buildings.get(&target) {
-                Some(building) => building,
-                None => continue,
-            };
-            if building.build_paid() || building.build_claimed() {
-                continue;
-            }
-            let priority = if (ops.is_route)(building.kind()) { 1 } else { 0 };
-            let reqs = (ops.build_requirements)(building.kind());
-            if reqs.is_empty() {
-                continue;
-            }
-            let missing = missing_requirements_for_target(buildings, target, &reqs);
-            if missing.is_empty() {
-                continue;
-            }
-            let Some(source) = nearest_supply_with_items(buildings, sim_grid, target, &missing, ops)
-            else {
-                continue;
-            };
-            if let Some(source_building) = buildings.get(&source) {
-                if !can_fulfill_reqs_from_building(source_building, &reqs) {
-                    continue;
-                }
-            }
-            let Some(base_depot) = base_cells
-                .iter()
-                .copied()
-                .min_by(|a, b| {
-                    cell_distance(sim_grid, *a, target)
-                        .partial_cmp(&cell_distance(sim_grid, *b, target))
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                })
-            else {
-                continue;
-            };
-            let path = if source == base_depot {
-                let first = match find_direct_path_cells(base_depot, target, neighbors) {
-                    Some(path) => path,
-                    None => continue,
-                };
-                let second = match find_direct_path_cells(target, base_depot, neighbors) {
-                    Some(path) => path,
-                    None => continue,
-                };
-                combine_paths(first, second)
-            } else {
-                let first = match find_direct_path_cells(base_depot, source, neighbors) {
-                    Some(path) => path,
-                    None => continue,
-                };
-                let second = match find_direct_path_cells(source, target, neighbors) {
-                    Some(path) => path,
-                    None => continue,
-                };
-                let third = match find_direct_path_cells(target, base_depot, neighbors) {
-                    Some(path) => path,
-                    None => continue,
-                };
-                combine_paths(combine_paths(first, second), third)
-            };
-            let dist = cell_distance(sim_grid, source, target);
-            let better = match best {
-                None => true,
-                Some((best_prio, best_dist, _, _, _, _)) => {
-                    if priority < best_prio {
-                        true
-                    } else if priority > best_prio {
-                        false
-                    } else if has_builder {
-                        dist > best_dist
-                    } else {
-                        dist < best_dist
-                    }
-                }
-            };
-            if better {
-                best = Some((priority, dist, target, base_depot, missing, path));
-            }
-        }
-        if let Some((_, _, target, base_depot, missing, path)) = best {
-            let supply_reqs = (ops.build_requirements)(
-                buildings
-                    .get(&target)
-                    .map(|b| b.kind())
-                    .unwrap_or_else(|| {
-                        buildings
-                            .get(&base_depot)
-                            .map(|b| b.kind())
-                            .unwrap()
-                    }),
-            );
-            let mut unit = PlanetUnit {
-                path,
-                index: 0,
-                progress: 0.0,
-                speed: 3.0,
-                forward: true,
-                capacity: 30,
-                cargo: Vec::new(),
-                depot: base_depot,
-                station_in: base_depot,
-                station_out: target,
-                auto_supply: true,
-                supply_types: missing,
-                auto_supply_role: AutoSupplyRole::Base,
-                supply_reqs,
-                waiting_for_supply: false,
-            };
-            if unit.path.first().copied() == Some(unit.station_in) {
-                if let Some(building) = buildings.get_mut(&unit.station_in) {
-                    if !take_reqs_from_building(
-                        building,
-                        &mut unit.cargo,
-                        unit.capacity,
-                        &unit.supply_reqs,
-                    ) {
-                        unit.waiting_for_supply = true;
-                    }
-                }
-            }
-            if let Some(building) = buildings.get_mut(&target) {
-                building.set_build_claimed(true);
-                buildings_dirty = true;
-            }
-            units.push(unit);
-            units_dirty = true;
-        }
-    }
-
-    for unit in units.iter_mut() {
-        if unit.auto_supply && unit.waiting_for_supply {
-            if unit.path.get(unit.index).copied() == Some(unit.station_in) {
-                if let Some(building) = buildings.get_mut(&unit.station_in) {
-                    if take_reqs_from_building(
-                        building,
-                        &mut unit.cargo,
-                        unit.capacity,
-                        &unit.supply_reqs,
-                    ) {
-                        unit.waiting_for_supply = false;
-                        buildings_dirty = true;
-                    } else {
-                        continue;
-                    }
-                } else {
-                    unit.waiting_for_supply = false;
-                }
-            } else {
-                unit.waiting_for_supply = false;
-            }
-        }
-        if unit.path.len() < 2 {
-            continue;
-        }
-        let is_logistics = buildings
-            .get(&unit.depot)
-            .map(|building| (ops.is_logistics)(building.kind()))
-            .unwrap_or(false);
-        unit.progress += dt * unit.speed;
-        while unit.progress >= 1.0 {
-            unit.progress -= 1.0;
-            if unit.auto_supply || is_logistics {
-                if unit.index + 1 < unit.path.len() {
-                    unit.index += 1;
-                } else if is_logistics {
-                    let start = unit.path.first().copied();
-                    if start == Some(unit.depot) {
-                        unit.index = 1.min(unit.path.len() - 1);
-                    } else {
-                        unit.index = 0;
-                    }
-                } else {
-                    unit.index = 0;
-                }
-            } else if unit.forward {
-                if unit.index + 1 < unit.path.len() {
-                    unit.index += 1;
-                }
-                if unit.index >= unit.path.len() - 1 {
-                    unit.forward = false;
-                }
-            } else if unit.index > 0 {
-                unit.index -= 1;
-            } else {
-                unit.forward = true;
-            }
-            let arrived = unit.path[unit.index];
-            if is_logistics
-                && unit.path.len() > 1
-                && unit.path.first().copied() == Some(unit.depot)
-                && arrived == unit.station_in
-            {
-                let arrived_index = unit.index;
-                if arrived_index > 0 {
-                    unit.path.drain(0..arrived_index);
-                }
-                unit.index = 0;
-            }
-            if arrived == unit.station_in {
-                if unit.auto_supply {
-                    let target_build_paid = buildings
-                        .get(&unit.station_out)
-                        .map(|b| b.build_paid())
-                        .unwrap_or(false);
-                    let target_needs = buildings
-                        .get(&unit.station_out)
-                        .map(|b| planet_is_under_construction(b) && !b.build_paid())
-                        .unwrap_or(false);
-                    if !target_needs {
-                        if let Some(building) = buildings.get_mut(&unit.station_out) {
-                            building.set_build_claimed(false);
-                            buildings_dirty = true;
-                        }
-                    }
-                    if let Some(building) = buildings.get_mut(&arrived) {
-                        if target_build_paid && !unit.cargo.is_empty() {
-                            unload_unit_to_building(
-                                &mut unit.cargo,
-                                building,
-                                (ops.storage_capacity)(building.kind()),
-                            );
-                            buildings_dirty = true;
-                        }
-                        if unit.cargo.is_empty()
-                            && target_needs
-                            && !take_reqs_from_building(
-                                building,
-                                &mut unit.cargo,
-                                unit.capacity,
-                                &unit.supply_reqs,
-                            )
-                        {
-                            unit.waiting_for_supply = true;
-                            buildings_dirty = true;
-                        }
-                    }
-                } else if is_logistics {
-                    if unit.cargo.is_empty() {
-                        if let Some(building) = buildings.get_mut(&arrived) {
-                            load_unit_from_building(
-                                building,
-                                &mut unit.cargo,
-                                unit.capacity,
-                            );
-                            buildings_dirty = true;
-                        }
-                    }
-                } else if let Some(building) = buildings.get_mut(&arrived) {
-                    load_unit_from_building(
-                        building,
-                        &mut unit.cargo,
-                        unit.capacity,
-                    );
-                    buildings_dirty = true;
-                }
-            }
-            let is_neighbor = neighbors
-                .get(unit.station_out as usize)
-                .map(|list| list.contains(&arrived))
+        let action = select_action(&units[index], buildings, ops);
+        let target = resolved_target(&units[index], &action);
+        if current_target_invalid(&units[index], &action, buildings)
+            || units[index].current_action.as_ref() != Some(&action)
+        {
+            units[index].current_action = Some(action.clone());
+            units[index].current_target = target;
+            units[index].progress = 0.0;
+            let current_cell = units[index].current_cell();
+            let allow_offroad = buildings
+                .get(&units[index].depot)
+                .map(|building| (ops.is_base)(building.kind()))
                 .unwrap_or(false);
-            if unit.auto_supply && (arrived == unit.station_out || is_neighbor) {
-                let under_construction = buildings
-                    .get(&unit.station_out)
-                    .map(planet_is_under_construction)
-                    .unwrap_or(false);
-                if under_construction {
-                    apply_cargo_to_construction(buildings, unit.station_out, &mut unit.cargo, ops);
-                    buildings_dirty = true;
+            units[index].path = match target {
+                Some(target_cell) if target_cell != current_cell => {
+                    path_to_target(current_cell, target_cell, buildings, neighbors, ops, allow_offroad)
                 }
-            } else if is_logistics && arrived == unit.station_out {
-                if let Some(building) = buildings.get_mut(&arrived) {
-                    unload_unit_to_building(
-                        &mut unit.cargo,
-                        building,
-                        (ops.storage_capacity)(building.kind()),
-                    );
-                    buildings_dirty = true;
+                _ => vec![current_cell],
+            };
+            units[index].index = 0;
+            units_dirty = true;
+        }
+
+        if execute_action_at_target(&mut units[index], buildings, ops) {
+            buildings_dirty = true;
+            units_dirty = true;
+        }
+
+        if units[index].preset_id == PlanetUnitPresetId::BuilderSupply
+            && buildings
+                .get(&units[index].depot)
+                .map(|building| (ops.is_builder)(building.kind()))
+                .unwrap_or(false)
+        {
+            let resting = storage_total(&units[index].cargo) == 0
+                && units[index].current_cell() == units[index].depot
+                && units[index].path.len() <= 1;
+            if resting {
+                units[index].assignment_check_timer += dt;
+                if units[index].assignment_check_timer >= 1.0 {
+                    units[index].assignment_check_timer = 0.0;
+                    let previous_target = units[index].nodes.construction;
+                    let reserved_targets: Vec<u32> = units
+                        .iter()
+                        .enumerate()
+                        .filter(|(other_index, other_unit)| {
+                            *other_index != index
+                                && other_unit.preset_id == PlanetUnitPresetId::BuilderSupply
+                        })
+                        .filter_map(|(_, other_unit)| other_unit.nodes.construction)
+                        .collect();
+                    if let Some((new_target, new_source)) =
+                        next_builder_assignment(
+                            units[index].depot,
+                            buildings,
+                            previous_target,
+                            &reserved_targets,
+                            neighbors,
+                            ops,
+                        )
+                    {
+                        units[index].nodes.construction = Some(new_target);
+                        units[index].nodes.pickup = Some(new_source);
+                        units[index].current_action = None;
+                        units[index].current_target = None;
+                        units[index].path = vec![units[index].current_cell()];
+                        units[index].index = 0;
+                        units[index].progress = 0.0;
+                        units_dirty = true;
+                    } else {
+                        units[index].nodes.construction = None;
+                        units[index].nodes.pickup = None;
+                        units[index].current_action = Some(UnitAction::WaitAtNode(UnitNodeSlot::Depot));
+                        units[index].current_target = Some(units[index].depot);
+                        units[index].path = vec![units[index].depot];
+                        units[index].index = 0;
+                        units[index].progress = 0.0;
+                    }
                 }
-            } else if arrived == unit.station_out {
-                let under_construction = buildings
-                    .get(&arrived)
-                    .map(planet_is_under_construction)
-                    .unwrap_or(false);
-                if under_construction {
-                    apply_cargo_to_construction(buildings, arrived, &mut unit.cargo, ops);
-                    buildings_dirty = true;
-                } else if let Some(building) = buildings.get_mut(&arrived) {
-                    unload_unit_to_building(
-                        &mut unit.cargo,
-                        building,
-                        (ops.storage_capacity)(building.kind()),
-                    );
-                    buildings_dirty = true;
-                }
+            } else {
+                units[index].assignment_check_timer = 0.0;
             }
         }
+
+        if units[index].fuel <= 0.0 || units[index].path.len() < 2 {
+            index += 1;
+            continue;
+        }
+
+        let distance_progress = dt * units[index].speed;
+        let fuel_spend = dt * units[index].fuel_burn_rate;
+        units[index].progress += distance_progress;
+        units[index].fuel = (units[index].fuel - fuel_spend).max(0.0);
+
+        while units[index].progress >= 1.0 && units[index].index + 1 < units[index].path.len() {
+            units[index].progress -= 1.0;
+            units[index].index += 1;
+            units_dirty = true;
+            if execute_action_at_target(&mut units[index], buildings, ops) {
+                buildings_dirty = true;
+                units_dirty = true;
+            }
+        }
+        index += 1;
     }
 
     UnitUpdateResult {
@@ -1062,7 +1224,6 @@ mod tests {
         Builder,
         Housing,
         Warehouse,
-        Logistics,
         Route,
     }
 
@@ -1074,55 +1235,21 @@ mod tests {
         build_time: f32,
         build_paid: bool,
         build_claimed: bool,
-        builder_units_desired: i32,
     }
 
     impl PlanetBuildingAccess for TestBuilding {
         type Kind = TestKind;
 
-        fn kind(&self) -> Self::Kind {
-            self.kind
-        }
-
-        fn storage(&self) -> &HashMap<PlanetResourceKind, u32> {
-            &self.storage
-        }
-
-        fn storage_mut(&mut self) -> &mut HashMap<PlanetResourceKind, u32> {
-            &mut self.storage
-        }
-
-        fn build_progress(&self) -> f32 {
-            self.build_progress
-        }
-
-        fn build_time(&self) -> f32 {
-            self.build_time
-        }
-
-        fn set_build_progress(&mut self, value: f32) {
-            self.build_progress = value;
-        }
-
-        fn build_paid(&self) -> bool {
-            self.build_paid
-        }
-
-        fn set_build_paid(&mut self, value: bool) {
-            self.build_paid = value;
-        }
-
-        fn build_claimed(&self) -> bool {
-            self.build_claimed
-        }
-
-        fn set_build_claimed(&mut self, value: bool) {
-            self.build_claimed = value;
-        }
-
-        fn builder_units_desired(&self) -> i32 {
-            self.builder_units_desired
-        }
+        fn kind(&self) -> Self::Kind { self.kind }
+        fn storage(&self) -> &HashMap<PlanetResourceKind, u32> { &self.storage }
+        fn storage_mut(&mut self) -> &mut HashMap<PlanetResourceKind, u32> { &mut self.storage }
+        fn build_progress(&self) -> f32 { self.build_progress }
+        fn build_time(&self) -> f32 { self.build_time }
+        fn set_build_progress(&mut self, value: f32) { self.build_progress = value; }
+        fn build_paid(&self) -> bool { self.build_paid }
+        fn set_build_paid(&mut self, value: bool) { self.build_paid = value; }
+        fn build_claimed(&self) -> bool { self.build_claimed }
+        fn set_build_claimed(&mut self, value: bool) { self.build_claimed = value; }
     }
 
     fn test_ops() -> UnitOps<TestKind> {
@@ -1131,7 +1258,7 @@ mod tests {
             is_builder: |kind| kind == TestKind::Builder,
             is_base: |kind| kind == TestKind::Base,
             is_warehouse: |kind| kind == TestKind::Warehouse,
-            is_logistics: |kind| kind == TestKind::Logistics,
+            is_refuel: |_kind| false,
             build_requirements: |kind| match kind {
                 TestKind::Housing => vec![PlanetResourceStack {
                     resource_id: resource_kind_to_id(PlanetResourceKind::Stone),
@@ -1147,45 +1274,164 @@ mod tests {
         TestBuilding {
             kind,
             storage: HashMap::new(),
-            build_progress: 0.0,
+            build_progress: 1.0,
             build_time: 1.0,
             build_paid: true,
             build_claimed: false,
-            builder_units_desired: 0,
         }
     }
 
     #[test]
     fn route_path_uses_route_cells_between_endpoints() {
         let mut buildings: HashMap<u32, TestBuilding> = HashMap::new();
-        let mut route = make_building(TestKind::Route);
-        route.build_paid = true;
-        route.build_progress = route.build_time;
-        buildings.insert(1, route);
-
+        buildings.insert(1, make_building(TestKind::Route));
         let neighbors = vec![vec![1], vec![0, 2], vec![1]];
-        let path = find_route_path_cells(0, 2, &buildings, &neighbors, &test_ops())
-            .expect("expected route path");
+        let path = find_route_path_cells(0, 2, &buildings, &neighbors, &test_ops()).unwrap();
         assert_eq!(path, vec![0, 1, 2]);
     }
 
     #[test]
-    fn apply_cargo_pays_construction_when_requirements_met() {
-        let target = 3;
+    fn fuel_rule_beats_cargo_rule() {
+        let mut unit = unit_for_preset(
+            PlanetUnitPresetId::Hauler,
+            0,
+            PlanetUnitNodeConfig { pickup: Some(1), dropoff: Some(2), refuel: Some(3), construction: None, wait: None },
+        );
+        unit.fuel = 10.0;
+        let buildings = HashMap::<u32, TestBuilding>::new();
+        let action = select_action(&unit, &buildings, &test_ops());
+        assert_eq!(action, UnitAction::RefuelAtNode(UnitNodeSlot::Refuel));
+    }
+
+    #[test]
+    fn cargo_empty_picks_up() {
+        let unit = unit_for_preset(
+            PlanetUnitPresetId::Hauler,
+            0,
+            PlanetUnitNodeConfig { pickup: Some(1), dropoff: Some(2), refuel: Some(3), construction: None, wait: None },
+        );
+        let buildings = HashMap::<u32, TestBuilding>::new();
+        let action = select_action(&unit, &buildings, &test_ops());
+        assert_eq!(action, UnitAction::PickupAtNode(UnitNodeSlot::Pickup));
+    }
+
+    #[test]
+    fn cargo_loaded_delivers() {
+        let mut unit = unit_for_preset(
+            PlanetUnitPresetId::Hauler,
+            0,
+            PlanetUnitNodeConfig { pickup: Some(1), dropoff: Some(2), refuel: Some(3), construction: None, wait: None },
+        );
+        unit.cargo.push(PlanetResourceStack { resource_id: resource_kind_to_id(PlanetResourceKind::Stone), amount: 2 });
+        let buildings = HashMap::<u32, TestBuilding>::new();
+        let action = select_action(&unit, &buildings, &test_ops());
+        assert_eq!(action, UnitAction::DeliverAtNode(UnitNodeSlot::Dropoff));
+    }
+
+    #[test]
+    fn build_action_pays_construction_when_requirements_met() {
         let mut buildings: HashMap<u32, TestBuilding> = HashMap::new();
-        let mut building = make_building(TestKind::Housing);
-        building.build_paid = false;
-        building.build_progress = 0.0;
-        buildings.insert(target, building);
+        let mut housing = make_building(TestKind::Housing);
+        housing.build_paid = false;
+        housing.build_progress = 0.0;
+        buildings.insert(2, housing);
 
-        let mut cargo = vec![PlanetResourceStack {
-            resource_id: resource_kind_to_id(PlanetResourceKind::Stone),
-            amount: 3,
-        }];
-        apply_cargo_to_construction(&mut buildings, target, &mut cargo, &test_ops());
+        let mut unit = unit_for_preset(
+            PlanetUnitPresetId::BuilderSupply,
+            0,
+            PlanetUnitNodeConfig { pickup: Some(1), dropoff: None, refuel: Some(3), construction: Some(2), wait: None },
+        );
+        unit.current_action = Some(UnitAction::BuildAtNode(UnitNodeSlot::Construction));
+        unit.current_target = Some(2);
+        unit.path = vec![2];
+        unit.cargo.push(PlanetResourceStack { resource_id: resource_kind_to_id(PlanetResourceKind::Stone), amount: 3 });
 
-        let updated = buildings.get(&target).unwrap();
-        assert!(updated.build_paid(), "construction should be marked paid");
-        assert!(cargo.iter().all(|stack| stack.amount == 0));
+        assert!(execute_action_at_target(&mut unit, &mut buildings, &test_ops()));
+        assert!(buildings.get(&2).unwrap().build_paid());
+    }
+
+    #[test]
+    fn builder_supply_capacity_covers_mine_requirements() {
+        let unit = unit_for_preset(
+            PlanetUnitPresetId::BuilderSupply,
+            0,
+            PlanetUnitNodeConfig { pickup: Some(1), dropoff: None, refuel: Some(0), construction: Some(2), wait: None },
+        );
+        assert!(unit.capacity >= 22);
+    }
+
+    #[test]
+    fn builder_supply_retargets_next_unpaid_work() {
+        let mut buildings: HashMap<u32, TestBuilding> = HashMap::new();
+        let mut builder = make_building(TestKind::Builder);
+        builder.storage.insert(PlanetResourceKind::Stone, 10);
+        buildings.insert(1, builder);
+
+        let mut old_target = make_building(TestKind::Housing);
+        old_target.build_paid = true;
+        buildings.insert(2, old_target);
+
+        let mut new_target = make_building(TestKind::Housing);
+        new_target.build_paid = false;
+        new_target.build_progress = 0.0;
+        buildings.insert(3, new_target);
+
+        let mut units = vec![unit_for_preset(
+            PlanetUnitPresetId::BuilderSupply,
+            1,
+            PlanetUnitNodeConfig {
+                pickup: Some(1),
+                dropoff: None,
+                refuel: Some(1),
+                construction: Some(2),
+                wait: None,
+            },
+        )];
+        let neighbors = vec![vec![1], vec![0, 2, 3], vec![1], vec![1]];
+        let grid = HexGrid {
+            freq: 1,
+            vertices: vec![],
+            faces: vec![],
+            face_centers: vec![],
+            vertex_faces: vec![],
+            base_face_buckets: vec![],
+            base_face_neighbors: vec![],
+        };
+
+        let _ = update_units_and_construction(&mut units, &mut buildings, &grid, &neighbors, 0.0, &test_ops());
+        assert_eq!(units[0].nodes.construction, Some(3));
+    }
+
+    #[test]
+    fn non_base_units_do_not_fall_back_to_direct_path() {
+        let mut buildings: HashMap<u32, TestBuilding> = HashMap::new();
+        buildings.insert(1, make_building(TestKind::Builder));
+        let mut unit = unit_for_preset(
+            PlanetUnitPresetId::BuilderSupply,
+            1,
+            PlanetUnitNodeConfig {
+                pickup: Some(2),
+                dropoff: None,
+                refuel: None,
+                construction: Some(2),
+                wait: None,
+            },
+        );
+        unit.current_action = None;
+        unit.current_target = None;
+        let mut units = vec![unit];
+        let neighbors = vec![vec![1], vec![0, 2], vec![1]];
+        let grid = HexGrid {
+            freq: 1,
+            vertices: vec![],
+            faces: vec![],
+            face_centers: vec![],
+            vertex_faces: vec![],
+            base_face_buckets: vec![],
+            base_face_neighbors: vec![],
+        };
+
+        let _ = update_units_and_construction(&mut units, &mut buildings, &grid, &neighbors, 0.0, &test_ops());
+        assert_eq!(units[0].path, vec![1]);
     }
 }

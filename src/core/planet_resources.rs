@@ -148,6 +148,17 @@ pub struct PlanetSimWorld {
     dirty: bool,
 }
 
+#[cfg(test)]
+pub(crate) fn sim_world_for_tests(cells: Vec<PlanetCellState>) -> PlanetSimWorld {
+    PlanetSimWorld {
+        sim_freq: 1,
+        seed: 0,
+        config_hash: 0,
+        cells,
+        dirty: false,
+    }
+}
+
 impl PlanetSimWorld {
     pub fn can_build(&self, cell_index: u32) -> bool {
         self.cells

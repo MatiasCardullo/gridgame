@@ -31,7 +31,7 @@ use crate::core::planet_units::{
     storage_total, unit_for_preset, update_units_and_construction,
 };
 use crate::core::ui::{draw_build_panel, draw_window, ui_button, ui_checkbox, WindowState, WindowStyle, WINDOW_TITLE_HEIGHT};
-use crate::core::map_common::{build_panel_layout, handle_window_drag};
+use crate::core::map_common::{build_panel_layout, handle_window_drag, is_ui_capturing};
 
 const PLANET_DATA_DIR: &str = "planet_data";
 const MESH_POINTS_PATH: &str = "planet_data/planet_mesh_points.csv";
@@ -641,6 +641,16 @@ struct PlanetBuildingState {
     auto_pick_refuel: bool,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct BuilderUnitDebugState {
+    depot: u32,
+    cell: u32,
+    action: Option<String>,
+    target: Option<u32>,
+    cargo: u32,
+    path_len: usize,
+}
+
 impl PlanetBuildingAccess for PlanetBuildingState {
     type Kind = PlanetBuildingKind;
 
@@ -709,6 +719,143 @@ fn mine_total_remaining(
         .filter_map(|target| sim_world.cells.get(target as usize))
         .filter_map(|cell| cell.deposit.map(|deposit| deposit.remaining_amount))
         .sum()
+}
+
+fn visible_owned_unit_count(units: &[PlanetUnit], depot: u32) -> usize {
+    units.iter().filter(|unit| unit.depot == depot).count().min(6)
+}
+
+fn extra_owned_unit_line_count(units: &[PlanetUnit], depot: u32) -> usize {
+    usize::from(units.iter().filter(|unit| unit.depot == depot).count() > 6)
+}
+
+fn builder_unit_action_text(unit: &PlanetUnit) -> String {
+    let action = unit
+        .current_action
+        .as_ref()
+        .map(|action| action.label())
+        .unwrap_or("Idle");
+    let target = unit
+        .current_target
+        .map(|target| target.to_string())
+        .unwrap_or_else(|| "-".to_string());
+    format!("{action} -> {target}")
+}
+
+fn builder_unit_debug_state(unit: &PlanetUnit) -> BuilderUnitDebugState {
+    BuilderUnitDebugState {
+        depot: unit.depot,
+        cell: unit.current_cell(),
+        action: Some(builder_unit_action_text(unit)),
+        target: unit.current_target,
+        cargo: storage_total(&unit.cargo),
+        path_len: unit.path.len(),
+    }
+}
+
+fn info_window_height_for_building(
+    state: &PlanetState,
+    cell_index: u32,
+    building: &PlanetBuildingState,
+) -> f32 {
+    let mut content_height = 20.0 + 20.0;
+    if state
+        .sim_world
+        .as_ref()
+        .and_then(|world| world.cells.get(cell_index as usize))
+        .is_some()
+    {
+        content_height += 20.0 + 26.0;
+    }
+
+    if planet_is_under_construction(building) {
+        content_height += 18.0;
+        content_height += 18.0;
+        content_height += 18.0;
+        if building.build_time > 0.0 {
+            content_height += 20.0;
+        }
+    }
+
+    content_height += 20.0 + 22.0;
+
+    match building.kind {
+        PlanetBuildingKind::Base => {
+            content_height += 30.0;
+        }
+        PlanetBuildingKind::Mine => {
+            if state
+                .sim_world
+                .as_ref()
+                .and_then(|world| world.cells.get(cell_index as usize))
+                .and_then(|cell| cell.deposit)
+                .is_some()
+            {
+                content_height += 18.0 + 24.0;
+            }
+            if !planet_is_under_construction(building) {
+                content_height += 34.0;
+            }
+        }
+        PlanetBuildingKind::Logistics => {
+            if planet_is_under_construction(building) {
+                content_height += 20.0;
+            } else {
+                content_height += 18.0 + 18.0 + 22.0;
+                content_height += 34.0 + 34.0 + 30.0;
+                if state.info_window.show_units {
+                    let visible_units = visible_owned_unit_count(&state.units, cell_index) as f32;
+                    let extra_lines = extra_owned_unit_line_count(&state.units, cell_index) as f32;
+                    content_height += 18.0 + 18.0 * visible_units + 18.0 * extra_lines;
+                }
+            }
+        }
+        PlanetBuildingKind::Builder => {
+            if planet_is_under_construction(building) {
+                content_height += 20.0;
+            } else {
+                content_height += 24.0 + 24.0 + 28.0;
+                content_height += 18.0 + 18.0 + 22.0;
+                content_height += 34.0 + 34.0 + 30.0;
+                if state.info_window.show_units {
+                    let visible_units = visible_owned_unit_count(&state.units, cell_index) as f32;
+                    let extra_lines = extra_owned_unit_line_count(&state.units, cell_index) as f32;
+                    content_height += 18.0 + 18.0 * visible_units + 18.0 * extra_lines;
+                }
+                let log_lines = state
+                    .builder_unit_log
+                    .iter()
+                    .filter(|entry| entry.starts_with(&format!("B{cell_index} ")))
+                    .count()
+                    .min(6) as f32;
+                if log_lines > 0.0 {
+                    content_height += 22.0 + 18.0 * log_lines;
+                }
+            }
+        }
+        _ => {}
+    }
+
+    WINDOW_TITLE_HEIGHT + 18.0 + content_height + 28.0 + 12.0
+}
+
+fn sync_info_window_layout(state: &mut PlanetState) {
+    if !state.info_window.open {
+        return;
+    }
+    let Some(cell_index) = state.info_target_cell else {
+        return;
+    };
+    let Some(building) = state.buildings.get(&cell_index) else {
+        return;
+    };
+    if !matches!(
+        building.kind,
+        PlanetBuildingKind::Logistics | PlanetBuildingKind::Builder | PlanetBuildingKind::Base
+    ) {
+        state.info_window.show_units = false;
+    }
+    state.info_window.rect.h = info_window_height_for_building(state, cell_index, building);
 }
 
 fn planet_cell_distance(sim_grid: &HexGrid, a: u32, b: u32) -> f32 {
@@ -854,6 +1001,7 @@ pub struct PlanetState {
     last_resource_save_at: f64,
     last_buildings_save_at: f64,
     last_units_save_at: f64,
+    builder_unit_log: Vec<String>,
     regen_generation: Arc<AtomicU64>,
 }
 
@@ -1003,6 +1151,7 @@ impl PlanetState {
             last_resource_save_at: 0.0,
             last_buildings_save_at: 0.0,
             last_units_save_at: 0.0,
+            builder_unit_log: Vec::new(),
             regen_generation: Arc::new(AtomicU64::new(0)),
         };
         state.load_buildings_snapshot(PLANET_BUILDINGS_PATH);
@@ -1584,6 +1733,7 @@ impl PlanetState {
         let Some(neighbors) = self.sim_neighbors.as_ref() else {
             return;
         };
+        let before_states = self.capture_builder_unit_debug_states();
         let ops = unit_ops();
         let result = update_units_and_construction(
             &mut self.units,
@@ -1593,11 +1743,84 @@ impl PlanetState {
             dt,
             &ops,
         );
+        self.log_builder_unit_changes(&before_states);
         if result.units_dirty {
             self.units_dirty = true;
         }
         if result.buildings_dirty {
             self.buildings_dirty = true;
+        }
+    }
+
+    fn capture_builder_unit_debug_states(&self) -> Vec<BuilderUnitDebugState> {
+        self.units
+            .iter()
+            .filter(|unit| {
+                unit.preset_id == PlanetUnitPresetId::BuilderSupply
+                    && self
+                        .buildings
+                        .get(&unit.depot)
+                        .map(|building| building.kind == PlanetBuildingKind::Builder)
+                        .unwrap_or(false)
+            })
+            .map(builder_unit_debug_state)
+            .collect()
+    }
+
+    fn push_builder_unit_log(&mut self, entry: String) {
+        if self.builder_unit_log.last() == Some(&entry) {
+            return;
+        }
+        self.builder_unit_log.push(entry);
+        if self.builder_unit_log.len() > 48 {
+            let drop_count = self.builder_unit_log.len() - 48;
+            self.builder_unit_log.drain(0..drop_count);
+        }
+    }
+
+    fn log_builder_unit_changes(&mut self, before_states: &[BuilderUnitDebugState]) {
+        let after_states = self.capture_builder_unit_debug_states();
+        let shared = before_states.len().min(after_states.len());
+        for index in 0..shared {
+            if before_states[index] != after_states[index] {
+                let before = &before_states[index];
+                let after = &after_states[index];
+                self.push_builder_unit_log(format!(
+                    "B{} U{}: {} c{} p{} @{} -> {} c{} p{} @{}",
+                    after.depot,
+                    index + 1,
+                    before.action.as_deref().unwrap_or("Idle"),
+                    before.cargo,
+                    before.path_len,
+                    before.cell,
+                    after.action.as_deref().unwrap_or("Idle"),
+                    after.cargo,
+                    after.path_len,
+                    after.cell,
+                ));
+            }
+        }
+        if after_states.len() > before_states.len() {
+            for (index, after) in after_states.iter().enumerate().skip(before_states.len()) {
+                self.push_builder_unit_log(format!(
+                    "B{} U{}: spawned {} c{} p{} @{}",
+                    after.depot,
+                    index + 1,
+                    after.action.as_deref().unwrap_or("Idle"),
+                    after.cargo,
+                    after.path_len,
+                    after.cell,
+                ));
+            }
+        } else if before_states.len() > after_states.len() {
+            for (index, before) in before_states.iter().enumerate().skip(after_states.len()) {
+                self.push_builder_unit_log(format!(
+                    "B{} U{}: removed from @{}",
+                    before.depot,
+                    index + 1,
+                    before.cell,
+                ));
+            }
         }
     }
 
@@ -3764,9 +3987,9 @@ pub fn run(
         (Some(PlanetBuildingKind::Route), "Route"),
     ];
     let panel_layout = build_panel_layout(panel_buttons.len(), state.panel_collapsed);
-    let ui_capturing = panel_layout.rect.contains(mouse)
-        || (state.info_window.open && state.info_window.rect.contains(mouse))
-        || (state.confirm_window.open && state.confirm_window.rect.contains(mouse));
+    sync_info_window_layout(state);
+    let ui_capturing =
+        is_ui_capturing(panel_layout.rect, &state.info_window, &state.confirm_window, mouse);
     let show_hover_grid = hovered_cell.is_some();
     if !state.debug_camera.enabled && is_mouse_button_pressed(MouseButton::Left) && !ui_capturing {
         if let Some(cell_index) = hovered_cell {
@@ -3995,33 +4218,6 @@ pub fn run(
     let mut spawn_request: Option<(u32, PlanetUnitPresetId, PlanetUnitNodeConfig)> = None;
     let mut expand_mine_request: Option<u32> = None;
     if state.info_window.open {
-        if let Some(cell_index) = state.info_target_cell {
-            if let Some(building) = state.buildings.get(&cell_index) {
-                if matches!(
-                    building.kind,
-                    PlanetBuildingKind::Logistics | PlanetBuildingKind::Builder | PlanetBuildingKind::Base
-                ) {
-                    let total_units = state.units.iter().filter(|unit| unit.depot == cell_index).count();
-                    let visible_lines = total_units.min(6) as f32;
-                    let controls_extra = match building.kind {
-                        PlanetBuildingKind::Base => 34.0,
-                        PlanetBuildingKind::Builder => 82.0,
-                        PlanetBuildingKind::Logistics => 0.0,
-                        _ => 0.0,
-                    };
-                    let extra = if state.info_window.show_units {
-                        let extra_lines = if total_units > 6 { 1.0 } else { 0.0 };
-                        controls_extra + 38.0 + (visible_lines + extra_lines) * 18.0
-                    } else {
-                        controls_extra
-                    };
-                    state.info_window.rect.h = 190.0 + extra;
-                } else {
-                    state.info_window.rect.h = state.info_window.rect.h.min(190.0);
-                    state.info_window.show_units = false;
-                }
-            }
-        }
         handle_window_drag(&mut state.info_window, mouse);
         let close = draw_window(
             &state.info_window,
@@ -4390,6 +4586,7 @@ pub fn run(
                                             ctx.font_sm,
                                             ctx.colors_rt.text_secondary,
                                         );
+                                        ty += 18.0;
                                     }
                                 }
                             }
@@ -4564,16 +4761,15 @@ pub fn run(
                                         .filter(|(_, unit)| unit.depot == cell_index)
                                         .collect();
                                     for (index, unit) in owned_units.iter().take(6) {
-                                        let task = unit
-                                            .current_action
-                                            .as_ref()
-                                            .map(|action| action.label())
-                                            .unwrap_or("Idle");
+                                        let cargo = storage_total(&unit.cargo);
                                         let info = format!(
-                                            "#{} {} {}%",
+                                            "#{} {} fuel:{}% cargo:{}/{} cell:{}",
                                             index + 1,
-                                            task,
-                                            (unit.fuel_ratio() * 100.0).round() as i32
+                                            builder_unit_action_text(unit),
+                                            (unit.fuel_ratio() * 100.0).round() as i32,
+                                            cargo,
+                                            unit.capacity,
+                                            unit.current_cell(),
                                         );
                                         draw_text(&info, tx, ty, ctx.font_sm, ctx.colors_rt.text_secondary);
                                         ty += 18.0;
@@ -4586,6 +4782,35 @@ pub fn run(
                                             ctx.font_sm,
                                             ctx.colors_rt.text_secondary,
                                         );
+                                        ty += 18.0;
+                                    }
+                                }
+
+                                let builder_logs: Vec<&String> = state
+                                    .builder_unit_log
+                                    .iter()
+                                    .rev()
+                                    .filter(|entry| entry.starts_with(&format!("B{cell_index} ")))
+                                    .take(6)
+                                    .collect();
+                                if !builder_logs.is_empty() {
+                                    draw_text(
+                                        "Recent log:",
+                                        tx,
+                                        ty,
+                                        ctx.font_sm,
+                                        ctx.colors_rt.text_secondary,
+                                    );
+                                    ty += 22.0;
+                                    for entry in builder_logs.into_iter() {
+                                        draw_text(
+                                            entry,
+                                            tx,
+                                            ty,
+                                            ctx.font_sm,
+                                            ctx.colors_rt.text_secondary,
+                                        );
+                                        ty += 18.0;
                                     }
                                 }
                             }

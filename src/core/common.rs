@@ -173,20 +173,11 @@ pub enum AutoSupplyRole {
     Builder,
 }
 
-
-// Select which endpoint to set for logistics units.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum StationPick {
-    In,
-    Out,
-}
-
 // Scene routing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Scene {
     MainMenu,
     Config,
-    PlanetSector,
     Planet,
     BuildTemplate,
 }
@@ -196,7 +187,6 @@ pub enum Scene {
 pub struct FrameContext {
     pub mouse: Vec2,
     pub screen_center: Vec2,
-    pub has_save: bool,
     pub font_sm: f32,
     pub font_md: f32,
     pub font_lg: f32,

@@ -109,17 +109,20 @@
 - Builds or loads per-cell simulation snapshot (`planet_data/planet_resources.bin`).
 - Classifies cells as `Land`, `Coast`, or `Water` from noise/sea-level, then derives lithology and deposits.
 - Buildability currently allows only `Land`.
-- Construction economy mirrors `planet_sector.rs`:
+- Construction economy mirrors the legacy 2D sector flow:
   - New buildings start unpaid/under construction.
   - Materials are required before build progress advances.
-  - Auto-supply units claim build targets and deliver materials.
-- Route-only logistics:
-  - Units traverse `Route` cells (endpoints can be non-route).
-  - Builder units and Base auto-supply use route paths.
+  - Base auto-builder units are limited to one active unit at a time.
+  - Builder-owned construction units can be multiple, but each reserves a distinct build target.
+- Declarative unit runtime:
+  - Units run preset-driven rules (`Hauler`, `BuilderSupply`, `Shuttle`).
+  - Logistics/builder units only move on `Route` networks.
+  - Base construction units may fall back to direct off-road travel.
+  - Units consume fuel while moving and can only refuel at completed `Refuel` buildings.
 
 8. Left click:
 - Reorients the camera to the selected face normal.
-- If a logistics station pick is active, left click selects the station cell.
+- If a node pick is active (`Pickup`, `Dropoff`, `Refuel`, `Construction`), left click selects the target cell.
 
 9. UI:
 - Debug controls (`draw_planet_controls`).
@@ -135,8 +138,10 @@
   - Mines extract continuously from cell deposits and reduce persisted `remaining_amount`.
 - Building windows now include:
   - Construction status + requirements.
-  - Logistics station `In/Out` picking and manual unit creation.
-  - Builder unit creation and unit list status.
+  - Base toggle for automatic builder unit spawning.
+  - Logistics node picking (`Pickup` / `Dropoff` / `Refuel`) and preset unit creation.
+  - Builder node picking (`Source` / `Build` / `Refuel`), auto-selection toggles, and unit list status.
+  - Mine expansion and multi-cell extraction status.
 
 ## 5) Key Picking/Coordinate Functions
 - `project_to_screen`: world -> screen with clipping.
@@ -144,10 +149,9 @@
 - `hovered_face`: picks the face by max dot(normal, hit direction).
 - `face_name`: greek label for base faces/subfaces.
 
-## TODO (Migration from `planet_sector.rs`)
-- Implement mining expansion (`mine_extra`) and multi-cell extraction behavior.
-- Persist full planet gameplay state in a dedicated 3D save format.
-- Add per-building placement rules and validation beyond the current `Land` gate.
-- Draw logistics routes and flow overlays directly on the sphere.
+## Current Notes
+- Mining expansion (`mine_extra`) and multi-cell extraction are implemented.
+- Logistics routes and flow overlays are drawn on the sphere for selected buildings.
+- `planet_data/planet_units.json` now stores the new declarative unit snapshot format; old unit snapshot formats are not migrated.
 
 

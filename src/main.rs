@@ -6,8 +6,8 @@ use macroquad::prelude::*;
 mod scenes;
 mod core;
 use core::{
-    load_config, save_config, Axial, BuildBlockType, MachineBlock, MachineBlockType, ConfigData, FrameContext, PlacedBlock, Scene,
-    StationPick, TileData, Unit,
+    load_config, save_config, Axial, MachineBlock, MachineBlockType, ConfigData, FrameContext,
+    PlacedBlock, Scene, TileData, Unit,
 };
 use core::ui::{UiButtonColors, WindowState};
 
@@ -42,7 +42,6 @@ async fn main() {
     let mut last_mouse = Vec2::ZERO;
     let map_path = "map.json";
     let _template_path = "template.json";
-    let mut selected: Option<BuildBlockType> = Some(BuildBlockType::Housing);
     let mut template_blocks: HashMap<Axial, MachineBlock> = HashMap::new();
     let mut template_selected: Option<MachineBlockType> = Some(MachineBlockType::ConveyorBelt);
     let mut placement_rotation: u8 = 0;
@@ -66,9 +65,6 @@ async fn main() {
         show_units: false,
     };
     let mut units: Vec<Unit> = Vec::new();
-    let mut station_in: Option<Axial> = None;
-    let mut station_out: Option<Axial> = None;
-    let mut station_pick: Option<StationPick> = None;
     let mut planet_state: Option<scenes::planet::PlanetState> = None;
     let mut planet_loader = scenes::planet::PlanetLoader::start();
     let greek_font = load_ttf_font("C:/Windows/Fonts/CascadiaMono.ttf").await.ok();
@@ -90,7 +86,6 @@ async fn main() {
         }
         let mouse = vec2(mouse_position().0, mouse_position().1);
         let screen_center = vec2(screen_width() * 0.5, screen_height() * 0.5);
-        let has_save = Path::new(map_path).exists();
         let colors_rt = colors.runtime();
         clear_background(colors_rt.background);
         let text_scale = config.text_scale;
@@ -108,7 +103,6 @@ async fn main() {
         let ctx = FrameContext {
             mouse,
             screen_center,
-            has_save,
             font_sm,
             font_md,
             font_lg,
@@ -129,7 +123,6 @@ async fn main() {
                     &mut cam_zoom,
                     &mut placement_rotation,
                     &mut scene,
-                    &mut dirty,
                     map_path,
                     &config,
                     planet_loader.is_loading(),
@@ -151,32 +144,6 @@ async fn main() {
                     &mut dirty,
                     &mut scene,
                     config_path,
-                );
-            }
-            Scene::PlanetSector => {
-                scenes::planet_sector::run(
-                    &ctx,
-                    &mut blocks,
-                    &mut tiles,
-                    &mut cam_offset,
-                    &mut cam_zoom,
-                    &mut dragging,
-                    &mut last_mouse,
-                    &mut selected,
-                    &mut placement_rotation,
-                    &mut panel_collapsed,
-                    &mut block_window,
-                    &mut confirm_window,
-                    &mut units,
-                    &mut station_in,
-                    &mut station_out,
-                    &mut station_pick,
-                    &mut dirty,
-                    &mut scene,
-                    map_path,
-                    &config,
-                    &colors_rt,
-                    core::map_common::MapOutline::Triangle,
                 );
             }
             Scene::Planet => {

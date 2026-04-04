@@ -5,7 +5,7 @@ use crate::core::{
     build_requirements, hex_distance, is_under_construction, item_from_tile,
 };
 
-// Sum all stored items.
+// Helpers for route/build unit simulation shared by 2D build-oriented scenes.
 fn storage_total(stored: &[crate::core::ItemStack]) -> i32 {
     stored.iter().map(|s| s.amount).sum()
 }

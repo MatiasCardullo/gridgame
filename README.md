@@ -42,4 +42,4 @@ Hex-grid strategy game built with Rust and Macroquad. Build structures, extract 
 9. `planet_data/planet_mesh_points.csv` only when mesh-point export is enabled.
 
 **Roadmap Notes**
-1. `planet_sector.rs` will be deprecated in favor of the 3D `planet.rs` scene now that the global hex grid exists.
+1. `build_template.rs` is the current 2D sandbox for future machine/build layout work.

@@ -1,12 +1,9 @@
 use macroquad::prelude::*;
 
 use crate::core::{
-    generate_tiles, load_map, save_map, AppConfig, Axial, FrameContext, PlacedBlock, MachineBlock, Scene,
-    TileData, Unit,
+    save_map, AppConfig, Axial, FrameContext, PlacedBlock, MachineBlock, Scene, TileData, Unit,
 };
 use crate::core::ui::{draw_log_panel, draw_progress_bar, ui_button};
-use crate::TRI_LENGHT;
-use crate::core::map_common::{outline_start_offset, MapOutline};
 use std::collections::HashMap;
 
 // Render and handle input for the main menu scene.
@@ -20,7 +17,6 @@ pub fn run(
     cam_zoom: &mut f32,
     placement_rotation: &mut u8,
     scene: &mut Scene,
-    dirty: &mut bool,
     map_path: &str,
     config: &AppConfig,
     planet_loading: bool,
@@ -45,35 +41,14 @@ pub fn run(
     let start_y = 200.0;
     let mut y = start_y;
 
-    if ctx.has_save {
-        let rect = Rect::new((screen_width() - btn_w) * 0.5, y, btn_w, btn_h);
-        let (clicked, _) = ui_button(rect, "Continuar", ctx.mouse, ctx.font_md, ctx.button_colors);
-        if clicked {
-            let (loaded_blocks, loaded_tiles, loaded_units) = load_map(map_path);
-            *blocks = loaded_blocks;
-            *tiles = loaded_tiles;
-            *units = loaded_units;
-            if tiles.is_empty() {
-                *tiles = generate_tiles(TRI_LENGHT, config);
-                *dirty = true;
-            }
-            *cam_offset = outline_start_offset(MapOutline::Triangle, config.zoom_level);
-            *cam_zoom = config.zoom_level;
-            *scene = Scene::PlanetSector;
-        }
-        y += btn_h + 12.0;
-    }
-
     let rect_new = Rect::new((screen_width() - btn_w) * 0.5, y, btn_w, btn_h);
-    let (clicked_new, _) = ui_button(rect_new, "Planet Sector", ctx.mouse, ctx.font_md, ctx.button_colors);
+    let (clicked_new, _) = ui_button(rect_new, "Build Template", ctx.mouse, ctx.font_md, ctx.button_colors);
     if clicked_new {
-        blocks.clear();
-        *tiles = generate_tiles(TRI_LENGHT, config);
-        units.clear();
-        *cam_offset = outline_start_offset(MapOutline::Triangle, config.zoom_level);
+        *cam_offset = Vec2::ZERO;
         *cam_zoom = config.zoom_level;
         *placement_rotation = 0;
-        *scene = Scene::PlanetSector;
+        template_blocks.clear();
+        *scene = Scene::BuildTemplate;
     }
     y += btn_h + 12.0;
 
@@ -99,17 +74,7 @@ pub fn run(
     }
     y += btn_h + 12.0;
 
-    let rect_template = Rect::new((screen_width() - btn_w) * 0.5, y, btn_w, btn_h);
-    let (clicked_template, _) =
-        ui_button(rect_template, "Build Template", ctx.mouse, ctx.font_md, ctx.button_colors);
-    if clicked_template {
-        *cam_offset = Vec2::ZERO;
-        *cam_zoom = config.zoom_level;
-        template_blocks.clear();
-        *scene = Scene::BuildTemplate;
-    }
-
-    let rect_exit = Rect::new((screen_width() - btn_w) * 0.5, y + btn_h + 12.0, btn_w, btn_h);
+    let rect_exit = Rect::new((screen_width() - btn_w) * 0.5, y, btn_w, btn_h);
     let (clicked_exit, _) = ui_button(rect_exit, "Salir", ctx.mouse, ctx.font_md, ctx.button_colors);
     if clicked_exit {
         if !blocks.is_empty() || !tiles.is_empty() {

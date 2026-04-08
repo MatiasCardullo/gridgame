@@ -404,7 +404,7 @@ fn next_builder_assignment<B: PlanetBuildingAccess>(
     neighbors: &[Vec<u32>],
     ops: &UnitOps<B::Kind>,
 ) -> Option<(u32, u32)> {
-    for target in buildings
+    let mut candidates: Vec<u32> = buildings
         .iter()
         .filter(|(cell_index, building)| {
             Some(**cell_index) != exclude
@@ -414,7 +414,10 @@ fn next_builder_assignment<B: PlanetBuildingAccess>(
                 && !(ops.build_requirements)(building.kind()).is_empty()
         })
         .map(|(cell_index, _)| *cell_index)
-    {
+        .collect();
+    candidates.sort_unstable();
+
+    for target in candidates {
         let reqs = buildings
             .get(&target)
             .map(|building| (ops.build_requirements)(building.kind()))
@@ -436,6 +439,40 @@ fn next_builder_assignment<B: PlanetBuildingAccess>(
         }
     }
     None
+}
+
+fn builder_assignment_changed(unit: &PlanetUnit, target: u32, source: u32) -> bool {
+    unit.nodes.construction != Some(target) || unit.nodes.pickup != Some(source)
+}
+
+fn current_builder_assignment_valid<B: PlanetBuildingAccess>(
+    unit: &PlanetUnit,
+    buildings: &HashMap<u32, B>,
+    neighbors: &[Vec<u32>],
+    ops: &UnitOps<B::Kind>,
+) -> bool {
+    let Some(target) = unit.nodes.construction else {
+        return false;
+    };
+    let Some(source) = unit.nodes.pickup else {
+        return false;
+    };
+    let Some(target_building) = buildings.get(&target) else {
+        return false;
+    };
+    if !planet_is_under_construction(target_building) || target_building.build_paid() {
+        return false;
+    }
+    let reqs = (ops.build_requirements)(target_building.kind());
+    if reqs.is_empty() {
+        return false;
+    }
+    let Some(source_building) = buildings.get(&source) else {
+        return false;
+    };
+    can_fulfill_reqs_from_building(source_building, &reqs)
+        && find_route_path_cells(unit.depot, source, buildings, neighbors, ops).is_some()
+        && find_route_path_cells(source, target, buildings, neighbors, ops).is_some()
 }
 
 fn stack_amount(stacks: &[PlanetResourceStack], kind: PlanetResourceKind) -> u32 {
@@ -1133,12 +1170,16 @@ pub fn update_units_and_construction<B: PlanetBuildingAccess>(
                 .construction
                 .and_then(|target| buildings.get(&target).map(|b| b.build_paid()))
                 .unwrap_or(true);
+            let assignment_valid =
+                current_builder_assignment_valid(&units[index], buildings, neighbors, ops);
             let needs_assignment = depot_is_builder
                 && (target_paid
                     || units[index].nodes.construction.is_none()
                     || units[index].nodes.pickup.is_none()
+                    || !assignment_valid
                     || (storage_total(&units[index].cargo) == 0
-                        && units[index].current_cell() == units[index].depot));
+                        && units[index].current_cell() == units[index].depot
+                        && !assignment_valid));
             if needs_assignment {
                 let previous_target = units[index].nodes.construction;
                 let reserved_targets: Vec<u32> = units
@@ -1158,15 +1199,17 @@ pub fn update_units_and_construction<B: PlanetBuildingAccess>(
                     neighbors,
                     ops,
                 ) {
-                    units[index].nodes.construction = Some(new_target);
-                    units[index].nodes.pickup = Some(new_source);
-                    units[index].current_action = None;
-                    units[index].current_target = None;
-                    units[index].path = vec![units[index].current_cell()];
-                    units[index].index = 0;
-                    units[index].progress = 0.0;
-                    units[index].assignment_check_timer = 0.0;
-                    units_dirty = true;
+                    if builder_assignment_changed(&units[index], new_target, new_source) {
+                        units[index].nodes.construction = Some(new_target);
+                        units[index].nodes.pickup = Some(new_source);
+                        units[index].current_action = None;
+                        units[index].current_target = None;
+                        units[index].path = vec![units[index].current_cell()];
+                        units[index].index = 0;
+                        units[index].progress = 0.0;
+                        units[index].assignment_check_timer = 0.0;
+                        units_dirty = true;
+                    }
                 } else if storage_total(&units[index].cargo) == 0
                     && units[index].current_cell() == units[index].depot
                 {
@@ -1244,6 +1287,10 @@ pub fn update_units_and_construction<B: PlanetBuildingAccess>(
                 units[index].assignment_check_timer += dt;
                 if units[index].assignment_check_timer >= 1.0 {
                     units[index].assignment_check_timer = 0.0;
+                    if current_builder_assignment_valid(&units[index], buildings, neighbors, ops) {
+                        index += 1;
+                        continue;
+                    }
                     let previous_target = units[index].nodes.construction;
                     let reserved_targets: Vec<u32> = units
                         .iter()
@@ -1262,14 +1309,16 @@ pub fn update_units_and_construction<B: PlanetBuildingAccess>(
                         neighbors,
                         ops,
                     ) {
-                        units[index].nodes.construction = Some(new_target);
-                        units[index].nodes.pickup = Some(new_source);
-                        units[index].current_action = None;
-                        units[index].current_target = None;
-                        units[index].path = vec![units[index].current_cell()];
-                        units[index].index = 0;
-                        units[index].progress = 0.0;
-                        units_dirty = true;
+                        if builder_assignment_changed(&units[index], new_target, new_source) {
+                            units[index].nodes.construction = Some(new_target);
+                            units[index].nodes.pickup = Some(new_source);
+                            units[index].current_action = None;
+                            units[index].current_target = None;
+                            units[index].path = vec![units[index].current_cell()];
+                            units[index].index = 0;
+                            units[index].progress = 0.0;
+                            units_dirty = true;
+                        }
                     } else {
                         units[index].nodes.construction = None;
                         units[index].nodes.pickup = None;
@@ -1567,6 +1616,91 @@ mod tests {
             &test_ops(),
         );
         assert_eq!(units[0].nodes.construction, Some(3));
+    }
+
+    #[test]
+    fn builder_assignment_selection_is_stable() {
+        let mut buildings: HashMap<u32, TestBuilding> = HashMap::new();
+        let mut builder = make_building(TestKind::Builder);
+        builder.storage.insert(PlanetResourceKind::Stone, 10);
+        buildings.insert(1, builder);
+
+        let mut target_a = make_building(TestKind::Housing);
+        target_a.build_paid = false;
+        target_a.build_progress = 0.0;
+        buildings.insert(3, target_a);
+
+        let mut target_b = make_building(TestKind::Housing);
+        target_b.build_paid = false;
+        target_b.build_progress = 0.0;
+        buildings.insert(2, target_b);
+
+        let neighbors = vec![vec![1], vec![0, 2, 3], vec![1], vec![1]];
+
+        let first = next_builder_assignment(1, &buildings, None, &[], &neighbors, &test_ops());
+        let second = next_builder_assignment(1, &buildings, None, &[], &neighbors, &test_ops());
+
+        assert_eq!(first, Some((2, 1)));
+        assert_eq!(second, first);
+    }
+
+    #[test]
+    fn builder_keeps_same_assignment_without_resetting_path() {
+        let mut buildings: HashMap<u32, TestBuilding> = HashMap::new();
+        let mut builder = make_building(TestKind::Builder);
+        builder.storage.insert(PlanetResourceKind::Stone, 10);
+        buildings.insert(1, builder);
+
+        let mut target = make_building(TestKind::Housing);
+        target.build_paid = false;
+        target.build_progress = 0.0;
+        buildings.insert(2, target);
+
+        let mut unit = unit_for_preset(
+            PlanetUnitPresetId::BuilderSupply,
+            1,
+            PlanetUnitNodeConfig {
+                pickup: Some(1),
+                dropoff: None,
+                refuel: None,
+                construction: Some(2),
+                wait: None,
+            },
+        );
+        unit.current_action = Some(UnitAction::PickupAtNode(UnitNodeSlot::Pickup));
+        unit.current_target = Some(1);
+        unit.path = vec![1, 2];
+        unit.progress = 0.4;
+
+        let mut units = vec![unit];
+        let neighbors = vec![vec![1], vec![0, 2], vec![1]];
+        let grid = HexGrid {
+            freq: 1,
+            vertices: vec![],
+            faces: vec![],
+            face_centers: vec![],
+            vertex_faces: vec![],
+            base_face_buckets: vec![],
+            base_face_neighbors: vec![],
+        };
+
+        let _ = update_units_and_construction(
+            &mut units,
+            &mut buildings,
+            &grid,
+            &neighbors,
+            0.0,
+            &test_ops(),
+        );
+
+        assert_eq!(units[0].nodes.construction, Some(2));
+        assert_eq!(
+            units[0].current_action,
+            Some(UnitAction::PickupAtNode(UnitNodeSlot::Pickup))
+        );
+        assert_eq!(units[0].current_target, Some(1));
+        assert_eq!(units[0].path, vec![1, 2]);
+        assert_eq!(units[0].progress, 0.4);
     }
 
     #[test]

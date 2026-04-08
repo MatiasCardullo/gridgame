@@ -4,34 +4,43 @@ use std::collections::HashMap;
 use std::fs;
 use std::fs::File;
 use std::io::{BufWriter, Write};
-use std::sync::mpsc::{self, Receiver};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::{self, Receiver};
 use std::time::{Instant, SystemTime};
 
-use crate::core::{FrameContext, Scene};
 use crate::core::debug::{
-    draw_planet_controls, format_log_timestamp, planet_perf_log, PLANET_DEBUG_UI_ENABLED_DEFAULT,
-    SAVE_MESH_POINTS_RUNTIME,
+    PLANET_DEBUG_UI_ENABLED_DEFAULT, SAVE_MESH_POINTS_RUNTIME, draw_planet_controls,
+    format_log_timestamp, planet_perf_log,
 };
+use crate::core::map_common::{build_panel_layout, handle_window_drag, is_ui_capturing};
 use crate::core::planet_grid::{
     HexGrid, align_vertices_to_poles, build_faces, build_frequency_geodesic, build_geodesic_sphere,
     build_hex_grid_from_data, build_vertex_neighbors, icosahedron_edges, icosahedron_vertices,
     load_hex_grid_cache, save_hex_grid_cache,
 };
 use crate::core::planet_resources::{
-    PlanetResourceKind, PlanetSimWorld, PlanetSurfaceClass, build_or_load_sim_world,
+    PlanetCellState, PlanetResourceKind, PlanetSimWorld, PlanetSurfaceClass,
+    build_or_load_sim_world,
 };
 use crate::core::planet_texture::{
-    PlanetNoiseConfig, color_from_height, height_value, load_or_build_heightmap, texture_params_match,
+    PlanetNoiseConfig, color_from_height, height_value, load_or_build_heightmap,
+    texture_params_match,
+};
+use crate::core::planet_unit_catalog::{
+    PlanetUnitDefinition, PlanetUnitDefinitionId, unit_definition,
 };
 use crate::core::planet_units::{
-    PlanetBuildingAccess, PlanetResourceStack, PlanetUnit, PlanetUnitNodeConfig, PlanetUnitPresetId,
-    PlanetUnitRecord, PlanetUnitsSnapshot, UnitOps, resource_kind_from_id, resource_kind_to_id,
-    storage_total, unit_for_preset, update_units_and_construction,
+    PlanetBuildingAccess, PlanetResourceStack, PlanetUnit, PlanetUnitNodeConfig,
+    PlanetUnitPresetId, PlanetUnitRecord, PlanetUnitsSnapshot, UnitOps, resource_kind_from_id,
+    resource_kind_to_id, storage_total, unit_for_definition, unit_for_preset,
+    update_units_and_construction,
 };
-use crate::core::ui::{draw_build_panel, draw_window, ui_button, ui_checkbox, WindowState, WindowStyle, WINDOW_TITLE_HEIGHT};
-use crate::core::map_common::{build_panel_layout, handle_window_drag, is_ui_capturing};
+use crate::core::ui::{
+    WINDOW_TITLE_HEIGHT, WindowState, WindowStyle, draw_build_panel, draw_window, ui_button,
+    ui_checkbox,
+};
+use crate::core::{FrameContext, Scene};
 
 const PLANET_DATA_DIR: &str = "planet_data";
 const MESH_POINTS_PATH: &str = "planet_data/planet_mesh_points.csv";
@@ -144,7 +153,11 @@ fn update_debug_camera_rig(rig: &mut DebugCameraRig, frame_time: f32, mouse: Vec
         move_dir -= world_up;
     }
     if move_dir.length_squared() > 0.0 {
-        let boost = if is_key_down(KeyCode::LeftShift) { 3.0 } else { 1.0 };
+        let boost = if is_key_down(KeyCode::LeftShift) {
+            3.0
+        } else {
+            1.0
+        };
         rig.position += move_dir.normalize() * rig.move_speed * boost * frame_time;
     }
     let (_, wheel_y) = mouse_wheel();
@@ -176,7 +189,10 @@ fn draw_camera_frustum(camera: &Camera3D, color: Color, far_visual: f32) {
     let forward = (camera.target - camera.position).normalize_or_zero();
     let right = forward.cross(camera.up).normalize_or_zero();
     let up = right.cross(forward).normalize_or_zero();
-    if forward.length_squared() == 0.0 || right.length_squared() == 0.0 || up.length_squared() == 0.0 {
+    if forward.length_squared() == 0.0
+        || right.length_squared() == 0.0
+        || up.length_squared() == 0.0
+    {
         return;
     }
 
@@ -210,7 +226,11 @@ fn draw_camera_frustum(camera: &Camera3D, color: Color, far_visual: f32) {
     draw_line_3d(ntr, ftr, color);
     draw_line_3d(nbl, fbl, color);
     draw_line_3d(nbr, fbr, color);
-    draw_line_3d(camera.position, near_center, Color::from_rgba(255, 220, 120, 255));
+    draw_line_3d(
+        camera.position,
+        near_center,
+        Color::from_rgba(255, 220, 120, 255),
+    );
 }
 
 // Draws a rectangular prism aligned to a local forward/side/normal basis.
@@ -283,7 +303,6 @@ fn draw_oriented_prism(
     }
 }
 
-
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct PlanetNoiseSnapshot {
     config: PlanetNoiseConfig,
@@ -338,9 +357,7 @@ fn start_hex_grid_build(
     let base_faces = base_faces.to_vec();
     std::thread::spawn(move || {
         let t0 = Instant::now();
-        let grid = if let Some((vertices, faces)) =
-            load_hex_grid_cache(cache_path, freq)
-        {
+        let grid = if let Some((vertices, faces)) = load_hex_grid_cache(cache_path, freq) {
             planet_perf_log(&format!(
                 "hex grid cache loaded path={} freq={} vertices={} faces={} took_ms={}",
                 cache_path,
@@ -717,12 +734,88 @@ fn mine_total_remaining(
     mine_target_cells(cell_index, building)
         .into_iter()
         .filter_map(|target| sim_world.cells.get(target as usize))
-        .filter_map(|cell| cell.deposit.map(|deposit| deposit.remaining_amount))
+        .flat_map(|cell| cell.deposits.iter())
+        .map(|deposit| deposit.remaining_amount)
         .sum()
 }
 
+fn cell_deposit_summary(cell: &PlanetCellState) -> String {
+    if cell.deposits.is_empty() {
+        return "No deposits".to_string();
+    }
+    cell.deposits
+        .iter()
+        .map(|deposit| {
+            format!(
+                "{} {}/{}",
+                resource_label(deposit.kind),
+                deposit.remaining_amount,
+                deposit.initial_amount
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" | ")
+}
+
+fn hover_deposit_summary(cell: &PlanetCellState) -> String {
+    if cell.deposits.is_empty() {
+        return "No deposits".to_string();
+    }
+    cell.deposits
+        .iter()
+        .map(|deposit| {
+            format!(
+                "{} {}/{} grade:{}",
+                resource_label(deposit.kind),
+                deposit.remaining_amount,
+                deposit.initial_amount,
+                deposit.grade_permille
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" | ")
+}
+
+fn mine_resource_totals(
+    sim_world: Option<&PlanetSimWorld>,
+    cell_index: u32,
+    building: &PlanetBuildingState,
+) -> Vec<(PlanetResourceKind, u32)> {
+    let Some(sim_world) = sim_world else {
+        return Vec::new();
+    };
+    let mut totals: HashMap<PlanetResourceKind, u32> = HashMap::new();
+    for target in mine_target_cells(cell_index, building).into_iter() {
+        let Some(cell) = sim_world.cells.get(target as usize) else {
+            continue;
+        };
+        for deposit in cell.deposits.iter() {
+            if deposit.remaining_amount == 0 {
+                continue;
+            }
+            *totals.entry(deposit.kind).or_insert(0) += deposit.remaining_amount;
+        }
+    }
+    let mut totals = totals.into_iter().collect::<Vec<_>>();
+    totals.sort_by_key(|(kind, _)| resource_kind_to_id(*kind));
+    totals
+}
+
+fn shared_deposit_kind(a: &PlanetCellState, b: &PlanetCellState) -> bool {
+    a.deposits.iter().any(|left| {
+        left.remaining_amount > 0
+            && b.deposits
+                .iter()
+                .any(|right| right.remaining_amount > 0 && right.kind == left.kind)
+    })
+}
+
 fn visible_owned_unit_count(units: &[PlanetUnit], depot: u32) -> usize {
-    units.iter().filter(|unit| unit.depot == depot).count().min(6)
+    units
+        .iter()
+        .filter(|unit| unit.depot == depot)
+        .count()
+        .min(6)
 }
 
 fn extra_owned_unit_line_count(units: &[PlanetUnit], depot: u32) -> usize {
@@ -740,6 +833,37 @@ fn builder_unit_action_text(unit: &PlanetUnit) -> String {
         .map(|target| target.to_string())
         .unwrap_or_else(|| "-".to_string());
     format!("{action} -> {target}")
+}
+
+fn unit_parts_summary(definition: &PlanetUnitDefinition) -> String {
+    definition
+        .required_parts
+        .iter()
+        .map(|part| {
+            if part.amount > 1 {
+                format!("{}x {}", part.amount, part.item_id.label())
+            } else {
+                part.item_id.label().to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn unit_attachments_summary(definition: &PlanetUnitDefinition) -> String {
+    if definition.supported_attachments.is_empty() {
+        "Attachments: fixed".to_string()
+    } else {
+        format!(
+            "Attachments: {}",
+            definition
+                .supported_attachments
+                .iter()
+                .map(|attachment| attachment.label())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    }
 }
 
 fn builder_unit_debug_state(unit: &PlanetUnit) -> BuilderUnitDebugState {
@@ -788,8 +912,8 @@ fn info_window_height_for_building(
                 .sim_world
                 .as_ref()
                 .and_then(|world| world.cells.get(cell_index as usize))
-                .and_then(|cell| cell.deposit)
-                .is_some()
+                .map(|cell| !cell.deposits.is_empty())
+                .unwrap_or(false)
             {
                 content_height += 18.0 + 24.0;
             }
@@ -874,16 +998,15 @@ fn expandable_mine_cells(
     cell_index: u32,
     building: &PlanetBuildingState,
 ) -> Vec<u32> {
-    let Some(base_kind) = sim_world
-        .cells
-        .get(cell_index as usize)
-        .and_then(|cell| cell.deposit)
-        .map(|deposit| deposit.kind)
-    else {
+    let Some(base_cell) = sim_world.cells.get(cell_index as usize) else {
         return Vec::new();
     };
+    if base_cell.deposits.is_empty() {
+        return Vec::new();
+    }
 
-    let mut existing: std::collections::HashSet<u32> = building.mine_extra.iter().copied().collect();
+    let mut existing: std::collections::HashSet<u32> =
+        building.mine_extra.iter().copied().collect();
     existing.insert(cell_index);
     let mut to_add = Vec::new();
     for current in existing.iter().copied() {
@@ -897,8 +1020,7 @@ fn expandable_mine_cells(
             let matches_kind = sim_world
                 .cells
                 .get(neighbor as usize)
-                .and_then(|cell| cell.deposit)
-                .map(|deposit| deposit.kind == base_kind)
+                .map(|cell| shared_deposit_kind(base_cell, cell))
                 .unwrap_or(false);
             if matches_kind {
                 to_add.push(neighbor);
@@ -1386,6 +1508,10 @@ impl PlanetState {
             self.units.push(PlanetUnit {
                 depot: record.depot,
                 preset_id: record.preset_id,
+                definition_id: record.definition_id.unwrap_or_else(|| {
+                    unit_for_preset(record.preset_id, record.depot, record.nodes.clone())
+                        .definition_id
+                }),
                 behavior: record.behavior,
                 nodes: record.nodes,
                 path: record.path,
@@ -1418,6 +1544,7 @@ impl PlanetState {
                 .map(|unit| PlanetUnitRecord {
                     depot: unit.depot,
                     preset_id: unit.preset_id,
+                    definition_id: Some(unit.definition_id),
                     behavior: unit.behavior.clone(),
                     nodes: unit.nodes.clone(),
                     index: unit.index,
@@ -1452,8 +1579,11 @@ impl PlanetState {
             (PlanetBuildingKind::Mine, Some(world)) => world
                 .cells
                 .get(cell_index as usize)
-                .and_then(|cell| cell.deposit)
-                .map(|deposit| deposit.remaining_amount > 0)
+                .map(|cell| {
+                    cell.deposits
+                        .iter()
+                        .any(|deposit| deposit.remaining_amount > 0)
+                })
                 .unwrap_or(false),
             _ => true,
         }
@@ -1622,7 +1752,10 @@ impl PlanetState {
                             )
                             && reqs.iter().all(|req| {
                                 resource_kind_from_id(req.resource_id)
-                                    .map(|kind| building.storage.get(&kind).copied().unwrap_or(0) >= req.amount)
+                                    .map(|kind| {
+                                        building.storage.get(&kind).copied().unwrap_or(0)
+                                            >= req.amount
+                                    })
                                     .unwrap_or(false)
                             })
                     })
@@ -1658,7 +1791,9 @@ impl PlanetState {
             .buildings
             .iter()
             .filter_map(|(cell_index, building)| {
-                if building.kind == PlanetBuildingKind::Mine && !planet_is_under_construction(building) {
+                if building.kind == PlanetBuildingKind::Mine
+                    && !planet_is_under_construction(building)
+                {
                     Some(*cell_index)
                 } else {
                     None
@@ -1681,20 +1816,19 @@ impl PlanetState {
             let mut remaining_units = units;
             let mut extracted_total = 0u32;
             while remaining_units > 0 {
-                let Some((target_cell, resource_kind)) = self
-                    .sim_world
-                    .as_ref()
-                    .and_then(|sim_world| {
-                        targets.iter().find_map(|target| {
-                            sim_world
-                                .cells
-                                .get(*target as usize)
-                                .and_then(|cell| cell.deposit)
-                                .filter(|deposit| deposit.remaining_amount > 0)
-                                .map(|deposit| (*target, deposit.kind))
-                        })
+                let Some(target_cell) = self.sim_world.as_ref().and_then(|sim_world| {
+                    targets.iter().find_map(|target| {
+                        sim_world
+                            .cells
+                            .get(*target as usize)
+                            .filter(|cell| {
+                                cell.deposits
+                                    .iter()
+                                    .any(|deposit| deposit.remaining_amount > 0)
+                            })
+                            .map(|_| *target)
                     })
-                else {
+                }) else {
                     break;
                 };
                 let available = self.storage_space_left(cell_index);
@@ -1706,16 +1840,24 @@ impl PlanetState {
                     .sim_world
                     .as_mut()
                     .map(|sim_world| sim_world.extract_from_cell(target_cell, to_extract))
-                    .unwrap_or(0);
-                if mined == 0 {
+                    .unwrap_or_default();
+                if mined.is_empty() {
                     break;
                 }
-                let stored = self.push_to_building_storage(cell_index, resource_kind, mined);
-                if stored == 0 {
+                let mut stored_total = 0u32;
+                for (resource_kind, mined_amount) in mined.into_iter() {
+                    let stored =
+                        self.push_to_building_storage(cell_index, resource_kind, mined_amount);
+                    stored_total += stored;
+                    if stored < mined_amount {
+                        break;
+                    }
+                }
+                if stored_total == 0 {
                     break;
                 }
-                extracted_total += stored;
-                remaining_units = remaining_units.saturating_sub(stored);
+                extracted_total += stored_total;
+                remaining_units = remaining_units.saturating_sub(stored_total);
             }
             progress -= extracted_total as f32;
             self.mine_progress.insert(cell_index, progress);
@@ -1869,8 +2011,8 @@ impl PlanetState {
         let relief_key = ReliefCacheKey::from_config(&config, self.config.subdivisions);
         let texture_size = HEIGHTMAP_SIZE;
         let regen_generation = Arc::clone(&self.regen_generation);
-        let refresh_texture =
-            !texture_params_match(&self.texture_config, &config) || self.heightmap_texture.is_none();
+        let refresh_texture = !texture_params_match(&self.texture_config, &config)
+            || self.heightmap_texture.is_none();
 
         if self.relief_cache.contains_key(&relief_key) {
             planet_perf_log(&format!(
@@ -1970,15 +2112,16 @@ impl PlanetState {
                     }
                     let local_end = (local_start + REGEN_FACE_GRAIN).min(end);
                     let slice = &faces[local_start..local_end];
-                    let (mesh_data, face_normals, sector_values) = build_planet_chunk_data_for_faces(
-                        &base_vertices,
-                        slice,
-                        subdivisions,
-                        1.6,
-                        &config,
-                        true,
-                        false,
-                    );
+                    let (mesh_data, face_normals, sector_values) =
+                        build_planet_chunk_data_for_faces(
+                            &base_vertices,
+                            slice,
+                            subdivisions,
+                            1.6,
+                            &config,
+                            true,
+                            false,
+                        );
                     if regen_generation.load(Ordering::Relaxed) != version {
                         return;
                     }
@@ -2007,7 +2150,11 @@ impl PlanetState {
         while let Ok(message) = rx.try_recv() {
             received_any = true;
             match message {
-                RegenMessage::Texture { version, pixels, size } => {
+                RegenMessage::Texture {
+                    version,
+                    pixels,
+                    size,
+                } => {
                     if version != self.regen_version {
                         continue;
                     }
@@ -2100,9 +2247,7 @@ impl PlanetLoader {
     pub fn start() -> Self {
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
-            let mut log_file = File::create("loading.log")
-                .ok()
-                .map(BufWriter::new);
+            let mut log_file = File::create("loading.log").ok().map(BufWriter::new);
             let total_steps: u32 = 5;
             let mut done_steps: u32 = 0;
 
@@ -2455,7 +2600,6 @@ fn clone_meshes(meshes: &[Mesh]) -> Vec<Mesh> {
     meshes.iter().map(clone_mesh).collect()
 }
 
-
 // Builds mesh data for a set of triangle faces.
 fn build_planet_chunk_data_for_faces(
     base_vertices: &[Vec3],
@@ -2801,7 +2945,11 @@ fn draw_sim_buildings(
             let plate_center_ix = vertices.len() as u16;
             vertices.push(Vertex::new2(plate_center, vec2(0.0, 0.0), route_base_color));
             for dir in outer_dirs.iter() {
-                vertices.push(Vertex::new2(*dir * route_radius, vec2(0.0, 0.0), route_base_color));
+                vertices.push(Vertex::new2(
+                    *dir * route_radius,
+                    vec2(0.0, 0.0),
+                    route_base_color,
+                ));
             }
             for i in 0..sides {
                 let a = plate_center_ix + 1 + i as u16;
@@ -2811,7 +2959,8 @@ fn draw_sim_buildings(
 
             // Build flat rectangular strips toward neighboring occupied cells.
             let mut neighbors: Vec<u32> = Vec::new();
-            let mut seen_neighbors: std::collections::HashSet<u32> = std::collections::HashSet::new();
+            let mut seen_neighbors: std::collections::HashSet<u32> =
+                std::collections::HashSet::new();
             for &face_index in face_list.iter() {
                 let Some(face) = visual_grid.faces.get(face_index as usize) else {
                     continue;
@@ -2825,7 +2974,9 @@ fn draw_sim_buildings(
                     }
                     if let Some(neighbor_building) = buildings.get(&candidate) {
                         // Avoid duplicate strip for route-route pairs.
-                        if neighbor_building.kind == PlanetBuildingKind::Route && candidate < *cell_index {
+                        if neighbor_building.kind == PlanetBuildingKind::Route
+                            && candidate < *cell_index
+                        {
                             continue;
                         }
                         neighbors.push(candidate);
@@ -2844,7 +2995,8 @@ fn draw_sim_buildings(
                 let end = neighbor_dir * route_radius;
                 let strip_mid_dir = (vertex_dir + neighbor_dir).normalize();
                 let strip_forward = (end - start).normalize();
-                let strip_forward = (strip_forward - strip_mid_dir * strip_forward.dot(strip_mid_dir)).normalize();
+                let strip_forward =
+                    (strip_forward - strip_mid_dir * strip_forward.dot(strip_mid_dir)).normalize();
                 if strip_forward.length() < 1e-6 {
                     continue;
                 }
@@ -3002,7 +3154,14 @@ fn draw_selected_unit_overlay(
 
     let mut highlighted_stations = std::collections::HashSet::new();
     for unit in owned_units.iter().copied() {
-        draw_projected_path(camera, sim_grid, &unit.path, overlay_radius, route_color, 2.0);
+        draw_projected_path(
+            camera,
+            sim_grid,
+            &unit.path,
+            overlay_radius,
+            route_color,
+            2.0,
+        );
 
         let current_index = unit.index.min(unit.path.len().saturating_sub(1));
         let next_index = (current_index + 1).min(unit.path.len().saturating_sub(1));
@@ -3032,7 +3191,11 @@ fn draw_selected_unit_overlay(
             }
         }
 
-        if let Some(cell) = unit.nodes.pickup.filter(|cell| highlighted_stations.insert(*cell)) {
+        if let Some(cell) = unit
+            .nodes
+            .pickup
+            .filter(|cell| highlighted_stations.insert(*cell))
+        {
             let _ = draw_global_hex_cell(
                 sim_grid,
                 camera,
@@ -3045,7 +3208,11 @@ fn draw_selected_unit_overlay(
                 None,
             );
         }
-        if let Some(cell) = unit.nodes.dropoff.filter(|cell| highlighted_stations.insert(*cell)) {
+        if let Some(cell) = unit
+            .nodes
+            .dropoff
+            .filter(|cell| highlighted_stations.insert(*cell))
+        {
             let _ = draw_global_hex_cell(
                 sim_grid,
                 camera,
@@ -3058,7 +3225,11 @@ fn draw_selected_unit_overlay(
                 None,
             );
         }
-        if let Some(cell) = unit.nodes.refuel.filter(|cell| highlighted_stations.insert(*cell)) {
+        if let Some(cell) = unit
+            .nodes
+            .refuel
+            .filter(|cell| highlighted_stations.insert(*cell))
+        {
             let _ = draw_global_hex_cell(
                 sim_grid,
                 camera,
@@ -3089,7 +3260,6 @@ fn draw_selected_unit_overlay(
             );
         }
     }
-
 }
 
 fn hovered_hex_vertex(hex_grid: &HexGrid, hover_dir: Vec3, base_face_index: usize) -> Option<u32> {
@@ -3349,11 +3519,7 @@ fn ray_sphere_intersection(origin: Vec3, dir: Vec3, radius: f32) -> Option<Vec3>
 }
 
 // Finds the face whose normal most aligns with the hit direction.
-fn hovered_face(
-    hit_point: Vec3,
-    faces: &[[usize; 3]],
-    vertices: &[Vec3],
-) -> Option<usize> {
+fn hovered_face(hit_point: Vec3, faces: &[[usize; 3]], vertices: &[Vec3]) -> Option<usize> {
     let dir = hit_point.normalize();
     let mut best: Option<(f32, usize)> = None;
     for (index, face) in faces.iter().enumerate() {
@@ -3402,7 +3568,7 @@ fn greek_face_letter(face_index: usize) -> char {
         19 => 'υ',
         20 => 'φ',
         21 => 'ψ',
-        _ => 'Ω'
+        _ => 'Ω',
     }
 }
 
@@ -3565,7 +3731,11 @@ fn zoom_to_subdivisions_hysteresis(distance: f32, current: u8) -> u8 {
     let h = SUBDIVISION_HYSTERESIS;
     match current {
         5 => {
-            if distance > 4.0 + h { 4 } else { 5 }
+            if distance > 4.0 + h {
+                4
+            } else {
+                5
+            }
         }
         4 => {
             if distance < 4.0 - h {
@@ -3595,7 +3765,11 @@ fn zoom_to_subdivisions_hysteresis(distance: f32, current: u8) -> u8 {
             }
         }
         1 => {
-            if distance < 9.0 - h { 2 } else { 1 }
+            if distance < 9.0 - h {
+                2
+            } else {
+                1
+            }
         }
         _ => zoom_to_subdivisions(distance),
     }
@@ -3650,23 +3824,18 @@ pub fn run(
             state.sim_grid = Some(result.grid);
             planet_perf_log(&format!(
                 "sim grid metrics min_cell_edge_dist_unit={:.7} took_ms={}",
-                state.min_cell_edge_dist_unit,
-                result.took_ms
+                state.min_cell_edge_dist_unit, result.took_ms
             ));
             if result.generation == state.sim_world_generation {
                 state.sim_world = Some(result.world);
                 planet_perf_log(&format!(
                     "sim world ready freq={} cells={} generation={} took_ms={}",
-                    freq,
-                    cell_count,
-                    result.generation,
-                    result.took_ms
+                    freq, cell_count, result.generation, result.took_ms
                 ));
             } else {
                 planet_perf_log(&format!(
                     "sim world stale ignored built_generation={} expected_generation={}",
-                    result.generation,
-                    state.sim_world_generation
+                    result.generation, state.sim_world_generation
                 ));
             }
         }
@@ -3686,9 +3855,7 @@ pub fn run(
             ));
             planet_perf_log(&format!(
                 "sim world build started freq={} cells={} generation={}",
-                freq,
-                cell_count,
-                generation
+                freq, cell_count, generation
             ));
         }
     }
@@ -3803,9 +3970,11 @@ pub fn run(
 
     let (_wx, wy) = mouse_wheel();
     if !state.debug_camera.enabled && wy.abs() > 0.001 {
-        state.target_distance = (state.target_distance - wy * 0.001 * state.target_distance).clamp(1.8, 100.0);
+        state.target_distance =
+            (state.target_distance - wy * 0.001 * state.target_distance).clamp(1.8, 100.0);
     }
-    state.distance += (state.target_distance - state.distance) * (0.01 * state.distance).clamp(0.05, 100.0);
+    state.distance +=
+        (state.target_distance - state.distance) * (0.01 * state.distance).clamp(0.05, 100.0);
     let desired_subdivisions =
         zoom_to_subdivisions_hysteresis(state.distance, state.config.subdivisions);
     if state.show_relief && desired_subdivisions != state.config.subdivisions {
@@ -3836,8 +4005,7 @@ pub fn run(
     }
     let rot_delta = 1.0 - state.camera_rot.dot(state.target_rot).abs();
     state.camera_rot = state.camera_rot.slerp(state.target_rot, 0.12);
-    let camera_animating =
-        state.dragging
+    let camera_animating = state.dragging
         || wy.abs() > 0.01
         || (state.target_distance - state.distance).abs() > 0.02
         || rot_delta > 0.001;
@@ -3912,7 +4080,7 @@ pub fn run(
         let far_visual = (state.distance * 1.8).clamp(4.0, 40.0);
         draw_camera_frustum(&orbit_camera, frustum_color, far_visual);
     }
-    
+
     let vertices = state.sector_vertices.clone();
     let base_vertices = state.base_vertices.clone();
     let edges = icosahedron_edges();
@@ -3934,7 +4102,13 @@ pub fn run(
     }
 
     for (a, b) in edges.iter().copied() {
-        draw_arc_on_sphere(projected_base[a], projected_base[b], line_radius, segments, edge_color);
+        draw_arc_on_sphere(
+            projected_base[a],
+            projected_base[b],
+            line_radius,
+            segments,
+            edge_color,
+        );
     }
 
     let use_subface_hover = state.distance <= SUBFACE_HOVER_MAX_DISTANCE;
@@ -3943,18 +4117,20 @@ pub fn run(
     let mut hover_hit: Option<Vec3> = None;
     let mut hovered_cell: Option<u32> = None;
     if !state.debug_camera.enabled {
-    if let Some((origin, dir)) = ray_from_mouse(&active_camera, mouse) {
-        if let Some(hit) = ray_sphere_intersection(origin, dir, radius) {
-            hover_hit = Some(hit);
-            hovered_base_face = hovered_face(hit, &base_faces, &base_vertices);
-            if use_subface_hover {
-                hovered_subface = hovered_face(hit, &faces, &vertices);
-            }
-            if let (Some(sim_grid), Some(base_face)) = (state.sim_grid.as_ref(), hovered_base_face) {
-                hovered_cell = hovered_hex_vertex(sim_grid, hit.normalize(), base_face);
+        if let Some((origin, dir)) = ray_from_mouse(&active_camera, mouse) {
+            if let Some(hit) = ray_sphere_intersection(origin, dir, radius) {
+                hover_hit = Some(hit);
+                hovered_base_face = hovered_face(hit, &base_faces, &base_vertices);
+                if use_subface_hover {
+                    hovered_subface = hovered_face(hit, &faces, &vertices);
+                }
+                if let (Some(sim_grid), Some(base_face)) =
+                    (state.sim_grid.as_ref(), hovered_base_face)
+                {
+                    hovered_cell = hovered_hex_vertex(sim_grid, hit.normalize(), base_face);
+                }
             }
         }
-    }
     }
     if let Some(face_index) = hovered_base_face {
         let face = base_faces[face_index];
@@ -3988,8 +4164,12 @@ pub fn run(
     ];
     let panel_layout = build_panel_layout(panel_buttons.len(), state.panel_collapsed);
     sync_info_window_layout(state);
-    let ui_capturing =
-        is_ui_capturing(panel_layout.rect, &state.info_window, &state.confirm_window, mouse);
+    let ui_capturing = is_ui_capturing(
+        panel_layout.rect,
+        &state.info_window,
+        &state.confirm_window,
+        mouse,
+    );
     let show_hover_grid = hovered_cell.is_some();
     if !state.debug_camera.enabled && is_mouse_button_pressed(MouseButton::Left) && !ui_capturing {
         if let Some(cell_index) = hovered_cell {
@@ -3997,7 +4177,9 @@ pub fn run(
                 if let Some(building) = state.buildings.get(&cell_index) {
                     let can_pick = match pick {
                         UnitNodePick::Construction => true,
-                        UnitNodePick::Pickup | UnitNodePick::Dropoff => !planet_is_under_construction(building),
+                        UnitNodePick::Pickup | UnitNodePick::Dropoff => {
+                            !planet_is_under_construction(building)
+                        }
                         UnitNodePick::Refuel => {
                             !planet_is_under_construction(building)
                                 && building.kind == PlanetBuildingKind::Refuel
@@ -4068,7 +4250,11 @@ pub fn run(
             let Some(b) = sim_grid.vertices.get(unit.path[next_index] as usize) else {
                 continue;
             };
-            let t = if next_index == current_index { 0.0 } else { unit.progress.clamp(0.0, 1.0) };
+            let t = if next_index == current_index {
+                0.0
+            } else {
+                unit.progress.clamp(0.0, 1.0)
+            };
             let dir = a.lerp(*b, t).normalize_or_zero();
             let unit_lift = 0.0035 + 0.0005 + unit_height * 0.5 + 0.0002;
             let world = dir * (radius + unit_lift);
@@ -4215,7 +4401,7 @@ pub fn run(
             ctx.colors_rt.text_primary,
         );
     }
-    let mut spawn_request: Option<(u32, PlanetUnitPresetId, PlanetUnitNodeConfig)> = None;
+    let mut spawn_request: Option<(u32, PlanetUnitDefinitionId, PlanetUnitNodeConfig)> = None;
     let mut expand_mine_request: Option<u32> = None;
     if state.info_window.open {
         handle_window_drag(&mut state.info_window, mouse);
@@ -4270,11 +4456,14 @@ pub fn run(
                                 ctx.colors_rt.text_secondary,
                             );
                             ty += 20.0;
-                            let dep = cell
-                                .deposit
-                                .map(|d| format!("{} {}/{}", resource_label(d.kind), d.remaining_amount, d.initial_amount))
-                                .unwrap_or_else(|| "No deposit".to_string());
-                            draw_text(&dep, tx, ty, ctx.font_sm, ctx.colors_rt.text_secondary);
+                            let deposit_summary = cell_deposit_summary(cell);
+                            draw_text(
+                                &deposit_summary,
+                                tx,
+                                ty,
+                                ctx.font_sm,
+                                ctx.colors_rt.text_secondary,
+                            );
                             ty += 26.0;
                         }
                     }
@@ -4301,8 +4490,9 @@ pub fn run(
                             let mut req_lines: Vec<String> = reqs
                                 .iter()
                                 .filter_map(|req| {
-                                    resource_kind_from_id(req.resource_id)
-                                        .map(|kind| format!("{} {}", resource_label(kind), req.amount))
+                                    resource_kind_from_id(req.resource_id).map(|kind| {
+                                        format!("{} {}", resource_label(kind), req.amount)
+                                    })
                                 })
                                 .collect();
                             req_lines.sort();
@@ -4355,7 +4545,13 @@ pub fn run(
                     );
                     ty += 20.0;
                     if storage_lines.is_empty() {
-                        draw_text("Stored: empty", tx, ty, ctx.font_sm, ctx.colors_rt.text_secondary);
+                        draw_text(
+                            "Stored: empty",
+                            tx,
+                            ty,
+                            ctx.font_sm,
+                            ctx.colors_rt.text_secondary,
+                        );
                         ty += 22.0;
                     } else {
                         draw_text(
@@ -4385,17 +4581,29 @@ pub fn run(
                             ty += 30.0;
                         }
                         PlanetBuildingKind::Mine => {
-                            if let Some(deposit) = state
-                                .sim_world
-                                .as_ref()
-                                .and_then(|world| world.cells.get(cell_index as usize))
-                                .and_then(|cell| cell.deposit)
-                            {
-                                let total_remaining =
-                                    mine_total_remaining(state.sim_world.as_ref(), cell_index, building);
+                            let resource_totals = mine_resource_totals(
+                                state.sim_world.as_ref(),
+                                cell_index,
+                                building,
+                            );
+                            if !resource_totals.is_empty() {
+                                let total_remaining = mine_total_remaining(
+                                    state.sim_world.as_ref(),
+                                    cell_index,
+                                    building,
+                                );
                                 let zones = 1 + building.mine_extra.len();
                                 draw_text(
-                                    &format!("Resource: {}", resource_label(deposit.kind)),
+                                    &format!(
+                                        "Resources: {}",
+                                        resource_totals
+                                            .iter()
+                                            .map(|(kind, amount)| {
+                                                format!("{} {}", resource_label(*kind), amount)
+                                            })
+                                            .collect::<Vec<_>>()
+                                            .join(" | ")
+                                    ),
                                     tx,
                                     ty,
                                     ctx.font_sm,
@@ -4449,11 +4657,29 @@ pub fn run(
                                     Some(c) => format!("Refuel: {}", c),
                                     None => "Refuel: (none)".to_string(),
                                 };
-                                draw_text(&pickup_text, tx, ty, ctx.font_sm, ctx.colors_rt.text_secondary);
+                                draw_text(
+                                    &pickup_text,
+                                    tx,
+                                    ty,
+                                    ctx.font_sm,
+                                    ctx.colors_rt.text_secondary,
+                                );
                                 ty += 18.0;
-                                draw_text(&dropoff_text, tx, ty, ctx.font_sm, ctx.colors_rt.text_secondary);
+                                draw_text(
+                                    &dropoff_text,
+                                    tx,
+                                    ty,
+                                    ctx.font_sm,
+                                    ctx.colors_rt.text_secondary,
+                                );
                                 ty += 18.0;
-                                draw_text(&refuel_text, tx, ty, ctx.font_sm, ctx.colors_rt.text_secondary);
+                                draw_text(
+                                    &refuel_text,
+                                    tx,
+                                    ty,
+                                    ctx.font_sm,
+                                    ctx.colors_rt.text_secondary,
+                                );
                                 ty += 22.0;
 
                                 let rect_pickup = Rect::new(tx, ty, 80.0, 26.0);
@@ -4491,18 +4717,18 @@ pub fn run(
                                 }
                                 ty += 34.0;
 
-                                let rect_hauler = Rect::new(tx, ty, 120.0, 28.0);
-                                let rect_shuttle = Rect::new(tx + 130.0, ty, 120.0, 28.0);
+                                let rect_hauler = Rect::new(tx, ty, 150.0, 28.0);
+                                let rect_shuttle = Rect::new(tx + 160.0, ty, 150.0, 28.0);
                                 let (clicked_hauler, _) = ui_button(
                                     rect_hauler,
-                                    "New Hauler",
+                                    "Cargo Hauler",
                                     mouse,
                                     ctx.font_sm,
                                     ctx.button_colors,
                                 );
                                 let (clicked_shuttle, _) = ui_button(
                                     rect_shuttle,
-                                    "New Shuttle",
+                                    "Site Shuttle",
                                     mouse,
                                     ctx.font_sm,
                                     ctx.button_colors,
@@ -4511,14 +4737,14 @@ pub fn run(
                                     if let (Some(pickup), Some(dropoff)) =
                                         (state.spawn_pickup_node, state.spawn_dropoff_node)
                                     {
-                                        let preset = if clicked_hauler {
-                                            PlanetUnitPresetId::Hauler
+                                        let definition_id = if clicked_hauler {
+                                            PlanetUnitDefinitionId::CargoHauler
                                         } else {
-                                            PlanetUnitPresetId::Shuttle
+                                            PlanetUnitDefinitionId::SiteShuttle
                                         };
                                         spawn_request = Some((
                                             cell_index,
-                                            preset,
+                                            definition_id,
                                             PlanetUnitNodeConfig {
                                                 pickup: Some(pickup),
                                                 dropoff: Some(dropoff),
@@ -4530,6 +4756,52 @@ pub fn run(
                                     }
                                 }
                                 ty += 34.0;
+
+                                let hauler_definition =
+                                    unit_definition(PlanetUnitDefinitionId::CargoHauler);
+                                draw_text(
+                                    &format!(
+                                        "{} | {}",
+                                        hauler_definition.item_id.label(),
+                                        hauler_definition.category.label()
+                                    ),
+                                    tx,
+                                    ty,
+                                    ctx.font_sm,
+                                    ctx.colors_rt.text_secondary,
+                                );
+                                ty += 18.0;
+                                draw_text(
+                                    &unit_parts_summary(hauler_definition),
+                                    tx,
+                                    ty,
+                                    ctx.font_sm,
+                                    ctx.colors_rt.text_secondary,
+                                );
+                                ty += 18.0;
+
+                                let shuttle_definition =
+                                    unit_definition(PlanetUnitDefinitionId::SiteShuttle);
+                                draw_text(
+                                    &format!(
+                                        "{} | {}",
+                                        shuttle_definition.item_id.label(),
+                                        shuttle_definition.category.label()
+                                    ),
+                                    tx,
+                                    ty,
+                                    ctx.font_sm,
+                                    ctx.colors_rt.text_secondary,
+                                );
+                                ty += 18.0;
+                                draw_text(
+                                    &unit_parts_summary(shuttle_definition),
+                                    tx,
+                                    ty,
+                                    ctx.font_sm,
+                                    ctx.colors_rt.text_secondary,
+                                );
+                                ty += 22.0;
 
                                 let label = if state.info_window.show_units {
                                     "Hide list"
@@ -4570,12 +4842,18 @@ pub fn run(
                                         let info = format!(
                                             "#{} {} {}% {}/{}",
                                             index + 1,
-                                            unit.preset_id.label(),
+                                            unit.label(),
                                             (unit.fuel_ratio() * 100.0).round() as i32,
                                             total,
                                             unit.capacity
                                         );
-                                        draw_text(&info, tx, ty, ctx.font_sm, ctx.colors_rt.text_secondary);
+                                        draw_text(
+                                            &info,
+                                            tx,
+                                            ty,
+                                            ctx.font_sm,
+                                            ctx.colors_rt.text_secondary,
+                                        );
                                         ty += 18.0;
                                     }
                                     if total_units > 6 {
@@ -4656,11 +4934,29 @@ pub fn run(
                                     Some(a) => format!("Refuel: {}", a),
                                     None => "Refuel: (none)".to_string(),
                                 };
-                                draw_text(&source_text, tx, ty, ctx.font_sm, ctx.colors_rt.text_secondary);
+                                draw_text(
+                                    &source_text,
+                                    tx,
+                                    ty,
+                                    ctx.font_sm,
+                                    ctx.colors_rt.text_secondary,
+                                );
                                 ty += 18.0;
-                                draw_text(&target_text, tx, ty, ctx.font_sm, ctx.colors_rt.text_secondary);
+                                draw_text(
+                                    &target_text,
+                                    tx,
+                                    ty,
+                                    ctx.font_sm,
+                                    ctx.colors_rt.text_secondary,
+                                );
                                 ty += 18.0;
-                                draw_text(&refuel_text, tx, ty, ctx.font_sm, ctx.colors_rt.text_secondary);
+                                draw_text(
+                                    &refuel_text,
+                                    tx,
+                                    ty,
+                                    ctx.font_sm,
+                                    ctx.colors_rt.text_secondary,
+                                );
                                 ty += 22.0;
 
                                 let rect_source = Rect::new(tx, ty, 80.0, 26.0);
@@ -4701,7 +4997,7 @@ pub fn run(
                                 let rect_spawn = Rect::new(tx, ty, 160.0, 28.0);
                                 let (clicked_spawn, _) = ui_button(
                                     rect_spawn,
-                                    "New Builder Unit",
+                                    "Builder Tender",
                                     mouse,
                                     ctx.font_sm,
                                     ctx.button_colors,
@@ -4713,7 +5009,7 @@ pub fn run(
                                     {
                                         spawn_request = Some((
                                             cell_index,
-                                            PlanetUnitPresetId::BuilderSupply,
+                                            PlanetUnitDefinitionId::BuilderTender,
                                             PlanetUnitNodeConfig {
                                                 pickup: Some(source),
                                                 dropoff: None,
@@ -4725,6 +5021,37 @@ pub fn run(
                                     }
                                 }
                                 ty += 34.0;
+
+                                let builder_definition =
+                                    unit_definition(PlanetUnitDefinitionId::BuilderTender);
+                                draw_text(
+                                    &format!(
+                                        "{} | {}",
+                                        builder_definition.item_id.label(),
+                                        builder_definition.category.label()
+                                    ),
+                                    tx,
+                                    ty,
+                                    ctx.font_sm,
+                                    ctx.colors_rt.text_secondary,
+                                );
+                                ty += 18.0;
+                                draw_text(
+                                    &unit_parts_summary(builder_definition),
+                                    tx,
+                                    ty,
+                                    ctx.font_sm,
+                                    ctx.colors_rt.text_secondary,
+                                );
+                                ty += 18.0;
+                                draw_text(
+                                    &unit_attachments_summary(builder_definition),
+                                    tx,
+                                    ty,
+                                    ctx.font_sm,
+                                    ctx.colors_rt.text_secondary,
+                                );
+                                ty += 22.0;
 
                                 let label = if state.info_window.show_units {
                                     "Hide list"
@@ -4745,7 +5072,11 @@ pub fn run(
                                 ty += 30.0;
 
                                 if state.info_window.show_units {
-                                    let total_units = state.units.iter().filter(|unit| unit.depot == cell_index).count();
+                                    let total_units = state
+                                        .units
+                                        .iter()
+                                        .filter(|unit| unit.depot == cell_index)
+                                        .count();
                                     draw_text(
                                         &format!("Units: {}", total_units),
                                         tx,
@@ -4771,7 +5102,13 @@ pub fn run(
                                             unit.capacity,
                                             unit.current_cell(),
                                         );
-                                        draw_text(&info, tx, ty, ctx.font_sm, ctx.colors_rt.text_secondary);
+                                        draw_text(
+                                            &info,
+                                            tx,
+                                            ty,
+                                            ctx.font_sm,
+                                            ctx.colors_rt.text_secondary,
+                                        );
                                         ty += 18.0;
                                     }
                                     if total_units > 6 {
@@ -4836,10 +5173,11 @@ pub fn run(
     if let Some(cell_index) = expand_mine_request {
         let _ = state.expand_mine_area(cell_index);
     }
-    if let Some((depot, preset_id, nodes)) = spawn_request {
-        let unit = unit_for_preset(preset_id, depot, nodes);
-        state.units.push(unit);
-        state.units_dirty = true;
+    if let Some((depot, definition_id, nodes)) = spawn_request {
+        if let Some(unit) = unit_for_definition(definition_id, depot, nodes) {
+            state.units.push(unit);
+            state.units_dirty = true;
+        }
     }
     if state.confirm_window.open {
         handle_window_drag(&mut state.confirm_window, mouse);
@@ -4952,17 +5290,7 @@ pub fn run(
                     ..Default::default()
                 },
             );
-            let deposit_text = if let Some(deposit) = cell.deposit {
-                format!(
-                    "{} {}/{} grade:{}",
-                    resource_label(deposit.kind),
-                    deposit.remaining_amount,
-                    deposit.initial_amount,
-                    deposit.grade_permille
-                )
-            } else {
-                "No deposit".to_string()
-            };
+            let deposit_text = hover_deposit_summary(cell);
             draw_text_ex(
                 &deposit_text,
                 20.0,
@@ -5015,13 +5343,13 @@ mod tests {
         }
     }
 
-    fn test_cell(deposit: Option<PlanetDeposit>) -> PlanetCellState {
+    fn test_cell(deposits: Vec<PlanetDeposit>) -> PlanetCellState {
         PlanetCellState {
             surface: PlanetSurfaceClass::Land,
             height: 0.0,
             slope: 0.0,
             lithology: LithologyKind::Clastic,
-            deposit,
+            deposits,
             buildable: true,
         }
     }
@@ -5030,18 +5358,18 @@ mod tests {
     fn mine_total_remaining_sums_center_and_expanded_cells() {
         let building = test_building();
         let sim_world = sim_world_for_tests(vec![
-            test_cell(Some(PlanetDeposit {
+            test_cell(vec![PlanetDeposit {
                 kind: PlanetResourceKind::Iron,
                 initial_amount: 12,
                 remaining_amount: 9,
                 grade_permille: 800,
-            })),
-            test_cell(Some(PlanetDeposit {
+            }]),
+            test_cell(vec![PlanetDeposit {
                 kind: PlanetResourceKind::Iron,
                 initial_amount: 8,
                 remaining_amount: 4,
                 grade_permille: 800,
-            })),
+            }]),
         ]);
 
         assert_eq!(mine_total_remaining(Some(&sim_world), 0, &building), 13);
@@ -5051,34 +5379,36 @@ mod tests {
     fn expandable_mine_cells_only_add_matching_adjacent_deposits() {
         let building = test_building();
         let sim_world = sim_world_for_tests(vec![
-            test_cell(Some(PlanetDeposit {
+            test_cell(vec![PlanetDeposit {
                 kind: PlanetResourceKind::Iron,
                 initial_amount: 10,
                 remaining_amount: 10,
                 grade_permille: 900,
-            })),
-            test_cell(Some(PlanetDeposit {
+            }]),
+            test_cell(vec![PlanetDeposit {
                 kind: PlanetResourceKind::Iron,
                 initial_amount: 7,
                 remaining_amount: 7,
                 grade_permille: 900,
-            })),
-            test_cell(Some(PlanetDeposit {
+            }]),
+            test_cell(vec![PlanetDeposit {
                 kind: PlanetResourceKind::Iron,
                 initial_amount: 5,
                 remaining_amount: 5,
                 grade_permille: 900,
-            })),
-            test_cell(Some(PlanetDeposit {
+            }]),
+            test_cell(vec![PlanetDeposit {
                 kind: PlanetResourceKind::Copper,
                 initial_amount: 6,
                 remaining_amount: 6,
                 grade_permille: 900,
-            })),
+            }]),
         ]);
         let neighbors = vec![vec![1, 3], vec![0, 2], vec![1], vec![0]];
 
-        assert_eq!(expandable_mine_cells(&sim_world, &neighbors, 0, &building), vec![2]);
+        assert_eq!(
+            expandable_mine_cells(&sim_world, &neighbors, 0, &building),
+            vec![2]
+        );
     }
 }
-

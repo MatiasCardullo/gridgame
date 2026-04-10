@@ -14,6 +14,7 @@ use crate::core::debug::{
     format_log_timestamp, planet_perf_log,
 };
 use crate::core::map_common::{build_panel_layout, handle_window_drag, is_ui_capturing};
+use crate::core::{tick_base_interior, BaseInteriorState};
 use crate::core::planet_grid::{
     HexGrid, align_vertices_to_poles, build_faces, build_frequency_geodesic, build_geodesic_sphere,
     build_hex_grid_from_data, build_vertex_neighbors, icosahedron_edges, icosahedron_vertices,
@@ -40,7 +41,7 @@ use crate::core::ui::{
     WINDOW_TITLE_HEIGHT, WindowState, WindowStyle, draw_build_panel, draw_window, ui_button,
     ui_checkbox,
 };
-use crate::core::{FrameContext, Scene};
+use crate::core::{Axial, FrameContext, Scene};
 
 const PLANET_DATA_DIR: &str = "planet_data";
 const MESH_POINTS_PATH: &str = "planet_data/planet_mesh_points.csv";
@@ -633,6 +634,8 @@ struct PlanetBuildingRecord {
     auto_pick_build: bool,
     #[serde(default)]
     auto_pick_refuel: bool,
+    #[serde(default)]
+    interior: Option<BaseInteriorState>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -656,6 +659,13 @@ struct PlanetBuildingState {
     auto_pick_source: bool,
     auto_pick_build: bool,
     auto_pick_refuel: bool,
+    interior: Option<BaseInteriorState>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InteriorPickMode {
+    ArmOutputs(Axial),
+    ArmInputs(Axial),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1109,6 +1119,8 @@ pub struct PlanetState {
     min_cell_edge_dist_unit: f32,
     info_window: WindowState,
     info_target_cell: Option<u32>,
+    editing_base_cell: Option<u32>,
+    interior_pick_mode: Option<InteriorPickMode>,
     confirm_window: WindowState,
     confirm_target_cell: Option<u32>,
     relief_cache: HashMap<ReliefCacheKey, ReliefCacheEntry>,
@@ -1251,6 +1263,8 @@ impl PlanetState {
                 show_units: false,
             },
             info_target_cell: None,
+            editing_base_cell: None,
+            interior_pick_mode: None,
             confirm_window: WindowState {
                 title: "Confirm".to_string(),
                 rect: Rect::new(40.0, 120.0, 250.0, 120.0),
@@ -1320,6 +1334,96 @@ impl PlanetState {
             },
         );
         self.relief_available = true;
+    }
+
+    pub fn begin_base_interior_edit(&mut self, cell_index: u32) -> bool {
+        let Some(building) = self.buildings.get(&cell_index) else {
+            return false;
+        };
+        if building.kind != PlanetBuildingKind::Base {
+            return false;
+        }
+        self.editing_base_cell = Some(cell_index);
+        true
+    }
+
+    pub fn clear_base_interior_edit(&mut self) {
+        self.editing_base_cell = None;
+        self.interior_pick_mode = None;
+    }
+
+    pub fn active_base_interior(&self) -> Option<&BaseInteriorState> {
+        let cell_index = self.editing_base_cell?;
+        self.buildings.get(&cell_index)?.interior.as_ref()
+    }
+
+    pub fn active_base_interior_mut(&mut self) -> Option<&mut BaseInteriorState> {
+        let cell_index = self.editing_base_cell?;
+        self.buildings.get_mut(&cell_index)?.interior.as_mut()
+    }
+
+    pub fn active_base_cell(&self) -> Option<u32> {
+        self.editing_base_cell
+    }
+
+    pub fn interior_pick_mode(&self) -> Option<InteriorPickMode> {
+        self.interior_pick_mode
+    }
+
+    pub fn begin_arm_output_pick(&mut self, arm_hex: Axial) {
+        self.interior_pick_mode = Some(InteriorPickMode::ArmOutputs(arm_hex));
+    }
+
+    pub fn begin_arm_input_pick(&mut self, arm_hex: Axial) {
+        self.interior_pick_mode = Some(InteriorPickMode::ArmInputs(arm_hex));
+    }
+
+    pub fn clear_interior_pick_mode(&mut self) {
+        self.interior_pick_mode = None;
+    }
+
+    pub fn mark_buildings_dirty(&mut self) {
+        self.buildings_dirty = true;
+    }
+
+    pub fn tick_active_base_interior(&mut self, dt: f32) {
+        if let Some(interior) = self.active_base_interior_mut() {
+            tick_base_interior(interior, dt);
+            self.buildings_dirty = true;
+        }
+    }
+
+    pub fn available_builder_tender_kits(&self) -> u32 {
+        self.buildings
+            .values()
+            .filter_map(|building| building.interior.as_ref())
+            .map(|interior| interior.builder_tender_kits())
+            .sum()
+    }
+
+    pub fn consume_builder_tender_kit(&mut self) -> bool {
+        for building in self.buildings.values_mut() {
+            if let Some(interior) = building.interior.as_mut() {
+                if interior.consume_builder_tender_kit() {
+                    self.buildings_dirty = true;
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    fn update_base_interiors(&mut self, dt: f32) {
+        let mut dirty = false;
+        for building in self.buildings.values_mut() {
+            if let Some(interior) = building.interior.as_mut() {
+                tick_base_interior(interior, dt);
+                dirty = true;
+            }
+        }
+        if dirty {
+            self.buildings_dirty = true;
+        }
     }
 
     // Rebuilds planet meshes from current noise settings.
@@ -1425,6 +1529,11 @@ impl PlanetState {
             } else {
                 record.build_progress
             };
+            let interior = if record.kind == PlanetBuildingKind::Base {
+                Some(record.interior.unwrap_or_default())
+            } else {
+                None
+            };
             self.buildings.insert(
                 record.cell_index,
                 PlanetBuildingState {
@@ -1441,6 +1550,7 @@ impl PlanetState {
                     auto_pick_source: record.auto_pick_source,
                     auto_pick_build: record.auto_pick_build,
                     auto_pick_refuel: record.auto_pick_refuel,
+                    interior,
                 },
             );
         }
@@ -1479,6 +1589,7 @@ impl PlanetState {
                     auto_pick_source: building.auto_pick_source,
                     auto_pick_build: building.auto_pick_build,
                     auto_pick_refuel: building.auto_pick_refuel,
+                    interior: building.interior.clone(),
                 })
                 .collect(),
         };
@@ -1622,6 +1733,7 @@ impl PlanetState {
                 auto_pick_source: false,
                 auto_pick_build: false,
                 auto_pick_refuel: false,
+                interior: (kind == PlanetBuildingKind::Base).then(BaseInteriorState::default),
             },
         );
         self.buildings_dirty = true;
@@ -1631,6 +1743,9 @@ impl PlanetState {
     fn remove_building(&mut self, cell_index: u32) -> bool {
         let removed = self.buildings.remove(&cell_index).is_some();
         if removed {
+            if self.editing_base_cell == Some(cell_index) {
+                self.editing_base_cell = None;
+            }
             self.mine_progress.remove(&cell_index);
             let before = self.units.len();
             self.units.retain(|unit| !unit.references_cell(cell_index));
@@ -3944,6 +4059,7 @@ pub fn run(
     }
     state.update_units_and_construction(frame_time);
     state.tick_mining(frame_time);
+    state.update_base_interiors(frame_time);
 
     let mut yaw_input = 0.0;
     let mut pitch_input = 0.0;
@@ -4403,6 +4519,7 @@ pub fn run(
     }
     let mut spawn_request: Option<(u32, PlanetUnitDefinitionId, PlanetUnitNodeConfig)> = None;
     let mut expand_mine_request: Option<u32> = None;
+    let mut open_interior_request: Option<u32> = None;
     if state.info_window.open {
         handle_window_drag(&mut state.info_window, mouse);
         let close = draw_window(
@@ -4565,6 +4682,33 @@ pub fn run(
                     }
                     match building.kind {
                         PlanetBuildingKind::Base => {
+                            let kits = building
+                                .interior
+                                .as_ref()
+                                .map(|interior| interior.builder_tender_kits())
+                                .unwrap_or(0);
+                            draw_text(
+                                &format!("Builder kits ready: {}", kits),
+                                tx,
+                                ty,
+                                ctx.font_sm,
+                                ctx.colors_rt.text_secondary,
+                            );
+                            ty += 20.0;
+
+                            let rect_interior = Rect::new(tx, ty, 190.0, 28.0);
+                            let (clicked_interior, _) = ui_button(
+                                rect_interior,
+                                "Open Base Interior",
+                                mouse,
+                                ctx.font_sm,
+                                ctx.button_colors,
+                            );
+                            if clicked_interior {
+                                open_interior_request = Some(cell_index);
+                            }
+                            ty += 36.0;
+
                             let rect_enabled = Rect::new(tx, ty, 230.0, 22.0);
                             let (clicked_enabled, _) = ui_checkbox(
                                 rect_enabled,
@@ -4994,6 +5138,18 @@ pub fn run(
                                 }
                                 ty += 34.0;
 
+                                draw_text(
+                                    &format!(
+                                        "Base kits ready: {}",
+                                        state.available_builder_tender_kits()
+                                    ),
+                                    tx,
+                                    ty,
+                                    ctx.font_sm,
+                                    ctx.colors_rt.text_secondary,
+                                );
+                                ty += 22.0;
+
                                 let rect_spawn = Rect::new(tx, ty, 160.0, 28.0);
                                 let (clicked_spawn, _) = ui_button(
                                     rect_spawn,
@@ -5004,20 +5160,22 @@ pub fn run(
                                 );
                                 if clicked_spawn {
                                     state.auto_select_builder_nodes(cell_index);
-                                    if let (Some(source), Some(target)) =
+                                    if state.available_builder_tender_kits() > 0 {
+                                        if let (Some(source), Some(target)) =
                                         (state.spawn_pickup_node, state.spawn_construction_node)
-                                    {
-                                        spawn_request = Some((
-                                            cell_index,
-                                            PlanetUnitDefinitionId::BuilderTender,
-                                            PlanetUnitNodeConfig {
-                                                pickup: Some(source),
-                                                dropoff: None,
-                                                refuel: state.spawn_refuel_node,
-                                                construction: Some(target),
-                                                wait: None,
-                                            },
-                                        ));
+                                        {
+                                            spawn_request = Some((
+                                                cell_index,
+                                                PlanetUnitDefinitionId::BuilderTender,
+                                                PlanetUnitNodeConfig {
+                                                    pickup: Some(source),
+                                                    dropoff: None,
+                                                    refuel: state.spawn_refuel_node,
+                                                    construction: Some(target),
+                                                    wait: None,
+                                                },
+                                            ));
+                                        }
                                     }
                                 }
                                 ty += 34.0;
@@ -5173,10 +5331,21 @@ pub fn run(
     if let Some(cell_index) = expand_mine_request {
         let _ = state.expand_mine_area(cell_index);
     }
+    if let Some(cell_index) = open_interior_request {
+        if state.begin_base_interior_edit(cell_index) {
+            *scene = Scene::BuildTemplate;
+        }
+    }
     if let Some((depot, definition_id, nodes)) = spawn_request {
-        if let Some(unit) = unit_for_definition(definition_id, depot, nodes) {
-            state.units.push(unit);
-            state.units_dirty = true;
+        let can_spawn = match definition_id {
+            PlanetUnitDefinitionId::BuilderTender => state.consume_builder_tender_kit(),
+            _ => true,
+        };
+        if can_spawn {
+            if let Some(unit) = unit_for_definition(definition_id, depot, nodes) {
+                state.units.push(unit);
+                state.units_dirty = true;
+            }
         }
     }
     if state.confirm_window.open {
@@ -5340,6 +5509,7 @@ mod tests {
             auto_pick_source: false,
             auto_pick_build: false,
             auto_pick_refuel: false,
+            interior: None,
         }
     }
 

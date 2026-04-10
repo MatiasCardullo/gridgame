@@ -1,7 +1,7 @@
 use macroquad::prelude::*;
 
 use crate::core::{
-    save_map, AppConfig, Axial, FrameContext, PlacedBlock, MachineBlock, Scene, TileData, Unit,
+    save_map, Axial, FrameContext, PlacedBlock, Scene, TileData, Unit,
 };
 use crate::core::ui::{draw_log_panel, draw_progress_bar, ui_button};
 use std::collections::HashMap;
@@ -12,13 +12,8 @@ pub fn run(
     blocks: &mut HashMap<Axial, PlacedBlock>,
     tiles: &mut HashMap<Axial, TileData>,
     units: &mut Vec<Unit>,
-    template_blocks: &mut HashMap<Axial, MachineBlock>,
-    cam_offset: &mut Vec2,
-    cam_zoom: &mut f32,
-    placement_rotation: &mut u8,
     scene: &mut Scene,
     map_path: &str,
-    config: &AppConfig,
     planet_loading: bool,
     planet_ready: bool,
     planet_progress: f32,
@@ -40,17 +35,6 @@ pub fn run(
     let btn_h = 52.0;
     let start_y = 200.0;
     let mut y = start_y;
-
-    let rect_new = Rect::new((screen_width() - btn_w) * 0.5, y, btn_w, btn_h);
-    let (clicked_new, _) = ui_button(rect_new, "Build Template", ctx.mouse, ctx.font_md, ctx.button_colors);
-    if clicked_new {
-        *cam_offset = Vec2::ZERO;
-        *cam_zoom = config.zoom_level;
-        *placement_rotation = 0;
-        template_blocks.clear();
-        *scene = Scene::BuildTemplate;
-    }
-    y += btn_h + 12.0;
 
     let rect_planet = Rect::new((screen_width() - btn_w) * 0.5, y, btn_w, btn_h);
     let planet_label = if planet_ready {

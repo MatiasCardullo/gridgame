@@ -6,8 +6,8 @@ use macroquad::prelude::*;
 mod scenes;
 mod core;
 use core::{
-    load_config, save_config, Axial, MachineBlock, MachineBlockType, ConfigData, FrameContext,
-    PlacedBlock, Scene, TileData, Unit,
+    load_config, save_config, Axial, MachineBlockType, ConfigData, FrameContext, PlacedBlock,
+    Scene, TileData, Unit,
 };
 use core::ui::{UiButtonColors, WindowState};
 
@@ -41,8 +41,6 @@ async fn main() {
     let mut dragging = false;
     let mut last_mouse = Vec2::ZERO;
     let map_path = "map.json";
-    let _template_path = "template.json";
-    let mut template_blocks: HashMap<Axial, MachineBlock> = HashMap::new();
     let mut template_selected: Option<MachineBlockType> = Some(MachineBlockType::ConveyorBelt);
     let mut placement_rotation: u8 = 0;
     let mut panel_collapsed = false;
@@ -118,13 +116,8 @@ async fn main() {
                     &mut blocks,
                     &mut tiles,
                     &mut units,
-                    &mut template_blocks,
-                    &mut cam_offset,
-                    &mut cam_zoom,
-                    &mut placement_rotation,
                     &mut scene,
                     map_path,
-                    &config,
                     planet_loader.is_loading(),
                     planet_loader.is_ready(),
                     planet_loader.progress(),
@@ -157,22 +150,26 @@ async fn main() {
                 }
             }
             Scene::BuildTemplate => {
-                scenes::build_template::run(
-                    &ctx,
-                    &mut cam_offset,
-                    &mut cam_zoom,
-                    &mut dragging,
-                    &mut last_mouse,
-                    &mut template_selected,
-                    &mut placement_rotation,
-                    &mut panel_collapsed,
-                    &mut block_window,
-                    &mut confirm_window,
-                    &mut scene,
-                    &config,
-                    &colors_rt,
-                    &mut template_blocks,
-                );
+                if let Some(state) = planet_state.as_mut() {
+                    scenes::build_template::run(
+                        &ctx,
+                        state,
+                        &mut cam_offset,
+                        &mut cam_zoom,
+                        &mut dragging,
+                        &mut last_mouse,
+                        &mut template_selected,
+                        &mut placement_rotation,
+                        &mut panel_collapsed,
+                        &mut block_window,
+                        &mut confirm_window,
+                        &mut scene,
+                        &config,
+                        &colors_rt,
+                    );
+                } else {
+                    scene = Scene::Planet;
+                }
             }
         }
 

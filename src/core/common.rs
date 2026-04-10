@@ -31,10 +31,13 @@ pub enum BuildBlockType {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum MachineBlockType {
     ConveyorBelt,
-    Inserter,
+    #[serde(alias = "Inserter")]
+    MechanicArm,
     Chest,
     Assembler,
     Furnace,
+    Pallet,
+    Crate,
 }
 
 

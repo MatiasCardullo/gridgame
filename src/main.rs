@@ -3,13 +3,13 @@ use std::path::Path;
 
 use macroquad::prelude::*;
 
-mod scenes;
 mod core;
-use core::{
-    load_config, save_config, Axial, MachineBlockType, ConfigData, FrameContext, PlacedBlock,
-    Scene, TileData, Unit,
-};
+mod scenes;
 use core::ui::{UiButtonColors, WindowState};
+use core::{
+    Axial, ConfigData, FrameContext, MachineBlockType, PlacedBlock, Scene, TileData, Unit,
+    load_config, save_config,
+};
 
 const HEX_SIZE: f32 = 15.0;
 const HEX_RADIUS: i32 = 64;
@@ -29,13 +29,7 @@ async fn main() {
     let mut colors = config_data.colors;
     cam_zoom = config.zoom_level;
     if !Path::new(config_path).exists() {
-        save_config(
-            config_path,
-            &ConfigData {
-                config,
-                colors,
-            },
-        );
+        save_config(config_path, &ConfigData { config, colors });
     }
     let mut color_target_index: usize = 0;
     let mut dragging = false;
@@ -65,7 +59,9 @@ async fn main() {
     let mut units: Vec<Unit> = Vec::new();
     let mut planet_state: Option<scenes::planet::PlanetState> = None;
     let mut planet_loader = scenes::planet::PlanetLoader::start();
-    let greek_font = load_ttf_font("C:/Windows/Fonts/CascadiaMono.ttf").await.ok();
+    let greek_font = load_ttf_font("C:/Windows/Fonts/CascadiaMono.ttf")
+        .await
+        .ok();
     let mut dirty = false;
     let mut scene = Scene::MainMenu;
 
@@ -187,24 +183,14 @@ fn draw_planet_loading_screen(ctx: &FrameContext, loader: &scenes::planet::Plane
         ctx.font_title,
         ctx.colors_rt.text_primary,
     );
-    let bar_rect = Rect::new(
-        (screen_width() - 420.0) * 0.5,
-        160.0,
-        420.0,
-        18.0,
-    );
+    let bar_rect = Rect::new((screen_width() - 420.0) * 0.5, 160.0, 420.0, 18.0);
     core::ui::draw_progress_bar(
         bar_rect,
         loader.progress(),
         ctx.colors_rt.button_hover,
         ctx.colors_rt.button_base,
     );
-    let log_rect = Rect::new(
-        (screen_width() - 520.0) * 0.5,
-        200.0,
-        520.0,
-        260.0,
-    );
+    let log_rect = Rect::new((screen_width() - 520.0) * 0.5, 200.0, 520.0, 260.0);
     if let Some(message) = loader.error() {
         let lines = vec![message.to_string()];
         core::ui::draw_log_panel(

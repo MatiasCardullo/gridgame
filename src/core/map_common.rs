@@ -1,10 +1,12 @@
-use macroquad::prelude::*;
-use crate::core::{hex_distance, hex_to_pixel, pixel_to_hex, AppConfig, Axial, FrameContext, RuntimeColors};
 use crate::core::ui::{
-    draw_window, ui_button, window_close_rect, window_title_rect, WindowState, WindowStyle,
-    WINDOW_TITLE_HEIGHT,
+    WINDOW_TITLE_HEIGHT, WindowState, WindowStyle, draw_window, ui_button, window_close_rect,
+    window_title_rect,
 };
-use crate::{TRI_LENGHT, HEX_RADIUS, HEX_SIZE};
+use crate::core::{
+    AppConfig, Axial, FrameContext, RuntimeColors, hex_distance, hex_to_pixel, pixel_to_hex,
+};
+use crate::{HEX_RADIUS, HEX_SIZE, TRI_LENGHT};
+use macroquad::prelude::*;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MapOutline {
@@ -37,22 +39,6 @@ pub fn in_bounds(hex: Axial, outline: MapOutline) -> bool {
     }
 }
 
-fn outline_centroid(outline: MapOutline) -> Vec2 {
-    match outline {
-        MapOutline::Hexagon => Vec2::ZERO,
-        MapOutline::Triangle => {
-            let a = hex_to_pixel(Axial { q: 0, r: 0 }, HEX_SIZE, Vec2::ZERO);
-            let b = hex_to_pixel(Axial { q: TRI_LENGHT, r: 0 }, HEX_SIZE, Vec2::ZERO);
-            let c = hex_to_pixel(Axial { q: 0, r: TRI_LENGHT }, HEX_SIZE, Vec2::ZERO);
-            (a + b + c) / 3.0
-        }
-    }
-}
-
-pub fn outline_start_offset(outline: MapOutline, zoom: f32) -> Vec2 {
-    -outline_centroid(outline) * zoom
-}
-
 pub fn hover_hex_from_mouse(ctx: &FrameContext, cam_offset: Vec2, cam_zoom: f32) -> Axial {
     let world_mouse = (ctx.mouse - ctx.screen_center - cam_offset) / cam_zoom;
     pixel_to_hex(world_mouse, HEX_SIZE, Vec2::ZERO)
@@ -77,13 +63,7 @@ pub fn draw_common_hud(
     );
 
     let coord_text = format!("Hex: q={} r={}", hover_hex.q, hover_hex.r);
-    draw_text(
-        &coord_text,
-        16.0,
-        52.0,
-        ctx.font_sm,
-        colors.text_secondary,
-    );
+    draw_text(&coord_text, 16.0, 52.0, ctx.font_sm, colors.text_secondary);
 
     let rot_text = format!("Rotation: {}", placement_rotation);
     draw_text(&rot_text, 16.0, 74.0, ctx.font_sm, colors.text_secondary);
@@ -170,15 +150,25 @@ pub fn run_confirm_window(
 
     let content_x = confirm_window.rect.x + 10.0;
     let mut content_y = confirm_window.rect.y + WINDOW_TITLE_HEIGHT + 20.0;
-    draw_text(label, content_x, content_y, ctx.font_sm, colors.text_secondary);
+    draw_text(
+        label,
+        content_x,
+        content_y,
+        ctx.font_sm,
+        colors.text_secondary,
+    );
     content_y += 28.0;
 
     let rect_cancel = Rect::new(content_x, content_y, 90.0, 26.0);
     let rect_ok = Rect::new(content_x + 100.0, content_y, 90.0, 26.0);
-    let (clicked_cancel, _) =
-        ui_button(rect_cancel, "Cancel", ctx.mouse, ctx.font_sm, ctx.button_colors);
-    let (clicked_ok, _) =
-        ui_button(rect_ok, "Delete", ctx.mouse, ctx.font_sm, ctx.button_colors);
+    let (clicked_cancel, _) = ui_button(
+        rect_cancel,
+        "Cancel",
+        ctx.mouse,
+        ctx.font_sm,
+        ctx.button_colors,
+    );
+    let (clicked_ok, _) = ui_button(rect_ok, "Delete", ctx.mouse, ctx.font_sm, ctx.button_colors);
 
     if clicked_cancel {
         confirm_window.open = false;
@@ -307,5 +297,3 @@ mod tests {
         assert_eq!(label, "Demolish Test?");
     }
 }
-
-

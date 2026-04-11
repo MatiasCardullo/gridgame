@@ -80,6 +80,14 @@ impl MechanicArmInputMode {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum MechanicArmActionStage {
+    #[default]
+    Idle,
+    Pickup,
+    Deliver,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct MechanicArmState {
     pub hex: Axial,
@@ -95,6 +103,12 @@ pub struct MechanicArmState {
     pub input_hexes: Vec<Axial>,
     #[serde(default)]
     pub filters: Vec<InteriorPartKind>,
+    #[serde(default)]
+    pub action_stage: MechanicArmActionStage,
+    #[serde(default)]
+    pub action_target: Option<Axial>,
+    #[serde(default)]
+    pub action_progress: f32,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -112,6 +126,10 @@ pub struct InteriorForkliftState {
     pub request_target: Option<Axial>,
     #[serde(default)]
     pub source_hex: Option<Axial>,
+    #[serde(default)]
+    pub carried_block: Option<MachineBlockType>,
+    #[serde(default)]
+    pub carried_items: Vec<InteriorPartStack>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -190,11 +208,17 @@ impl Default for BaseInteriorState {
 
 impl BaseInteriorState {
     pub fn block_at(&self, hex: Axial) -> Option<&MachineBlock> {
-        self.blocks.iter().find(|record| record.hex == hex).map(|record| &record.block)
+        self.blocks
+            .iter()
+            .find(|record| record.hex == hex)
+            .map(|record| &record.block)
     }
 
     pub fn block_at_mut(&mut self, hex: Axial) -> Option<&mut MachineBlock> {
-        self.blocks.iter_mut().find(|record| record.hex == hex).map(|record| &mut record.block)
+        self.blocks
+            .iter_mut()
+            .find(|record| record.hex == hex)
+            .map(|record| &mut record.block)
     }
 
     pub fn upsert_block(&mut self, hex: Axial, block: MachineBlock) {
@@ -213,7 +237,10 @@ impl BaseInteriorState {
         self.mechanic_arms.retain(|record| record.hex != hex);
         self.assembly_nodes.retain(|record| record.hex != hex);
         self.belt_items.retain(|record| record.hex != hex);
-        self.logistics_requests.retain(|request| request.target_hex != hex);
+        self.logistics_requests
+            .retain(|request| request.target_hex != hex);
+        self.logistics_requests
+            .retain(|request| request.target_hex != hex);
         for arm in self.mechanic_arms.iter_mut() {
             arm.output_hexes.retain(|target| *target != hex);
             arm.input_hexes.retain(|target| *target != hex);
@@ -221,11 +248,16 @@ impl BaseInteriorState {
     }
 
     pub fn sync_runtime_for_block(&mut self, hex: Axial) {
-        let Some(block) = self.block_at(hex).cloned() else { return; };
+        let Some(block) = self.block_at(hex).cloned() else {
+            return;
+        };
         match block.kind {
             MachineBlockType::Pallet | MachineBlockType::Crate => {
                 if self.containers.iter().all(|record| record.hex != hex) {
-                    self.containers.push(InteriorContainerRecord { hex, items: Vec::new() });
+                    self.containers.push(InteriorContainerRecord {
+                        hex,
+                        items: Vec::new(),
+                    });
                 }
             }
             MachineBlockType::MechanicArm => {
@@ -238,6 +270,9 @@ impl BaseInteriorState {
                         input_mode: MechanicArmInputMode::AnyNeighbor,
                         input_hexes: Vec::new(),
                         filters: Vec::new(),
+                        action_stage: MechanicArmActionStage::Idle,
+                        action_target: None,
+                        action_progress: 0.0,
                     });
                 }
             }
@@ -251,7 +286,9 @@ impl BaseInteriorState {
                     });
                 }
             }
-            MachineBlockType::ConveyorBelt | MachineBlockType::Chest | MachineBlockType::Furnace => {}
+            MachineBlockType::ConveyorBelt
+            | MachineBlockType::Chest
+            | MachineBlockType::Furnace => {}
         }
     }
 
@@ -273,7 +310,10 @@ impl BaseInteriorState {
 
     pub fn consume_builder_tender_kit(&mut self) -> bool {
         for node in self.assembly_nodes.iter_mut() {
-            if take_part(&mut node.completed_outputs, InteriorPartKind::BuilderTenderKit) {
+            if take_part(
+                &mut node.completed_outputs,
+                InteriorPartKind::BuilderTenderKit,
+            ) {
                 return true;
             }
         }
@@ -336,7 +376,9 @@ impl BaseInteriorState {
     }
 
     pub fn set_assembler_recipe(&mut self, hex: Axial, recipe: AssemblerRecipeId) -> bool {
-        let Some(node) = self.assembly_node_mut(hex) else { return false; };
+        let Some(node) = self.assembly_node_mut(hex) else {
+            return false;
+        };
         if !node.inserted.is_empty() {
             return false;
         }
@@ -358,7 +400,11 @@ pub fn machine_block_label(kind: MachineBlockType) -> &'static str {
 }
 
 pub fn assembly_recipe_ids() -> &'static [AssemblerRecipeId] {
-    &[AssemblerRecipeId::BuilderTender, AssemblerRecipeId::CargoHauler, AssemblerRecipeId::SiteShuttle]
+    &[
+        AssemblerRecipeId::BuilderTender,
+        AssemblerRecipeId::CargoHauler,
+        AssemblerRecipeId::SiteShuttle,
+    ]
 }
 
 pub fn assembly_recipe_parts(recipe: AssemblerRecipeId) -> &'static [InteriorPartKind] {
@@ -409,68 +455,97 @@ pub fn all_interior_filter_parts() -> &'static [InteriorPartKind] {
 pub fn default_base_interior() -> BaseInteriorState {
     let mut state = BaseInteriorState {
         blocks: vec![
-            InteriorBlockRecord { hex: Axial { q: -3, r: 0 }, block: MachineBlock { kind: MachineBlockType::Pallet, rotation: 0 } },
-            InteriorBlockRecord { hex: Axial { q: -3, r: 1 }, block: MachineBlock { kind: MachineBlockType::Crate, rotation: 0 } },
-            InteriorBlockRecord { hex: Axial { q: -2, r: 0 }, block: MachineBlock { kind: MachineBlockType::MechanicArm, rotation: 0 } },
-            InteriorBlockRecord { hex: Axial { q: -1, r: 0 }, block: MachineBlock { kind: MachineBlockType::ConveyorBelt, rotation: 0 } },
-            InteriorBlockRecord { hex: Axial { q: 0, r: 0 }, block: MachineBlock { kind: MachineBlockType::ConveyorBelt, rotation: 0 } },
-            InteriorBlockRecord { hex: Axial { q: 1, r: 0 }, block: MachineBlock { kind: MachineBlockType::ConveyorBelt, rotation: 0 } },
-            InteriorBlockRecord { hex: Axial { q: 2, r: 0 }, block: MachineBlock { kind: MachineBlockType::MechanicArm, rotation: 0 } },
-            InteriorBlockRecord { hex: Axial { q: 3, r: 0 }, block: MachineBlock { kind: MachineBlockType::Assembler, rotation: 0 } },
-            InteriorBlockRecord { hex: Axial { q: 4, r: 0 }, block: MachineBlock { kind: MachineBlockType::Crate, rotation: 0 } },
+            InteriorBlockRecord {
+                hex: Axial { q: -3, r: 0 },
+                block: MachineBlock {
+                    kind: MachineBlockType::Pallet,
+                    rotation: 0,
+                },
+            },
+            InteriorBlockRecord {
+                hex: Axial { q: -3, r: 1 },
+                block: MachineBlock {
+                    kind: MachineBlockType::Crate,
+                    rotation: 0,
+                },
+            },
         ],
         containers: vec![
             InteriorContainerRecord {
                 hex: Axial { q: -3, r: 0 },
                 items: vec![
-                    InteriorPartStack { kind: InteriorPartKind::ChassisFrame, amount: 2 },
-                    InteriorPartStack { kind: InteriorPartKind::WheelAssembly, amount: 4 },
-                    InteriorPartStack { kind: InteriorPartKind::ForkCarriage, amount: 2 },
-                    InteriorPartStack { kind: InteriorPartKind::MastSegment, amount: 2 },
+                    InteriorPartStack {
+                        kind: InteriorPartKind::ChassisFrame,
+                        amount: 2,
+                    },
+                    InteriorPartStack {
+                        kind: InteriorPartKind::WheelAssembly,
+                        amount: 4,
+                    },
+                    InteriorPartStack {
+                        kind: InteriorPartKind::ForkCarriage,
+                        amount: 2,
+                    },
+                    InteriorPartStack {
+                        kind: InteriorPartKind::MastSegment,
+                        amount: 2,
+                    },
                 ],
             },
             InteriorContainerRecord {
                 hex: Axial { q: -3, r: 1 },
                 items: vec![
-                    InteriorPartStack { kind: InteriorPartKind::EngineCore, amount: 2 },
-                    InteriorPartStack { kind: InteriorPartKind::ControlModule, amount: 2 },
-                    InteriorPartStack { kind: InteriorPartKind::HydraulicSet, amount: 2 },
-                    InteriorPartStack { kind: InteriorPartKind::SensorPack, amount: 2 },
-                    InteriorPartStack { kind: InteriorPartKind::FastenerBundle, amount: 4 },
+                    InteriorPartStack {
+                        kind: InteriorPartKind::EngineCore,
+                        amount: 2,
+                    },
+                    InteriorPartStack {
+                        kind: InteriorPartKind::ControlModule,
+                        amount: 2,
+                    },
+                    InteriorPartStack {
+                        kind: InteriorPartKind::HydraulicSet,
+                        amount: 2,
+                    },
+                    InteriorPartStack {
+                        kind: InteriorPartKind::SensorPack,
+                        amount: 2,
+                    },
+                    InteriorPartStack {
+                        kind: InteriorPartKind::FastenerBundle,
+                        amount: 4,
+                    },
                 ],
             },
-            InteriorContainerRecord { hex: Axial { q: 4, r: 0 }, items: Vec::new() },
         ],
         belt_items: Vec::new(),
-        mechanic_arms: vec![
-            MechanicArmState {
-                hex: Axial { q: -2, r: 0 },
-                held: None,
-                cooldown: 0.0,
-                output_hexes: vec![Axial { q: -1, r: 0 }],
-                input_mode: MechanicArmInputMode::AnyNeighbor,
-                input_hexes: Vec::new(),
-                filters: Vec::new(),
-            },
-            MechanicArmState {
-                hex: Axial { q: 2, r: 0 },
-                held: None,
-                cooldown: 0.0,
-                output_hexes: vec![Axial { q: 3, r: 0 }],
-                input_mode: MechanicArmInputMode::ExplicitInputs,
-                input_hexes: vec![Axial { q: 1, r: 0 }],
-                filters: Vec::new(),
-            },
-        ],
-        assembly_nodes: vec![AssemblyNodeState {
-            hex: Axial { q: 3, r: 0 },
-            selected_recipe: AssemblerRecipeId::BuilderTender,
-            inserted: Vec::new(),
-            completed_outputs: Vec::new(),
-        }],
+        mechanic_arms: Vec::new(),
+        assembly_nodes: Vec::new(),
         forklifts: vec![
-            InteriorForkliftState { id: 1, hex: Axial { q: -4, r: 0 }, home: Axial { q: -4, r: 0 }, target: Some(Axial { q: -3, r: 0 }), carried: None, move_progress: 0.0, request_target: None, source_hex: None },
-            InteriorForkliftState { id: 2, hex: Axial { q: -4, r: 1 }, home: Axial { q: -4, r: 1 }, target: Some(Axial { q: -3, r: 1 }), carried: None, move_progress: 0.0, request_target: None, source_hex: None },
+            InteriorForkliftState {
+                id: 1,
+                hex: Axial { q: -4, r: 0 },
+                home: Axial { q: -4, r: 0 },
+                target: None,
+                carried: None,
+                move_progress: 0.0,
+                request_target: None,
+                source_hex: None,
+                carried_block: None,
+                carried_items: Vec::new(),
+            },
+            InteriorForkliftState {
+                id: 2,
+                hex: Axial { q: -4, r: 1 },
+                home: Axial { q: -4, r: 1 },
+                target: None,
+                carried: None,
+                move_progress: 0.0,
+                request_target: None,
+                source_hex: None,
+                carried_block: None,
+                carried_items: Vec::new(),
+            },
         ],
         logistics_requests: Vec::new(),
         runtime_timer: 0.0,
@@ -483,16 +558,21 @@ fn direction_hex(hex: Axial, rotation: u8) -> Axial {
     axial_neighbors(hex)[rotation as usize % 6]
 }
 
-fn container_at_mut(interior: &mut BaseInteriorState, hex: Axial) -> Option<&mut InteriorContainerRecord> {
-    interior.containers.iter_mut().find(|record| record.hex == hex)
-}
-
-fn first_available_part(items: &[InteriorPartStack]) -> Option<InteriorPartKind> {
-    items.iter().find(|stack| stack.amount > 0).map(|stack| stack.kind)
+fn container_at_mut(
+    interior: &mut BaseInteriorState,
+    hex: Axial,
+) -> Option<&mut InteriorContainerRecord> {
+    interior
+        .containers
+        .iter_mut()
+        .find(|record| record.hex == hex)
 }
 
 fn take_part(items: &mut Vec<InteriorPartStack>, kind: InteriorPartKind) -> bool {
-    if let Some(stack) = items.iter_mut().find(|stack| stack.kind == kind && stack.amount > 0) {
+    if let Some(stack) = items
+        .iter_mut()
+        .find(|stack| stack.kind == kind && stack.amount > 0)
+    {
         stack.amount -= 1;
         if stack.amount == 0 {
             items.retain(|entry| entry.amount > 0);
@@ -510,10 +590,6 @@ fn push_part(items: &mut Vec<InteriorPartStack>, kind: InteriorPartKind) {
     }
 }
 
-fn belt_item_at_mut(interior: &mut BaseInteriorState, hex: Axial) -> Option<&mut InteriorBeltItem> {
-    interior.belt_items.iter_mut().find(|item| item.hex == hex)
-}
-
 fn belt_has_item(interior: &BaseInteriorState, hex: Axial) -> bool {
     interior.belt_items.iter().any(|item| item.hex == hex)
 }
@@ -527,6 +603,86 @@ fn part_passes_filter(arm: &MechanicArmState, part: InteriorPartKind) -> bool {
     arm.filters.is_empty() || arm.filters.contains(&part)
 }
 
+fn push_unique_part(parts: &mut Vec<InteriorPartKind>, kind: InteriorPartKind) {
+    if !parts.contains(&kind) {
+        parts.push(kind);
+    }
+}
+
+fn arm_output_demands(
+    interior: &BaseInteriorState,
+    arm: &MechanicArmState,
+) -> Vec<InteriorPartKind> {
+    let mut demanded = Vec::new();
+    for output_hex in &arm.output_hexes {
+        if let Some(node) = interior.assembly_node(*output_hex) {
+            if let Some(next_part) = assembly_recipe_parts(node.selected_recipe)
+                .get(node.inserted.len())
+                .copied()
+            {
+                push_unique_part(&mut demanded, next_part);
+            }
+        }
+    }
+    demanded
+}
+
+fn output_accepts_part(
+    interior: &BaseInteriorState,
+    output_hex: Axial,
+    part: InteriorPartKind,
+) -> bool {
+    if interior
+        .block_at(output_hex)
+        .map(|block| block.kind == MachineBlockType::ConveyorBelt)
+        .unwrap_or(false)
+        && !belt_has_item(interior, output_hex)
+    {
+        return true;
+    }
+    if let Some(node) = interior.assembly_node(output_hex) {
+        return assembly_can_accept(node, part);
+    }
+    interior
+        .containers
+        .iter()
+        .any(|container| container.hex == output_hex)
+}
+
+fn arm_can_deliver_part(
+    interior: &BaseInteriorState,
+    arm: &MechanicArmState,
+    part: InteriorPartKind,
+) -> bool {
+    arm.output_hexes
+        .iter()
+        .any(|output_hex| output_accepts_part(interior, *output_hex, part))
+}
+
+fn select_container_part_for_arm(
+    interior: &BaseInteriorState,
+    arm: &MechanicArmState,
+    items: &[InteriorPartStack],
+) -> Option<InteriorPartKind> {
+    let demanded = arm_output_demands(interior, arm);
+    let demand_is_strict = !demanded.is_empty();
+    for stack in items {
+        if stack.amount == 0 {
+            continue;
+        }
+        if !part_passes_filter(arm, stack.kind) {
+            continue;
+        }
+        if demand_is_strict && !demanded.contains(&stack.kind) {
+            continue;
+        }
+        if arm_can_deliver_part(interior, arm, stack.kind) {
+            return Some(stack.kind);
+        }
+    }
+    None
+}
+
 fn request_container_delivery(
     interior: &mut BaseInteriorState,
     requester_hex: Axial,
@@ -536,7 +692,11 @@ fn request_container_delivery(
     if interior.block_at(target_hex).is_some() {
         return;
     }
-    if interior.logistics_requests.iter().any(|request| request.target_hex == target_hex) {
+    if interior
+        .logistics_requests
+        .iter()
+        .any(|request| request.target_hex == target_hex)
+    {
         return;
     }
     interior.logistics_requests.push(InteriorLogisticsRequest {
@@ -554,15 +714,28 @@ fn nearest_container_for_request(
 ) -> Option<Axial> {
     let mut best: Option<(i32, Axial)> = None;
     for container in &interior.containers {
-        let Some(block) = interior.block_at(container.hex) else { continue; };
-        if !matches!(block.kind, MachineBlockType::Pallet | MachineBlockType::Crate) {
+        let Some(block) = interior.block_at(container.hex) else {
+            continue;
+        };
+        if !matches!(
+            block.kind,
+            MachineBlockType::Pallet | MachineBlockType::Crate
+        ) {
             continue;
         }
         let has_match = match required_filter {
-            Some(kind) => container.items.iter().any(|stack| stack.kind == kind && stack.amount > 0),
+            Some(kind) => container
+                .items
+                .iter()
+                .any(|stack| stack.kind == kind && stack.amount > 0),
             None => container.items.iter().any(|stack| stack.amount > 0),
         };
         if !has_match {
+            continue;
+        }
+        if interior.forklifts.iter().any(|forklift| {
+            forklift.source_hex == Some(container.hex) && forklift.request_target.is_some()
+        }) {
             continue;
         }
         let dist = (container.hex.q - target_hex.q).abs() + (container.hex.r - target_hex.r).abs();
@@ -574,18 +747,56 @@ fn nearest_container_for_request(
     best.map(|(_, hex)| hex)
 }
 
-fn move_container_block(interior: &mut BaseInteriorState, source_hex: Axial, target_hex: Axial) -> bool {
+fn take_container_block(
+    interior: &mut BaseInteriorState,
+    source_hex: Axial,
+) -> Option<(MachineBlockType, Vec<InteriorPartStack>)> {
+    let block_index = interior
+        .blocks
+        .iter()
+        .position(|record| record.hex == source_hex)?;
+    let container_index = interior
+        .containers
+        .iter()
+        .position(|record| record.hex == source_hex)?;
+    let block = interior.blocks.remove(block_index).block;
+    if !matches!(
+        block.kind,
+        MachineBlockType::Pallet | MachineBlockType::Crate
+    ) {
+        return None;
+    }
+    let container = interior.containers.remove(container_index);
+    Some((block.kind, container.items))
+}
+
+fn place_container_block(
+    interior: &mut BaseInteriorState,
+    target_hex: Axial,
+    block_kind: MachineBlockType,
+    items: Vec<InteriorPartStack>,
+) -> bool {
     if interior.block_at(target_hex).is_some() {
         return false;
     }
-    let Some(block_index) = interior.blocks.iter().position(|record| record.hex == source_hex) else { return false; };
-    let Some(container_index) = interior.containers.iter().position(|record| record.hex == source_hex) else { return false; };
-    interior.blocks[block_index].hex = target_hex;
-    interior.containers[container_index].hex = target_hex;
+    interior.blocks.push(InteriorBlockRecord {
+        hex: target_hex,
+        block: MachineBlock {
+            kind: block_kind,
+            rotation: 0,
+        },
+    });
+    interior.containers.push(InteriorContainerRecord {
+        hex: target_hex,
+        items,
+    });
     true
 }
 
-fn pickup_for_arm(interior: &mut BaseInteriorState, arm_hex: Axial) -> Option<InteriorPartKind> {
+fn pickup_for_arm(
+    interior: &mut BaseInteriorState,
+    arm_hex: Axial,
+) -> Option<(Axial, InteriorPartKind)> {
     let arm = interior.mechanic_arm(arm_hex)?.clone();
     if arm.output_hexes.is_empty() {
         return None;
@@ -594,51 +805,102 @@ fn pickup_for_arm(interior: &mut BaseInteriorState, arm_hex: Axial) -> Option<In
         MechanicArmInputMode::AnyNeighbor => axial_neighbors(arm_hex).to_vec(),
         MechanicArmInputMode::ExplicitInputs => arm.input_hexes.clone(),
     };
+    let demanded = arm_output_demands(interior, &arm);
+    let demand_is_strict = !demanded.is_empty();
     for candidate in candidates {
-        if let Some(container) = container_at_mut(interior, candidate) {
-            if let Some(kind) = first_available_part(&container.items) {
-                if part_passes_filter(&arm, kind) && take_part(&mut container.items, kind) {
-                    return Some(kind);
+        let selected_from_container = interior
+            .containers
+            .iter()
+            .find(|container| container.hex == candidate)
+            .and_then(|container| select_container_part_for_arm(interior, &arm, &container.items));
+        if let Some(kind) = selected_from_container {
+            if let Some(container) = container_at_mut(interior, candidate) {
+                if take_part(&mut container.items, kind) {
+                    return Some((candidate, kind));
                 }
             }
         }
-        if let Some(item) = belt_item_at_mut(interior, candidate) {
-            if item.progress >= 0.5 && part_passes_filter(&arm, item.kind) {
-                let picked = item.kind;
-                interior.belt_items.retain(|belt_item| belt_item.hex != candidate);
-                return Some(picked);
+        let belt_kind = interior
+            .belt_items
+            .iter()
+            .find(|item| item.hex == candidate)
+            .filter(|item| item.progress >= 0.5)
+            .map(|item| item.kind);
+        if let Some(kind) = belt_kind {
+            if part_passes_filter(&arm, kind)
+                && (!demand_is_strict || demanded.contains(&kind))
+                && arm_can_deliver_part(interior, &arm, kind)
+            {
+                interior
+                    .belt_items
+                    .retain(|belt_item| belt_item.hex != candidate);
+                return Some((candidate, kind));
             }
         }
-        if arm.input_mode == MechanicArmInputMode::ExplicitInputs && interior.block_at(candidate).is_none() {
-            request_container_delivery(interior, arm_hex, candidate, arm.filters.first().copied());
+        if arm.input_mode == MechanicArmInputMode::ExplicitInputs
+            && interior.block_at(candidate).is_none()
+        {
+            let demanded = arm_output_demands(interior, &arm);
+            request_container_delivery(
+                interior,
+                arm_hex,
+                candidate,
+                demanded
+                    .first()
+                    .copied()
+                    .or_else(|| arm.filters.first().copied()),
+            );
         }
     }
     None
 }
 
-fn deliver_from_arm(interior: &mut BaseInteriorState, arm_hex: Axial, held_kind: InteriorPartKind) -> bool {
-    let Some(arm) = interior.mechanic_arm(arm_hex).cloned() else { return false; };
-    for output_hex in arm.output_hexes {
-        if interior.block_at(output_hex).map(|block| block.kind == MachineBlockType::ConveyorBelt).unwrap_or(false)
-            && !belt_has_item(interior, output_hex)
-        {
-            interior.belt_items.push(InteriorBeltItem { hex: output_hex, kind: held_kind, progress: 0.0 });
-            return true;
-        }
-        if let Some(node) = interior.assembly_node_mut(output_hex) {
-            if assembly_can_accept(node, held_kind) {
-                node.inserted.push(held_kind);
-                if node.inserted.len() == assembly_recipe_parts(node.selected_recipe).len() {
-                    push_part(&mut node.completed_outputs, node.selected_recipe.output_kind());
-                    node.inserted.clear();
-                }
-                return true;
+fn delivery_target_for_arm(
+    interior: &BaseInteriorState,
+    arm_hex: Axial,
+    held_kind: InteriorPartKind,
+) -> Option<Axial> {
+    let arm = interior.mechanic_arm(arm_hex)?;
+    arm.output_hexes
+        .iter()
+        .copied()
+        .find(|output_hex| output_accepts_part(interior, *output_hex, held_kind))
+}
+
+fn complete_delivery_to_target(
+    interior: &mut BaseInteriorState,
+    target_hex: Axial,
+    held_kind: InteriorPartKind,
+) -> bool {
+    if interior
+        .block_at(target_hex)
+        .map(|block| block.kind == MachineBlockType::ConveyorBelt)
+        .unwrap_or(false)
+        && !belt_has_item(interior, target_hex)
+    {
+        interior.belt_items.push(InteriorBeltItem {
+            hex: target_hex,
+            kind: held_kind,
+            progress: 0.0,
+        });
+        return true;
+    }
+    if let Some(node) = interior.assembly_node_mut(target_hex) {
+        if assembly_can_accept(node, held_kind) {
+            node.inserted.push(held_kind);
+            if node.inserted.len() == assembly_recipe_parts(node.selected_recipe).len() {
+                push_part(
+                    &mut node.completed_outputs,
+                    node.selected_recipe.output_kind(),
+                );
+                node.inserted.clear();
             }
-        }
-        if let Some(container) = container_at_mut(interior, output_hex) {
-            push_part(&mut container.items, held_kind);
             return true;
         }
+    }
+    if let Some(container) = container_at_mut(interior, target_hex) {
+        push_part(&mut container.items, held_kind);
+        return true;
     }
     false
 }
@@ -654,12 +916,17 @@ fn tick_belts(interior: &mut BaseInteriorState, dt: f32) {
         if new_progress < 1.0 {
             continue;
         }
-        let Some(block) = interior.block_at(snapshot_item.hex) else { continue; };
+        let Some(block) = interior.block_at(snapshot_item.hex) else {
+            continue;
+        };
         if block.kind != MachineBlockType::ConveyorBelt {
             continue;
         }
         let next_hex = direction_hex(snapshot_item.hex, block.rotation);
-        if interior.block_at(next_hex).map(|next| next.kind == MachineBlockType::ConveyorBelt).unwrap_or(false)
+        if interior
+            .block_at(next_hex)
+            .map(|next| next.kind == MachineBlockType::ConveyorBelt)
+            .unwrap_or(false)
             && !belt_has_item(interior, next_hex)
         {
             moves.push((index, next_hex));
@@ -676,8 +943,46 @@ fn tick_belts(interior: &mut BaseInteriorState, dt: f32) {
 fn tick_mechanic_arms(interior: &mut BaseInteriorState, dt: f32) {
     let arm_hexes: Vec<Axial> = interior.mechanic_arms.iter().map(|arm| arm.hex).collect();
     for arm_hex in arm_hexes {
-        let Some(index) = interior.mechanic_arms.iter().position(|arm| arm.hex == arm_hex) else { continue; };
+        let Some(index) = interior
+            .mechanic_arms
+            .iter()
+            .position(|arm| arm.hex == arm_hex)
+        else {
+            continue;
+        };
         if let Some(arm) = interior.mechanic_arms.get_mut(index) {
+            if arm.action_stage != MechanicArmActionStage::Idle {
+                arm.action_progress += dt * 1.8;
+                if arm.action_progress < 1.0 {
+                    continue;
+                }
+                arm.action_progress = 0.0;
+                match arm.action_stage {
+                    // Pickup is already reserved; completing the animation just returns the claw home.
+                    MechanicArmActionStage::Pickup => {
+                        arm.action_stage = MechanicArmActionStage::Idle;
+                        arm.action_target = None;
+                        arm.cooldown = 0.08;
+                    }
+                    MechanicArmActionStage::Deliver => {
+                        let target = arm.action_target;
+                        let held = arm.held;
+                        arm.action_stage = MechanicArmActionStage::Idle;
+                        arm.action_target = None;
+                        let _ = arm;
+                        if let (Some(target_hex), Some(held_kind)) = (target, held) {
+                            if complete_delivery_to_target(interior, target_hex, held_kind) {
+                                if let Some(arm) = interior.mechanic_arms.get_mut(index) {
+                                    arm.held = None;
+                                    arm.cooldown = 0.12;
+                                }
+                            }
+                        }
+                        continue;
+                    }
+                    MechanicArmActionStage::Idle => {}
+                }
+            }
             if arm.cooldown > 0.0 {
                 arm.cooldown = (arm.cooldown - dt).max(0.0);
                 continue;
@@ -685,18 +990,21 @@ fn tick_mechanic_arms(interior: &mut BaseInteriorState, dt: f32) {
         }
         let held = interior.mechanic_arms[index].held;
         if held.is_none() {
-            if let Some(kind) = pickup_for_arm(interior, arm_hex) {
+            if let Some((source_hex, kind)) = pickup_for_arm(interior, arm_hex) {
                 if let Some(arm) = interior.mechanic_arms.get_mut(index) {
                     arm.held = Some(kind);
-                    arm.cooldown = 0.35;
+                    arm.action_stage = MechanicArmActionStage::Pickup;
+                    arm.action_target = Some(source_hex);
+                    arm.action_progress = 0.0;
                 }
             }
             continue;
         }
-        if deliver_from_arm(interior, arm_hex, held.unwrap()) {
+        if let Some(target_hex) = delivery_target_for_arm(interior, arm_hex, held.unwrap()) {
             if let Some(arm) = interior.mechanic_arms.get_mut(index) {
-                arm.held = None;
-                arm.cooldown = 0.45;
+                arm.action_stage = MechanicArmActionStage::Deliver;
+                arm.action_target = Some(target_hex);
+                arm.action_progress = 0.0;
             }
         }
     }
@@ -704,13 +1012,25 @@ fn tick_mechanic_arms(interior: &mut BaseInteriorState, dt: f32) {
 
 fn tick_forklifts(interior: &mut BaseInteriorState, dt: f32) {
     for request_index in 0..interior.logistics_requests.len() {
-        if interior.logistics_requests[request_index].assigned_forklift.is_some() {
+        if interior.logistics_requests[request_index]
+            .assigned_forklift
+            .is_some()
+        {
             continue;
         }
         let target_hex = interior.logistics_requests[request_index].target_hex;
         let required_filter = interior.logistics_requests[request_index].required_filter;
-        let Some(source_hex) = nearest_container_for_request(interior, target_hex, required_filter) else { continue; };
-        let Some(forklift) = interior.forklifts.iter_mut().find(|forklift| forklift.request_target.is_none()) else { break; };
+        let Some(source_hex) = nearest_container_for_request(interior, target_hex, required_filter)
+        else {
+            continue;
+        };
+        let Some(forklift) = interior
+            .forklifts
+            .iter_mut()
+            .find(|forklift| forklift.request_target.is_none())
+        else {
+            break;
+        };
         interior.logistics_requests[request_index].assigned_forklift = Some(forklift.id);
         forklift.request_target = Some(target_hex);
         forklift.source_hex = Some(source_hex);
@@ -718,16 +1038,30 @@ fn tick_forklifts(interior: &mut BaseInteriorState, dt: f32) {
     }
 
     let mut completed_targets: Vec<Axial> = Vec::new();
-    let mut planned_moves: Vec<(usize, Axial, Axial)> = Vec::new();
+    let mut pickups: Vec<(usize, Axial, Axial)> = Vec::new();
+    let mut deliveries: Vec<(usize, Axial)> = Vec::new();
     for (index, forklift) in interior.forklifts.iter_mut().enumerate() {
         forklift.move_progress += dt * 0.55;
         if forklift.move_progress < 1.0 {
             continue;
         }
         forklift.move_progress = 0.0;
-        match (forklift.target, forklift.source_hex, forklift.request_target) {
-            (Some(target), Some(source_hex), Some(request_target)) if forklift.hex == target && target == source_hex => {
-                planned_moves.push((index, source_hex, request_target));
+        match (
+            forklift.target,
+            forklift.source_hex,
+            forklift.request_target,
+        ) {
+            // At source: pick up the pallet/crate first, then drive it to the request target.
+            (Some(target), Some(source_hex), Some(request_target))
+                if forklift.hex == target && target == source_hex =>
+            {
+                pickups.push((index, source_hex, request_target));
+            }
+            // At request target: place the carried pallet/crate on the requested empty cell.
+            (Some(target), Some(_), Some(request_target))
+                if forklift.hex == target && target == request_target =>
+            {
+                deliveries.push((index, request_target));
             }
             (Some(target), _, _) if forklift.hex == target => {
                 forklift.target = Some(forklift.home);
@@ -741,18 +1075,51 @@ fn tick_forklifts(interior: &mut BaseInteriorState, dt: f32) {
         }
     }
 
-    for (index, source_hex, request_target) in planned_moves {
-        if move_container_block(interior, source_hex, request_target) {
+    for (index, source_hex, request_target) in pickups {
+        if let Some((block_kind, items)) = take_container_block(interior, source_hex) {
+            if let Some(forklift) = interior.forklifts.get_mut(index) {
+                forklift.carried_block = Some(block_kind);
+                forklift.carried_items = items;
+                forklift.target = Some(request_target);
+            }
+        } else if let Some(forklift) = interior.forklifts.get_mut(index) {
+            forklift.target = Some(forklift.home);
+            forklift.source_hex = None;
+            forklift.request_target = None;
+            forklift.carried_block = None;
+            forklift.carried_items.clear();
+        }
+    }
+
+    for (index, request_target) in deliveries {
+        let maybe_payload = match interior.forklifts.get_mut(index) {
+            Some(forklift) => forklift
+                .carried_block
+                .take()
+                .map(|block_kind| (block_kind, std::mem::take(&mut forklift.carried_items))),
+            None => None,
+        };
+        let Some((block_kind, items)) = maybe_payload else {
+            continue;
+        };
+
+        if place_container_block(interior, request_target, block_kind, items.clone()) {
             if let Some(forklift) = interior.forklifts.get_mut(index) {
                 forklift.target = Some(forklift.home);
                 forklift.source_hex = None;
                 forklift.request_target = None;
             }
             completed_targets.push(request_target);
+        } else if let Some(forklift) = interior.forklifts.get_mut(index) {
+            forklift.carried_block = Some(block_kind);
+            forklift.carried_items = items;
+            forklift.target = Some(request_target);
         }
     }
     if !completed_targets.is_empty() {
-        interior.logistics_requests.retain(|request| !completed_targets.contains(&request.target_hex));
+        interior
+            .logistics_requests
+            .retain(|request| !completed_targets.contains(&request.target_hex));
     }
 }
 
@@ -775,12 +1142,21 @@ mod tests {
     }
 
     #[test]
-    fn mechanic_arm_moves_container_part_to_belt() {
+    fn default_base_starts_with_only_loaded_containers() {
         let mut interior = default_base_interior();
-        tick_base_interior(&mut interior, 1.0);
-        tick_base_interior(&mut interior, 1.0);
-        tick_base_interior(&mut interior, 1.0);
-        assert!(!interior.belt_items.is_empty());
+        interior.ensure_runtime_state();
+        assert!(interior.blocks.iter().all(|record| matches!(
+            record.block.kind,
+            MachineBlockType::Pallet | MachineBlockType::Crate
+        )));
+        assert!(
+            interior
+                .containers
+                .iter()
+                .all(|container| !container.items.is_empty())
+        );
+        assert!(interior.mechanic_arms.is_empty());
+        assert!(interior.assembly_nodes.is_empty());
     }
 
     #[test]
@@ -795,17 +1171,129 @@ mod tests {
             assert!(assembly_can_accept(&node, *part));
             node.inserted.push(*part);
         }
-        push_part(&mut node.completed_outputs, node.selected_recipe.output_kind());
+        push_part(
+            &mut node.completed_outputs,
+            node.selected_recipe.output_kind(),
+        );
         node.inserted.clear();
-        assert!(node.completed_outputs.iter().any(|stack| stack.kind == InteriorPartKind::BuilderTenderKit));
+        assert!(
+            node.completed_outputs
+                .iter()
+                .any(|stack| stack.kind == InteriorPartKind::BuilderTenderKit)
+        );
     }
 
     #[test]
-    fn explicit_empty_input_creates_forklift_request() {
+    fn mechanic_arm_picks_output_required_part_instead_of_first_available() {
+        let mut interior = BaseInteriorState {
+            blocks: vec![
+                InteriorBlockRecord {
+                    hex: Axial { q: 0, r: 0 },
+                    block: MachineBlock {
+                        kind: MachineBlockType::MechanicArm,
+                        rotation: 0,
+                    },
+                },
+                InteriorBlockRecord {
+                    hex: Axial { q: -1, r: 0 },
+                    block: MachineBlock {
+                        kind: MachineBlockType::Crate,
+                        rotation: 0,
+                    },
+                },
+                InteriorBlockRecord {
+                    hex: Axial { q: 1, r: 0 },
+                    block: MachineBlock {
+                        kind: MachineBlockType::Assembler,
+                        rotation: 0,
+                    },
+                },
+            ],
+            containers: vec![InteriorContainerRecord {
+                hex: Axial { q: -1, r: 0 },
+                items: vec![
+                    InteriorPartStack {
+                        kind: InteriorPartKind::WheelAssembly,
+                        amount: 1,
+                    },
+                    InteriorPartStack {
+                        kind: InteriorPartKind::ChassisFrame,
+                        amount: 1,
+                    },
+                ],
+            }],
+            belt_items: Vec::new(),
+            mechanic_arms: vec![MechanicArmState {
+                hex: Axial { q: 0, r: 0 },
+                held: None,
+                cooldown: 0.0,
+                output_hexes: vec![Axial { q: 1, r: 0 }],
+                input_mode: MechanicArmInputMode::ExplicitInputs,
+                input_hexes: vec![Axial { q: -1, r: 0 }],
+                filters: Vec::new(),
+                action_stage: MechanicArmActionStage::Idle,
+                action_target: None,
+                action_progress: 0.0,
+            }],
+            assembly_nodes: vec![AssemblyNodeState {
+                hex: Axial { q: 1, r: 0 },
+                selected_recipe: AssemblerRecipeId::BuilderTender,
+                inserted: Vec::new(),
+                completed_outputs: Vec::new(),
+            }],
+            forklifts: Vec::new(),
+            logistics_requests: Vec::new(),
+            runtime_timer: 0.0,
+        };
+
+        tick_base_interior(&mut interior, 0.1);
+        assert_eq!(
+            interior.mechanic_arms[0].held,
+            Some(InteriorPartKind::ChassisFrame)
+        );
+        assert_eq!(
+            interior.containers[0]
+                .items
+                .iter()
+                .find(|stack| stack.kind == InteriorPartKind::WheelAssembly)
+                .map(|stack| stack.amount),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn forklift_request_moves_container_only_after_arrival() {
         let mut interior = default_base_interior();
-        let arm_hex = Axial { q: 2, r: 0 };
-        interior.toggle_arm_input_hex(arm_hex, Axial { q: 2, r: -1 });
-        tick_base_interior(&mut interior, 0.2);
-        assert!(!interior.logistics_requests.is_empty());
+        request_container_delivery(
+            &mut interior,
+            Axial { q: 0, r: 0 },
+            Axial { q: -1, r: 0 },
+            None,
+        );
+
+        tick_base_interior(&mut interior, 2.0);
+        assert!(interior.block_at(Axial { q: -3, r: 0 }).is_some());
+        assert!(interior.block_at(Axial { q: -1, r: 0 }).is_none());
+        assert!(
+            interior
+                .forklifts
+                .iter()
+                .all(|forklift| forklift.carried_block.is_none())
+        );
+
+        tick_base_interior(&mut interior, 2.0);
+        assert!(interior.block_at(Axial { q: -3, r: 0 }).is_none());
+        assert!(interior.block_at(Axial { q: -1, r: 0 }).is_none());
+        assert!(
+            interior
+                .forklifts
+                .iter()
+                .any(|forklift| forklift.carried_block.is_some())
+        );
+
+        tick_base_interior(&mut interior, 2.0);
+        tick_base_interior(&mut interior, 2.0);
+        assert!(interior.block_at(Axial { q: -1, r: 0 }).is_some());
+        assert!(interior.logistics_requests.is_empty());
     }
 }

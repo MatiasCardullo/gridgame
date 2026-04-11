@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 
 use crate::core::{
-    Axial, AutoSupplyRole, BuildBlockType, ItemType, PlacedBlock, TileData, TileType, Unit, add_item,
-    build_requirements, hex_distance, is_under_construction, item_from_tile,
+    AutoSupplyRole, Axial, BuildBlockType, ItemType, PlacedBlock, TileData, TileType, Unit,
+    add_item, build_requirements, hex_distance, is_under_construction, item_from_tile,
 };
 
 // Helpers for route/build unit simulation shared by 2D build-oriented scenes.
@@ -420,7 +420,11 @@ pub fn update_units_and_mining(
             if block.build_claimed {
                 continue;
             }
-            let priority = if block.kind == BuildBlockType::Route { 0 } else { 1 };
+            let priority = if block.kind == BuildBlockType::Route {
+                0
+            } else {
+                1
+            };
             let reqs = build_requirements(block.kind);
             if reqs.is_empty() {
                 continue;
@@ -498,8 +502,12 @@ pub fn update_units_and_mining(
             };
             if unit.path.first().copied() == Some(unit.station_in) {
                 if let Some(block) = blocks.get_mut(&unit.station_in) {
-                    if !take_reqs_from_block(block, &mut unit.cargo, unit.capacity, &unit.supply_reqs)
-                    {
+                    if !take_reqs_from_block(
+                        block,
+                        &mut unit.cargo,
+                        unit.capacity,
+                        &unit.supply_reqs,
+                    ) {
                         unit.waiting_for_supply = true;
                     }
                 }
@@ -524,7 +532,11 @@ pub fn update_units_and_mining(
             if block.build_claimed {
                 continue;
             }
-            let priority = if block.kind == BuildBlockType::Route { 1 } else { 0 };
+            let priority = if block.kind == BuildBlockType::Route {
+                1
+            } else {
+                0
+            };
             let reqs = build_requirements(block.kind);
             if reqs.is_empty() {
                 continue;
@@ -611,8 +623,12 @@ pub fn update_units_and_mining(
             };
             if unit.path.first().copied() == Some(unit.station_in) {
                 if let Some(block) = blocks.get_mut(&unit.station_in) {
-                    if !take_reqs_from_block(block, &mut unit.cargo, unit.capacity, &unit.supply_reqs)
-                    {
+                    if !take_reqs_from_block(
+                        block,
+                        &mut unit.cargo,
+                        unit.capacity,
+                        &unit.supply_reqs,
+                    ) {
                         unit.waiting_for_supply = true;
                     }
                 }
@@ -655,12 +671,22 @@ pub fn update_units_and_mining(
             if free_space < required_space {
                 break;
             }
-            let added = add_item(&mut block.stored, item_from_tile(tile.kind), 1, block.capacity);
+            let added = add_item(
+                &mut block.stored,
+                item_from_tile(tile.kind),
+                1,
+                block.capacity,
+            );
             if added <= 0 {
                 break;
             }
             if extra_gangue > 0 {
-                let _ = add_item(&mut block.stored, ItemType::Gangue, added * 2, block.capacity);
+                let _ = add_item(
+                    &mut block.stored,
+                    ItemType::Gangue,
+                    added * 2,
+                    block.capacity,
+                );
             }
             tile.amount -= added;
             block.mine_progress -= added as f32;
@@ -671,8 +697,12 @@ pub fn update_units_and_mining(
         if unit.auto_supply && unit.waiting_for_supply {
             if unit.path.get(unit.index).copied() == Some(unit.station_in) {
                 if let Some(block) = blocks.get_mut(&unit.station_in) {
-                    if take_reqs_from_block(block, &mut unit.cargo, unit.capacity, &unit.supply_reqs)
-                    {
+                    if take_reqs_from_block(
+                        block,
+                        &mut unit.cargo,
+                        unit.capacity,
+                        &unit.supply_reqs,
+                    ) {
                         unit.waiting_for_supply = false;
                     } else {
                         continue;
@@ -802,7 +832,7 @@ pub fn update_units_and_mining(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::{new_placed_block, ItemStack};
+    use crate::core::{ItemStack, new_placed_block};
 
     #[test]
     fn route_path_uses_route_tiles_between_endpoints() {

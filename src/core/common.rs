@@ -591,17 +591,17 @@ pub fn load_map(path: &str) -> (
                             } else {
                                 b.capacity
                             },
-                              stored: b.stored,
-                              build_progress: b.build_progress,
-                              build_time: b.build_time,
-                              build_paid: b.build_paid,
-                              build_claimed: b.build_claimed,
-                              builder_units_desired: b.builder_units_desired,
-                              builder_units_created: b.builder_units_created,
-                              mine_extra: b.mine_extra,
-                          },
-                      )
-                  })
+                            stored: b.stored,
+                            build_progress: b.build_progress,
+                            build_time: b.build_time,
+                            build_paid: b.build_paid,
+                            build_claimed: b.build_claimed,
+                            builder_units_desired: b.builder_units_desired,
+                            builder_units_created: b.builder_units_created,
+                            mine_extra: b.mine_extra,
+                        },
+                    )
+                })
                 .collect();
             let tiles = data
                 .tiles

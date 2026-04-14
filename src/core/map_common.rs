@@ -5,13 +5,12 @@ use crate::core::ui::{
 use crate::core::{
     AppConfig, Axial, FrameContext, RuntimeColors, hex_distance, hex_to_pixel, pixel_to_hex,
 };
-use crate::{HEX_RADIUS, HEX_SIZE, TRI_LENGHT};
+use crate::{HEX_RADIUS, HEX_SIZE};
 use macroquad::prelude::*;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MapOutline {
     Hexagon,
-    Triangle,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -31,11 +30,6 @@ pub struct PanelLayout {
 pub fn in_bounds(hex: Axial, outline: MapOutline) -> bool {
     match outline {
         MapOutline::Hexagon => hex_distance(hex, Axial { q: 0, r: 0 }) <= HEX_RADIUS,
-        MapOutline::Triangle => {
-            let q = hex.q;
-            let r = hex.r;
-            q >= 0 && r >= 0 && q + r <= TRI_LENGHT
-        }
     }
 }
 

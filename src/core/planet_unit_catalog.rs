@@ -338,10 +338,6 @@ const UNIT_DEFINITIONS: &[PlanetUnitDefinition] = &[
     },
 ];
 
-pub fn unit_definitions() -> &'static [PlanetUnitDefinition] {
-    UNIT_DEFINITIONS
-}
-
 pub fn unit_definition(id: PlanetUnitDefinitionId) -> &'static PlanetUnitDefinition {
     UNIT_DEFINITIONS
         .iter()
@@ -358,23 +354,6 @@ pub fn runtime_definition_for_preset(
         .unwrap_or(&UNIT_DEFINITIONS[0])
 }
 
-pub fn runtime_spawnable_definitions() -> Vec<&'static PlanetUnitDefinition> {
-    UNIT_DEFINITIONS
-        .iter()
-        .filter(|definition| definition.preset_id.is_some())
-        .collect()
-}
-
-pub fn attachment_supported(
-    category: PlanetUnitCategory,
-    attachment_id: PlanetUnitAttachmentId,
-) -> bool {
-    unit_definitions()
-        .iter()
-        .filter(|definition| definition.category == category)
-        .any(|definition| definition.supported_attachments.contains(&attachment_id))
-}
-
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
@@ -383,7 +362,7 @@ mod tests {
 
     #[test]
     fn catalog_covers_all_v1_categories() {
-        let categories: HashSet<PlanetUnitCategory> = unit_definitions()
+        let categories: HashSet<PlanetUnitCategory> = UNIT_DEFINITIONS
             .iter()
             .map(|definition| definition.category)
             .collect();
@@ -395,7 +374,7 @@ mod tests {
 
     #[test]
     fn every_definition_has_required_parts() {
-        for definition in unit_definitions() {
+        for definition in UNIT_DEFINITIONS {
             assert!(
                 !definition.required_parts.is_empty(),
                 "definition {:?} should declare parts",
@@ -406,15 +385,22 @@ mod tests {
 
     #[test]
     fn attachment_compatibility_is_category_bound() {
-        assert!(attachment_supported(
+        let supports = |category: PlanetUnitCategory, attachment_id: PlanetUnitAttachmentId| {
+            UNIT_DEFINITIONS
+                .iter()
+                .filter(|definition| definition.category == category)
+                .any(|definition| definition.supported_attachments.contains(&attachment_id))
+        };
+
+        assert!(supports(
             PlanetUnitCategory::ExcavationModular,
             PlanetUnitAttachmentId::HydraulicHammer
         ));
-        assert!(!attachment_supported(
+        assert!(!supports(
             PlanetUnitCategory::CargoLogistics,
             PlanetUnitAttachmentId::HydraulicHammer
         ));
-        assert!(!attachment_supported(
+        assert!(!supports(
             PlanetUnitCategory::Drilling,
             PlanetUnitAttachmentId::Bucket
         ));

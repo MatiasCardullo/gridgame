@@ -21,16 +21,6 @@ pub enum PlanetUnitPresetId {
     Shuttle,
 }
 
-impl PlanetUnitPresetId {
-    pub fn label(self) -> &'static str {
-        match self {
-            PlanetUnitPresetId::Hauler => "Hauler",
-            PlanetUnitPresetId::BuilderSupply => "Builder Supply",
-            PlanetUnitPresetId::Shuttle => "Shuttle",
-        }
-    }
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum UnitNodeSlot {
     Depot,

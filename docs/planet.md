@@ -33,7 +33,7 @@
   - meshes (`base_texture_meshes`, `relief_meshes`, fallback),
   - topology (`base_vertices`, `sector_vertices`, `sector_faces`),
   - a single planet grid (`freq=160` default) used for hover + gameplay simulation,
-  - per-cell simulation world (surface class + deposit state),
+  - per-cell simulation world (surface class + multi-deposit resource state),
   - regeneration cache and async state.
 - Persisted gameplay data:
   - buildings: `planet_data/planet_buildings.json`
@@ -108,6 +108,12 @@
 - Uses the same grid cache (`planet_data/planet_sim_grid.bin`) for gameplay state.
 - Builds or loads per-cell simulation snapshot (`planet_data/planet_resources.bin`).
 - Classifies cells as `Land`, `Coast`, or `Water` from noise/sea-level, then derives lithology and deposits.
+- Resource generation now supports multiple deposits per cell:
+  - Minerals (`Iron`, `Copper`, `Gold`, `Lead`, `Zinc`, `Aluminum`, `Lithium`, `Phosphate`) each use an independent seeded noise map layered on top of geologic suitability.
+  - `Stone`, `Salt`, and `FreshWater` remain more tightly coupled to terrain/surface rules instead of mineral noise.
+  - Empty cells are valid.
+  - Cells with several deposits are valid.
+  - `FreshWater` is never generated for `Water` cells.
 - Buildability currently allows only `Land`.
 - Construction economy mirrors the legacy 2D sector flow:
   - New buildings start unpaid/under construction.
@@ -127,6 +133,7 @@
 9. UI:
 - Debug controls (`draw_planet_controls`).
 - Text for the hovered sector/zone name plus hovered sim-cell info (surface/buildability/deposit).
+- Hover/building UI now lists all deposits found in a sim cell instead of only one.
 - Build/mining controls:
   - `1`: no tool
   - `2`: `Base`
@@ -136,6 +143,8 @@
   - `M`: export hovered base-face zone PNG to `planet_data/zone_maps/`
   - `Shift+M`: export PNGs for all base-face zones
   - Mines extract continuously from cell deposits and reduce persisted `remaining_amount`.
+  - If a mine covers a multi-resource cell, extraction is mixed across the active deposits in that cell.
+  - Expanded mine zones aggregate totals across all deposits from all covered cells.
 - Building windows now include:
   - Construction status + requirements.
   - Base toggle for automatic builder unit spawning.

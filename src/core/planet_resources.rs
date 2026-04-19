@@ -1,3 +1,4 @@
+use std::fs;
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Write};
 
@@ -9,6 +10,8 @@ use crate::core::planet_texture::{PlanetNoiseConfig, height_value};
 const SNAPSHOT_MAGIC: &[u8; 4] = b"PRS1";
 const SNAPSHOT_VERSION: u16 = 2;
 const COASTAL_HEIGHT_BAND: f32 = 0.08;
+const RESOURCE_MAP_IMAGE_PREFIX: &str = "planet_data/planet_resource";
+const RESOURCE_MAP_SIZE: u16 = 1024;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PlanetSurfaceClass {
     Land,
@@ -306,7 +309,7 @@ fn generate_world(
     for metric in metrics.iter() {
         let surface = classify_surface(metric.height, config.sea_level);
         let lithology = choose_lithology(metric, surface, config, seed);
-        let deposits = generate_deposits(metric, surface, lithology, config, seed);
+        let deposits = generate_deposits(metric, config, seed);
         let buildable = matches!(surface, PlanetSurfaceClass::Land);
         cells.push(PlanetCellState {
             surface,
@@ -370,171 +373,46 @@ fn choose_lithology(
 
 fn generate_deposits(
     metric: &CellMetrics,
-    surface: PlanetSurfaceClass,
-    lithology: LithologyKind,
     config: &PlanetNoiseConfig,
     seed: u64,
 ) -> Vec<PlanetDeposit> {
-    let sea = config.sea_level;
-    let h_relief = (metric.height - sea).max(0.0);
-    let seabed_depth = (sea - metric.height).max(0.0);
-    let is_water = matches!(surface, PlanetSurfaceClass::Water);
-    let structure = metric.fracture;
-    let volcanic = metric.volcanic;
-    let p_iron = if matches!(
-        surface,
-        PlanetSurfaceClass::Land | PlanetSurfaceClass::Coast
-    ) {
-        lithology_match(lithology, LithologyKind::IgneousMafic, 0.65)
-            + lithology_match(lithology, LithologyKind::IgneousFelsic, 0.25)
-            + h_relief * 0.4
-            + metric.slope * 2.4
-    } else if is_water {
-        lithology_match(lithology, LithologyKind::IgneousMafic, 0.34)
-            + seabed_depth * 0.9
-            + metric.slope * 1.1
-    } else {
-        0.0
-    };
-    let p_copper = if matches!(
-        surface,
-        PlanetSurfaceClass::Land | PlanetSurfaceClass::Coast
-    ) {
-        volcanic * 0.8 + structure * 0.4 + metric.slope * 3.0 + h_relief * 0.25
-    } else if is_water {
-        volcanic * 0.55 + structure * 0.35 + metric.slope * 1.4 + seabed_depth * 0.65
-    } else {
-        0.0
-    };
-    let p_gold = if matches!(
-        surface,
-        PlanetSurfaceClass::Land | PlanetSurfaceClass::Coast
-    ) {
-        volcanic * 0.5 + structure * 0.7 + metric.slope * 2.2 + h_relief * 0.25
-    } else if is_water {
-        volcanic * 0.32 + structure * 0.35 + metric.slope * 0.95 + seabed_depth * 0.25
-    } else {
-        0.0
-    };
-    let p_lead = if matches!(
-        surface,
-        PlanetSurfaceClass::Land | PlanetSurfaceClass::Coast
-    ) {
-        lithology_match(lithology, LithologyKind::Carbonate, 0.7) + structure * 0.5
-    } else if is_water {
-        lithology_match(lithology, LithologyKind::Carbonate, 0.26) + seabed_depth * 0.6
-    } else {
-        0.0
-    };
-    let p_zinc = if matches!(
-        surface,
-        PlanetSurfaceClass::Land | PlanetSurfaceClass::Coast
-    ) {
-        lithology_match(lithology, LithologyKind::Carbonate, 0.75) + structure * 0.45
-    } else if is_water {
-        lithology_match(lithology, LithologyKind::Carbonate, 0.24) + seabed_depth * 0.62
-    } else {
-        0.0
-    };
-    let p_aluminum = if matches!(
-        surface,
-        PlanetSurfaceClass::Land | PlanetSurfaceClass::Coast
-    ) {
-        lithology_match(lithology, LithologyKind::Clastic, 0.55)
-            + lithology_match(lithology, LithologyKind::IgneousFelsic, 0.45)
-            + (1.0 - metric.slope * 4.5).clamp(0.0, 1.0) * 0.4
-            + metric.dryness * 0.22
-    } else {
-        0.0
-    };
-    let p_lithium = if matches!(surface, PlanetSurfaceClass::Land) {
-        lithology_match(lithology, LithologyKind::Evaporite, 0.75)
-            + metric.dryness * 0.65
-            + (1.0 - metric.slope * 5.0).clamp(0.0, 1.0) * 0.35
-    } else {
-        0.0
-    };
-    let p_phosphate = if matches!(surface, PlanetSurfaceClass::Coast) {
-        lithology_match(lithology, LithologyKind::PhosphoriteHost, 0.9)
-            + (1.0 - metric.slope * 4.0).clamp(0.0, 1.0) * 0.5
-    } else if is_water {
-        lithology_match(lithology, LithologyKind::PhosphoriteHost, 0.45)
-            + (1.0 - metric.slope * 3.0).clamp(0.0, 1.0) * 0.35
-    } else {
-        0.0
-    };
-    let p_stone = if !is_water {
-        0.35 + metric.slope * 1.2
-    } else {
-        0.2 + seabed_depth * 0.8 + metric.slope * 0.6
-    };
-    let p_fresh_water = if matches!(surface, PlanetSurfaceClass::Land) {
-        (1.0 - metric.dryness) * 0.6 + (1.0 - metric.slope * 4.0).clamp(0.0, 1.0) * 0.3
-    } else {
-        0.0
-    };
-    let p_salt = if matches!(surface, PlanetSurfaceClass::Coast) {
-        lithology_match(lithology, LithologyKind::Evaporite, 0.8) + metric.dryness * 0.5
-    } else if is_water {
-        lithology_match(lithology, LithologyKind::Evaporite, 0.35) + metric.dryness * 0.2
-    } else {
-        0.0
-    };
-
     let mut deposits = Vec::new();
-    for (kind, score) in [
-        (
-            PlanetResourceKind::Iron,
-            p_iron + mineral_noise(metric.dir, seed, PlanetResourceKind::Iron) * 0.7,
-        ),
-        (
-            PlanetResourceKind::Copper,
-            p_copper + mineral_noise(metric.dir, seed, PlanetResourceKind::Copper) * 0.72,
-        ),
-        (
-            PlanetResourceKind::Gold,
-            p_gold * 0.55 + mineral_noise(metric.dir, seed, PlanetResourceKind::Gold) * 0.66,
-        ),
-        (
-            PlanetResourceKind::Lead,
-            p_lead + mineral_noise(metric.dir, seed, PlanetResourceKind::Lead) * 0.68,
-        ),
-        (
-            PlanetResourceKind::Zinc,
-            p_zinc + mineral_noise(metric.dir, seed, PlanetResourceKind::Zinc) * 0.68,
-        ),
-        (
-            PlanetResourceKind::Aluminum,
-            p_aluminum + mineral_noise(metric.dir, seed, PlanetResourceKind::Aluminum) * 0.65,
-        ),
-        (
-            PlanetResourceKind::Lithium,
-            p_lithium + mineral_noise(metric.dir, seed, PlanetResourceKind::Lithium) * 0.74,
-        ),
-        (
-            PlanetResourceKind::Phosphate,
-            p_phosphate + mineral_noise(metric.dir, seed, PlanetResourceKind::Phosphate) * 0.62,
-        ),
-    ] {
+    for kind in resource_map_kinds() {
+        let score = sample_resource_score(metric.dir, config, seed, kind);
         if let Some(deposit) = deposit_from_score(kind, score) {
-            deposits.push(deposit);
-        }
-    }
-
-    if let Some(deposit) = deposit_from_score(PlanetResourceKind::Stone, p_stone) {
-        deposits.push(deposit);
-    }
-    if let Some(deposit) = deposit_from_score(PlanetResourceKind::Salt, p_salt) {
-        deposits.push(deposit);
-    }
-    if !is_water {
-        if let Some(deposit) = deposit_from_score(PlanetResourceKind::FreshWater, p_fresh_water) {
             deposits.push(deposit);
         }
     }
 
     deposits.sort_by_key(|deposit| deposit.kind.to_u8());
     deposits
+}
+
+fn sample_resource_score(
+    dir: Vec3,
+    config: &PlanetNoiseConfig,
+    seed: u64,
+    kind: PlanetResourceKind,
+) -> f32 {
+    match kind {
+        PlanetResourceKind::FreshWater | PlanetResourceKind::Salt => {
+            let height = height_value(dir, config);
+            if height < config.sea_level {
+                0.0
+            } else {
+                resource_noise_score(dir, seed, kind)
+            }
+        }
+        PlanetResourceKind::Iron
+        | PlanetResourceKind::Copper
+        | PlanetResourceKind::Gold
+        | PlanetResourceKind::Lead
+        | PlanetResourceKind::Zinc
+        | PlanetResourceKind::Aluminum
+        | PlanetResourceKind::Lithium
+        | PlanetResourceKind::Phosphate => resource_noise_score(dir, seed, kind),
+        PlanetResourceKind::Stone => 0.0,
+    }
 }
 
 fn deposit_from_score(kind: PlanetResourceKind, score: f32) -> Option<PlanetDeposit> {
@@ -544,7 +422,6 @@ fn deposit_from_score(kind: PlanetResourceKind, score: f32) -> Option<PlanetDepo
         PlanetResourceKind::Phosphate => 0.68,
         PlanetResourceKind::Salt => 0.66,
         PlanetResourceKind::FreshWater => 0.63,
-        PlanetResourceKind::Stone => 0.55,
         PlanetResourceKind::Aluminum => 0.64,
         _ => 0.62,
     };
@@ -558,7 +435,6 @@ fn deposit_from_score(kind: PlanetResourceKind, score: f32) -> Option<PlanetDepo
         PlanetResourceKind::Lithium => 12_000,
         PlanetResourceKind::Phosphate => 15_000,
         PlanetResourceKind::FreshWater => 18_000,
-        PlanetResourceKind::Stone => 28_000,
         PlanetResourceKind::Salt => 14_000,
         PlanetResourceKind::Aluminum => 20_000,
         _ => 16_000,
@@ -573,7 +449,21 @@ fn deposit_from_score(kind: PlanetResourceKind, score: f32) -> Option<PlanetDepo
     })
 }
 
-fn mineral_noise(dir: Vec3, seed: u64, kind: PlanetResourceKind) -> f32 {
+fn resource_noise_score(dir: Vec3, seed: u64, kind: PlanetResourceKind) -> f32 {
+    let broad = resource_noise_layer(dir, seed, kind, 1.8, 3, vec3(7.0, -11.0, 5.0));
+    let medium = resource_noise_layer(dir, seed, kind, 4.2, 4, vec3(-13.0, 3.0, 17.0));
+    let detail = resource_noise_layer(dir, seed, kind, 8.6, 5, vec3(19.0, 23.0, -29.0));
+    (broad * 0.52 + medium * 0.33 + detail * 0.15).clamp(0.0, 1.0)
+}
+
+fn resource_noise_layer(
+    dir: Vec3,
+    seed: u64,
+    kind: PlanetResourceKind,
+    scale: f32,
+    octaves: u32,
+    offset: Vec3,
+) -> f32 {
     let kind_seed = match kind {
         PlanetResourceKind::Iron => 0x00A1_1023_u64,
         PlanetResourceKind::Copper => 0x00B2_2045_u64,
@@ -583,22 +473,221 @@ fn mineral_noise(dir: Vec3, seed: u64, kind: PlanetResourceKind) -> f32 {
         PlanetResourceKind::Aluminum => 0x00F6_60EF_u64,
         PlanetResourceKind::Lithium => 0x0017_7123_u64,
         PlanetResourceKind::Phosphate => 0x0028_8235_u64,
-        _ => 0x0039_9347_u64,
+        PlanetResourceKind::FreshWater => 0x0039_9347_u64,
+        PlanetResourceKind::Salt => 0x004A_A569_u64,
+        PlanetResourceKind::Stone => 0x005B_B78B_u64,
     };
     fbm3_resource(
-        dir.x * 2.6 + 11.0,
-        dir.y * 2.6 - 7.0,
-        dir.z * 2.6 + 5.0,
+        dir.x * scale + offset.x,
+        dir.y * scale + offset.y,
+        dir.z * scale + offset.z,
         seed ^ kind_seed,
-        4,
+        octaves,
     )
 }
 
-fn lithology_match(current: LithologyKind, wanted: LithologyKind, value: f32) -> f32 {
-    if current == wanted {
-        value
-    } else {
-        value * 0.16
+fn resource_map_kinds() -> [PlanetResourceKind; 10] {
+    [
+        PlanetResourceKind::Iron,
+        PlanetResourceKind::Copper,
+        PlanetResourceKind::Gold,
+        PlanetResourceKind::Lead,
+        PlanetResourceKind::Zinc,
+        PlanetResourceKind::Aluminum,
+        PlanetResourceKind::Lithium,
+        PlanetResourceKind::Phosphate,
+        PlanetResourceKind::FreshWater,
+        PlanetResourceKind::Salt,
+    ]
+}
+
+fn save_resource_maps(config: &PlanetNoiseConfig, seed: u64, size: u16) {
+    for kind in resource_map_kinds() {
+        let _ = load_or_build_resource_map(config, seed, kind, size);
+    }
+}
+
+pub fn ensure_resource_maps(config: &PlanetNoiseConfig, seed: u64) {
+    save_resource_maps(config, seed, RESOURCE_MAP_SIZE);
+}
+
+fn load_or_build_resource_map(
+    config: &PlanetNoiseConfig,
+    seed: u64,
+    kind: PlanetResourceKind,
+    size: u16,
+) -> Vec<u8> {
+    if let Some(pixels) = load_resource_map_png(config, seed, kind, size) {
+        return pixels;
+    }
+    let pixels = build_resource_map_pixels(config, seed, kind, size);
+    save_resource_map_png(config, seed, kind, size, &pixels);
+    pixels
+}
+
+fn resource_map_cache_key(
+    config: &PlanetNoiseConfig,
+    seed: u64,
+    kind: PlanetResourceKind,
+    size: u16,
+) -> u64 {
+    let words = [
+        config.noise_scale.to_bits() as u64,
+        config.height_amp.to_bits() as u64,
+        config.height_bias.to_bits() as u64,
+        config.lat_bias.to_bits() as u64,
+        config.sea_level.to_bits() as u64,
+        config.ice_start.to_bits() as u64,
+        config.ice_strength.to_bits() as u64,
+        seed,
+        kind.to_u8() as u64,
+        size as u64,
+    ];
+    let mut hash: u64 = 1469598103934665603;
+    for word in words {
+        hash ^= word;
+        hash = hash.wrapping_mul(1099511628211);
+    }
+    hash
+}
+
+fn resource_map_cache_path(
+    config: &PlanetNoiseConfig,
+    seed: u64,
+    kind: PlanetResourceKind,
+    size: u16,
+) -> String {
+    format!(
+        "{}_{}_{:016x}_{}x{}.png",
+        RESOURCE_MAP_IMAGE_PREFIX,
+        resource_map_name(kind),
+        resource_map_cache_key(config, seed, kind, size),
+        size,
+        size
+    )
+}
+
+fn resource_map_name(kind: PlanetResourceKind) -> &'static str {
+    match kind {
+        PlanetResourceKind::Iron => "iron",
+        PlanetResourceKind::Copper => "copper",
+        PlanetResourceKind::Gold => "gold",
+        PlanetResourceKind::Lead => "lead",
+        PlanetResourceKind::Zinc => "zinc",
+        PlanetResourceKind::Aluminum => "aluminum",
+        PlanetResourceKind::Lithium => "lithium",
+        PlanetResourceKind::Phosphate => "phosphate",
+        PlanetResourceKind::FreshWater => "fresh_water",
+        PlanetResourceKind::Salt => "salt",
+        PlanetResourceKind::Stone => "stone",
+    }
+}
+
+fn resource_map_color(kind: PlanetResourceKind) -> Color {
+    match kind {
+        PlanetResourceKind::Iron => Color::from_rgba(160, 112, 96, 255),
+        PlanetResourceKind::Copper => Color::from_rgba(210, 124, 70, 255),
+        PlanetResourceKind::Gold => Color::from_rgba(230, 190, 70, 255),
+        PlanetResourceKind::Lead => Color::from_rgba(100, 110, 140, 255),
+        PlanetResourceKind::Zinc => Color::from_rgba(180, 190, 205, 255),
+        PlanetResourceKind::Aluminum => Color::from_rgba(196, 204, 214, 255),
+        PlanetResourceKind::Lithium => Color::from_rgba(214, 120, 186, 255),
+        PlanetResourceKind::Phosphate => Color::from_rgba(184, 212, 124, 255),
+        PlanetResourceKind::FreshWater => Color::from_rgba(84, 166, 255, 255),
+        PlanetResourceKind::Salt => Color::from_rgba(224, 232, 238, 255),
+        PlanetResourceKind::Stone => Color::from_rgba(132, 132, 132, 255),
+    }
+}
+
+fn load_resource_map_png(
+    config: &PlanetNoiseConfig,
+    seed: u64,
+    kind: PlanetResourceKind,
+    size: u16,
+) -> Option<Vec<u8>> {
+    let path = resource_map_cache_path(config, seed, kind, size);
+    let file_bytes = fs::read(path).ok()?;
+    let mut image = Image::from_file_with_format(&file_bytes, None).ok()?;
+    if image.width != size || image.height != size {
+        return None;
+    }
+    flip_rgba_vertical(&mut image.bytes, image.width as usize, image.height as usize);
+    Some(image.bytes)
+}
+
+fn save_resource_map_png(
+    config: &PlanetNoiseConfig,
+    seed: u64,
+    kind: PlanetResourceKind,
+    size: u16,
+    pixels: &[u8],
+) {
+    if pixels.len() != size as usize * size as usize * 4 {
+        return;
+    }
+    let path = resource_map_cache_path(config, seed, kind, size);
+    let image = Image {
+        bytes: pixels.to_vec(),
+        width: size,
+        height: size,
+    };
+    image.export_png(&path);
+}
+
+fn build_resource_map_pixels(
+    config: &PlanetNoiseConfig,
+    seed: u64,
+    kind: PlanetResourceKind,
+    size: u16,
+) -> Vec<u8> {
+    let size = size as usize;
+    let color = resource_map_color(kind);
+    let mut scores = vec![0.0f32; size * size];
+    let mut max_score = 0.0f32;
+
+    for y in 0..size {
+        let v = y as f32 / (size - 1) as f32;
+        let phi = v * std::f32::consts::PI;
+        let sin_phi = phi.sin();
+        let cos_phi = phi.cos();
+        for x in 0..size {
+            let u = x as f32 / (size - 1) as f32;
+            let theta = (u - 0.5) * std::f32::consts::TAU;
+            let dir = vec3(sin_phi * theta.cos(), cos_phi, sin_phi * theta.sin());
+            let score = sample_resource_score(dir, config, seed, kind).max(0.0);
+            scores[y * size + x] = score;
+            max_score = max_score.max(score);
+        }
+    }
+
+    let mut pixels = vec![0u8; size * size * 4];
+    for y in 0..size {
+        for x in 0..size {
+            let idx = y * size + x;
+            let intensity = if max_score <= 1e-6 {
+                0.0
+            } else {
+                (scores[idx] / max_score).clamp(0.0, 1.0)
+            };
+            let glow = intensity.sqrt();
+            let px = idx * 4;
+            pixels[px] = (color.r * glow * 255.0) as u8;
+            pixels[px + 1] = (color.g * glow * 255.0) as u8;
+            pixels[px + 2] = (color.b * glow * 255.0) as u8;
+            pixels[px + 3] = 255;
+        }
+    }
+    pixels
+}
+
+fn flip_rgba_vertical(bytes: &mut [u8], width: usize, height: usize) {
+    let stride = width * 4;
+    for y in 0..(height / 2) {
+        let top = y * stride;
+        let bottom = (height - 1 - y) * stride;
+        for x in 0..stride {
+            bytes.swap(top + x, bottom + x);
+        }
     }
 }
 
@@ -881,7 +970,7 @@ mod tests {
                 slope: 0.2,
                 lithology: LithologyKind::Clastic,
                 deposits: vec![PlanetDeposit {
-                    kind: PlanetResourceKind::Stone,
+                    kind: PlanetResourceKind::Iron,
                     initial_amount: 10,
                     remaining_amount: 3,
                     grade_permille: 500,
@@ -892,7 +981,7 @@ mod tests {
         };
         assert_eq!(
             world.extract_from_cell(0, 7),
-            vec![(PlanetResourceKind::Stone, 3)]
+            vec![(PlanetResourceKind::Iron, 3)]
         );
         assert_eq!(world.cells[0].deposits[0].remaining_amount, 0);
     }
@@ -951,8 +1040,6 @@ mod tests {
         };
         let deposits = generate_deposits(
             &metric,
-            PlanetSurfaceClass::Water,
-            LithologyKind::Clastic,
             &config,
             42,
         );
@@ -960,6 +1047,29 @@ mod tests {
             deposits
                 .iter()
                 .all(|deposit| deposit.kind != PlanetResourceKind::FreshWater)
+        );
+    }
+
+    #[test]
+    fn stone_is_not_generated() {
+        let config = PlanetNoiseConfig::default();
+        let metric = CellMetrics {
+            dir: vec3(0.3, 0.8, 0.4).normalize(),
+            height: config.sea_level + 0.08,
+            slope: 0.04,
+            dryness: 0.4,
+            fracture: 0.3,
+            volcanic: 0.3,
+        };
+        let deposits = generate_deposits(
+            &metric,
+            &config,
+            42,
+        );
+        assert!(
+            deposits
+                .iter()
+                .all(|deposit| deposit.kind != PlanetResourceKind::Stone)
         );
     }
 }

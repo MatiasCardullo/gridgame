@@ -76,10 +76,10 @@ impl Default for PlanetNoiseConfig {
     fn default() -> Self {
         Self {
             noise_scale: 2.0,
-            height_amp: 1.2,
-            height_bias: -0.3,
+            height_amp: 0.8,
+            height_bias: 0.1,
             lat_bias: 0.1,
-            sea_level: 0.62,
+            sea_level: 0.44,
             ice_start: 0.55,
             ice_strength: 1.6,
             subdivisions: 4,

@@ -21,7 +21,7 @@ use crate::core::planet_grid::{
 };
 use crate::core::planet_resources::{
     PlanetCellState, PlanetResourceKind, PlanetSimWorld, PlanetSurfaceClass,
-    build_or_load_sim_world,
+    build_or_load_sim_world, ensure_resource_maps,
 };
 use crate::core::planet_texture::{
     PlanetNoiseConfig, color_from_height, height_value, load_or_build_heightmap,
@@ -49,7 +49,7 @@ const SIM_GRID_CACHE_PATH: &str = "planet_data/planet_sim_grid.bin";
 const PLANET_RESOURCES_PATH: &str = "planet_data/planet_resources.bin";
 const PLANET_BUILDINGS_PATH: &str = "planet_data/planet_buildings.json";
 const PLANET_UNITS_PATH: &str = "planet_data/planet_units.json";
-const HEIGHTMAP_SIZE: u16 = 2048;
+const HEIGHTMAP_SIZE: u16 = 4096;
 const TEXTURE_BASE_SUBDIVISIONS: usize = 2;
 const TEXTURE_LAYER_OFFSET: f32 = 0.004;
 const SUBDIVISION_HYSTERESIS: f32 = 0.25;
@@ -61,6 +61,8 @@ const SIM_GRID_HEXES_ACROSS: i32 = 160;
 const PLANET_OVERLAY_OFFSET: f32 = 0.01;
 const PLANET_SIM_SEED: u64 = 0xDA7A_51C4_1234_8B9E;
 const MINE_EXTRACT_RATE_PER_SEC: f32 = 6.0;
+const PLANET_RADIUS: f32 = 1.6;
+const SURFACE_EYE_HEIGHT: f32 = 0.012;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum UnitNodePick {
@@ -68,6 +70,20 @@ enum UnitNodePick {
     Dropoff,
     Refuel,
     Construction,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PlanetViewMode {
+    Orbit,
+    Surface,
+}
+
+#[derive(Clone, Debug)]
+struct SurfaceCameraRig {
+    anchor_dir: Vec3,
+    yaw: f32,
+    pitch: f32,
+    move_speed: f32,
 }
 
 // Wraps an angle to the [-PI, PI] range for smooth camera interpolation.
@@ -176,6 +192,109 @@ fn debug_camera_from_rig(rig: &DebugCameraRig) -> Camera3D {
         z_near: 0.05,
         z_far: 200.0,
         ..Default::default()
+    }
+}
+
+fn surface_basis(up: Vec3) -> (Vec3, Vec3) {
+    let up = up.normalize_or_zero();
+    let mut north = vec3(0.0, 1.0, 0.0) - up * up.dot(vec3(0.0, 1.0, 0.0));
+    if north.length_squared() < 1e-5 {
+        north = vec3(0.0, 0.0, 1.0) - up * up.dot(vec3(0.0, 0.0, 1.0));
+    }
+    let north = north.normalize_or_zero();
+    let east = up.cross(north).normalize_or_zero();
+    (north, east)
+}
+
+fn yaw_from_surface_forward(forward: Vec3, up: Vec3) -> f32 {
+    let (north, east) = surface_basis(up);
+    forward.dot(east).atan2(forward.dot(north))
+}
+
+fn planet_surface_radius(dir: Vec3, config: &PlanetNoiseConfig) -> f32 {
+    let normal = dir.normalize_or_zero();
+    let height = height_value(normal, config);
+    let elevation = if height < config.sea_level {
+        0.0
+    } else {
+        (height - config.sea_level) * 0.28
+    };
+    PLANET_RADIUS + elevation
+}
+
+fn surface_camera_from_rig(rig: &SurfaceCameraRig, config: &PlanetNoiseConfig) -> Camera3D {
+    let surface_up = rig.anchor_dir.normalize_or_zero();
+    let (north, east) = surface_basis(surface_up);
+    let forward_flat = (north * rig.yaw.cos() + east * rig.yaw.sin()).normalize_or_zero();
+    let forward =
+        (forward_flat * rig.pitch.cos() + surface_up * rig.pitch.sin()).normalize_or_zero();
+    let surface_radius = planet_surface_radius(surface_up, config);
+    let position = surface_up * (surface_radius + SURFACE_EYE_HEIGHT);
+    Camera3D {
+        position,
+        target: position + forward,
+        up: -surface_up,
+        fovy: 75.0,
+        z_near: 0.01,
+        z_far: 200.0,
+        ..Default::default()
+    }
+}
+
+fn update_surface_camera_rig(
+    rig: &mut SurfaceCameraRig,
+    config: &PlanetNoiseConfig,
+    frame_time: f32,
+) {
+    let delta = mouse_delta_position();
+    rig.yaw += delta.x * 0.12;
+    rig.pitch = (rig.pitch + delta.y * 0.12).clamp(-1.2, 1.2);
+
+    let up = rig.anchor_dir.normalize_or_zero();
+    let (north, east) = surface_basis(up);
+    let forward = (north * rig.yaw.cos() + east * rig.yaw.sin()).normalize_or_zero();
+    let right = up.cross(forward).normalize_or_zero();
+    let mut move_dir = Vec3::ZERO;
+    if is_key_down(KeyCode::W) {
+        move_dir += forward;
+    }
+    if is_key_down(KeyCode::S) {
+        move_dir -= forward;
+    }
+    if is_key_down(KeyCode::D) {
+        move_dir += right;
+    }
+    if is_key_down(KeyCode::A) {
+        move_dir -= right;
+    }
+    if move_dir.length_squared() > 0.0 {
+        let speed = if is_key_down(KeyCode::LeftShift) {
+            rig.move_speed * 2.2
+        } else {
+            rig.move_speed
+        };
+        let surface_radius = planet_surface_radius(up, config).max(0.1);
+        let travel = move_dir.normalize() * (speed * frame_time / surface_radius);
+        rig.anchor_dir = (up + travel).normalize_or_zero();
+    }
+}
+
+fn surface_rig_from_orbit(camera: &Camera3D, _config: &PlanetNoiseConfig) -> SurfaceCameraRig {
+    let orbit_forward = (camera.target - camera.position).normalize_or_zero();
+    let anchor_dir = ray_sphere_intersection(camera.position, orbit_forward, PLANET_RADIUS)
+        .map(|hit| hit.normalize_or_zero())
+        .unwrap_or_else(|| (-camera.position).normalize_or_zero());
+    let mut forward = orbit_forward - anchor_dir * orbit_forward.dot(anchor_dir);
+    if forward.length_squared() < 1e-5 {
+        let (north, _) = surface_basis(anchor_dir);
+        forward = north;
+    }
+    let forward = forward.normalize_or_zero();
+    SurfaceCameraRig {
+        anchor_dir,
+        yaw: yaw_from_surface_forward(forward, anchor_dir),
+        pitch: 0.0,
+        move_speed: 0.6,
     }
 }
 
@@ -1066,6 +1185,8 @@ pub struct PlanetLoader {
 }
 
 pub struct PlanetState {
+    view_mode: PlanetViewMode,
+    surface_camera: SurfaceCameraRig,
     pub camera_rot: Quat,
     pub target_rot: Quat,
     pub distance: f32,
@@ -1190,7 +1311,18 @@ impl PlanetState {
         let initial_camera_pos = (initial_rot * vec3(0.0, 0.0, 1.0)) * 6.0;
         let initial_forward = (-initial_camera_pos).normalize_or_zero();
         let (initial_yaw, initial_pitch) = yaw_pitch_from_forward(initial_forward);
+        let initial_orbit_camera = Camera3D {
+            position: initial_camera_pos,
+            target: vec3(0.0, 0.0, 0.0),
+            up: initial_rot * vec3(0.0, 1.0, 0.0),
+            fovy: 45.0,
+            z_near: 0.05,
+            z_far: 200.0,
+            ..Default::default()
+        };
         let mut state = Self {
+            view_mode: PlanetViewMode::Orbit,
+            surface_camera: surface_rig_from_orbit(&initial_orbit_camera, &config),
             camera_rot: initial_rot,
             target_rot: initial_rot,
             distance: 6.0,
@@ -2248,7 +2380,7 @@ impl PlanetLoader {
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
             let mut log_file = File::create("loading.log").ok().map(BufWriter::new);
-            let total_steps: u32 = 5;
+            let total_steps: u32 = 6;
             let mut done_steps: u32 = 0;
 
             fn send_log(
@@ -2333,6 +2465,17 @@ impl PlanetLoader {
                 &mut log_file,
                 "Load/build heightmap",
                 heightmap_start,
+                &mut done_steps,
+                total_steps,
+            );
+
+            let resource_maps_start = step_start(&tx, &mut log_file, "Load/build resource maps");
+            ensure_resource_maps(&config, PLANET_SIM_SEED);
+            step_done(
+                &tx,
+                &mut log_file,
+                "Load/build resource maps",
+                resource_maps_start,
                 &mut done_steps,
                 total_steps,
             );
@@ -3783,6 +3926,8 @@ pub fn run(
     greek_font: Option<&Font>,
 ) {
     if is_key_pressed(KeyCode::Escape) {
+        set_cursor_grab(false);
+        show_mouse(true);
         if let Some(sim_world) = state.sim_world.as_mut() {
             sim_world.save_if_dirty(PLANET_RESOURCES_PATH);
         }
@@ -3877,24 +4022,72 @@ pub fn run(
 
     let mouse = vec2(mouse_position().0, mouse_position().1);
     let was_debug_camera_enabled = state.debug_camera.enabled;
+    if is_key_pressed(KeyCode::F5) {
+        match state.view_mode {
+            PlanetViewMode::Orbit => {
+                let orbit_camera = Camera3D {
+                    position: (state.camera_rot * vec3(0.0, 0.0, 1.0)) * state.distance,
+                    target: vec3(0.0, 0.0, 0.0),
+                    up: state.camera_rot * vec3(0.0, 1.0, 0.0),
+                    fovy: 45.0,
+                    z_near: 0.05,
+                    z_far: 200.0,
+                    ..Default::default()
+                };
+                state.surface_camera = surface_rig_from_orbit(&orbit_camera, &state.config);
+                state.view_mode = PlanetViewMode::Surface;
+            }
+            PlanetViewMode::Surface => {
+                let up = state.surface_camera.anchor_dir.normalize_or_zero();
+                let (north, east) = surface_basis(up);
+                let orbit_up = (north * state.surface_camera.yaw.cos()
+                    + east * state.surface_camera.yaw.sin())
+                .normalize_or_zero();
+                let orbit_rot = quat_from_forward_up(up, orbit_up);
+                state.camera_rot = orbit_rot;
+                state.target_rot = orbit_rot;
+                state.view_mode = PlanetViewMode::Orbit;
+            }
+        }
+    }
     if is_key_pressed(KeyCode::F6) {
         state.debug_camera.enabled = !state.debug_camera.enabled;
     }
     if is_key_pressed(KeyCode::F7) {
         state.debug_camera.show_original_frustum = !state.debug_camera.show_original_frustum;
     }
+    let grab_surface_mouse =
+        state.view_mode == PlanetViewMode::Surface && !state.debug_camera.enabled;
+    set_cursor_grab(grab_surface_mouse);
+    show_mouse(!grab_surface_mouse);
 
-    let orbit_camera_pos = (state.camera_rot * vec3(0.0, 0.0, 1.0)) * state.distance;
     if !was_debug_camera_enabled && state.debug_camera.enabled {
-        let orbit_forward = (-orbit_camera_pos).normalize_or_zero();
+        let source_camera = if state.view_mode == PlanetViewMode::Surface {
+            surface_camera_from_rig(&state.surface_camera, &state.config)
+        } else {
+            let orbit_camera_pos = (state.camera_rot * vec3(0.0, 0.0, 1.0)) * state.distance;
+            Camera3D {
+                position: orbit_camera_pos,
+                target: vec3(0.0, 0.0, 0.0),
+                up: state.camera_rot * vec3(0.0, 1.0, 0.0),
+                fovy: 45.0,
+                z_near: 0.05,
+                z_far: 200.0,
+                ..Default::default()
+            }
+        };
+        let orbit_forward = (source_camera.target - source_camera.position).normalize_or_zero();
         let (yaw, pitch) = yaw_pitch_from_forward(orbit_forward);
-        state.debug_camera.position = orbit_camera_pos;
+        state.debug_camera.position = source_camera.position;
         state.debug_camera.yaw = yaw;
         state.debug_camera.pitch = pitch;
         state.debug_camera.looking = false;
     }
 
-    if !state.debug_camera.enabled && is_mouse_button_down(MouseButton::Middle) {
+    if state.view_mode == PlanetViewMode::Orbit
+        && !state.debug_camera.enabled
+        && is_mouse_button_down(MouseButton::Middle)
+    {
         if !state.dragging {
             state.dragging = true;
             state.last_mouse = mouse;
@@ -3959,7 +4152,10 @@ pub fn run(
     if is_key_down(KeyCode::Down) {
         pitch_input -= 1.0;
     }
-    if !state.debug_camera.enabled && (yaw_input != 0.0 || pitch_input != 0.0) {
+    if state.view_mode == PlanetViewMode::Orbit
+        && !state.debug_camera.enabled
+        && (yaw_input != 0.0 || pitch_input != 0.0)
+    {
         let speed = 1.6;
         let up_dir = state.target_rot * vec3(0.0, 1.0, 0.0);
         let right_dir = state.target_rot * vec3(1.0, 0.0, 0.0);
@@ -3969,7 +4165,7 @@ pub fn run(
     }
 
     let (_wx, wy) = mouse_wheel();
-    if !state.debug_camera.enabled && wy.abs() > 0.001 {
+    if state.view_mode == PlanetViewMode::Orbit && !state.debug_camera.enabled && wy.abs() > 0.001 {
         state.target_distance =
             (state.target_distance - wy * 0.001 * state.target_distance).clamp(1.8, 100.0);
     }
@@ -4020,11 +4216,16 @@ pub fn run(
         z_far: 200.0,
         ..Default::default()
     };
+    if state.view_mode == PlanetViewMode::Surface && !state.debug_camera.enabled {
+        update_surface_camera_rig(&mut state.surface_camera, &state.config, frame_time);
+    }
     if state.debug_camera.enabled {
         update_debug_camera_rig(&mut state.debug_camera, frame_time, mouse);
     }
     let active_camera = if state.debug_camera.enabled {
         debug_camera_from_rig(&state.debug_camera)
+    } else if state.view_mode == PlanetViewMode::Surface {
+        surface_camera_from_rig(&state.surface_camera, &state.config)
     } else {
         Camera3D {
             position: orbit_camera.position,
@@ -4036,10 +4237,15 @@ pub fn run(
             ..Default::default()
         }
     };
-    let culling_camera = &orbit_camera;
+    let culling_camera = if state.view_mode == PlanetViewMode::Surface && !state.debug_camera.enabled
+    {
+        &active_camera
+    } else {
+        &orbit_camera
+    };
     set_camera(&active_camera);
 
-    let radius = 1.6;
+    let radius = PLANET_RADIUS;
     let line_radius = radius + PLANET_OVERLAY_OFFSET;
     let zoom_t = ((state.distance - 2.0) / 18.0).clamp(0.0, 1.0);
     let segments = ((32.0 - 16.0 * zoom_t).round() as i32).clamp(10, 32) as usize;
@@ -4111,7 +4317,8 @@ pub fn run(
         );
     }
 
-    let use_subface_hover = state.distance <= SUBFACE_HOVER_MAX_DISTANCE;
+    let use_subface_hover =
+        state.view_mode == PlanetViewMode::Surface || state.distance <= SUBFACE_HOVER_MAX_DISTANCE;
     let mut hovered_subface: Option<usize> = None;
     let mut hovered_base_face: Option<usize> = None;
     let mut hover_hit: Option<Vec3> = None;
@@ -5314,6 +5521,27 @@ pub fn run(
             screen_height() - 18.0,
             ctx.font_sm,
             Color::from_rgba(255, 220, 150, 255),
+        );
+    } else if state.view_mode == PlanetViewMode::Surface {
+        draw_text(
+            &format!(
+                "Surface F5=orbit Mouse=look WASD move SHIFT sprint pos:{:.2},{:.2},{:.2}",
+                state.surface_camera.anchor_dir.x,
+                state.surface_camera.anchor_dir.y,
+                state.surface_camera.anchor_dir.z
+            ),
+            20.0,
+            screen_height() - 18.0,
+            ctx.font_sm,
+            Color::from_rgba(170, 230, 255, 255),
+        );
+    } else {
+        draw_text(
+            "Orbit F5=surface MMB/Arrows rotate Wheel zoom",
+            20.0,
+            screen_height() - 18.0,
+            ctx.font_sm,
+            Color::from_rgba(170, 230, 255, 255),
         );
     }
 }

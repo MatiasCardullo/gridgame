@@ -4,6 +4,13 @@ use crate::core::base_interior::{
 };
 use crate::core::{Axial, MachineBlock, MachineBlockType};
 
+fn hex_distance(a: Axial, b: Axial) -> i32 {
+    let dq = a.q - b.q;
+    let dr = a.r - b.r;
+    let ds = (a.q + a.r) - (b.q + b.r);
+    dq.abs().max(dr.abs()).max(ds.abs())
+}
+
 pub fn request_container_delivery(
     interior: &mut BaseInteriorState,
     requester_hex: Axial,
@@ -59,7 +66,7 @@ fn nearest_container_for_request(
         }) {
             continue;
         }
-        let dist = (container.hex.q - target_hex.q).abs() + (container.hex.r - target_hex.r).abs();
+        let dist = hex_distance(container.hex, target_hex);
         match best {
             Some((best_dist, _)) if dist >= best_dist => {}
             _ => best = Some((dist, container.hex)),
@@ -145,16 +152,17 @@ pub fn tick_interior_forklifts(interior: &mut BaseInteriorState, dt: f32) {
     let mut pickups: Vec<(usize, Axial, Axial)> = Vec::new();
     let mut deliveries: Vec<(usize, Axial)> = Vec::new();
     for (index, forklift) in interior.forklifts.iter_mut().enumerate() {
-        forklift.move_progress += dt * 0.55;
+        let speed = match forklift.target {
+            Some(target) if target == forklift.hex => 1.8,
+            Some(target) => 0.95 / hex_distance(forklift.hex, target).max(1) as f32,
+            None => 1.8,
+        };
+        forklift.move_progress += dt * speed;
         if forklift.move_progress < 1.0 {
             continue;
         }
         forklift.move_progress = 0.0;
-        match (
-            forklift.target,
-            forklift.source_hex,
-            forklift.request_target,
-        ) {
+        match (forklift.target, forklift.source_hex, forklift.request_target) {
             (Some(target), Some(source_hex), Some(request_target))
                 if forklift.hex == target && target == source_hex =>
             {

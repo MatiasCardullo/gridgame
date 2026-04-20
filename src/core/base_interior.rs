@@ -375,7 +375,7 @@ impl BaseInteriorState {
         let Some(node) = self.assembly_node_mut(hex) else {
             return false;
         };
-        if !node.inserted.is_empty() {
+        if !node.inserted.is_empty() || !node.completed_outputs.is_empty() {
             return false;
         }
         node.selected_recipe = recipe;
@@ -590,6 +590,9 @@ fn belt_has_item(interior: &BaseInteriorState, hex: Axial) -> bool {
 }
 
 fn assembly_can_accept(node: &AssemblyNodeState, part: InteriorPartKind) -> bool {
+    if !node.completed_outputs.is_empty() {
+        return false;
+    }
     let recipe = assembly_recipe_parts(node.selected_recipe);
     recipe.get(node.inserted.len()).copied() == Some(part)
 }
@@ -654,7 +657,7 @@ fn arm_can_deliver_part(
         .any(|output_hex| output_accepts_part(interior, *output_hex, part))
 }
 
-fn select_container_part_for_arm(
+fn select_stack_part_for_arm(
     interior: &BaseInteriorState,
     arm: &MechanicArmState,
     items: &[InteriorPartStack],
@@ -697,10 +700,22 @@ fn pickup_for_arm(
             .containers
             .iter()
             .find(|container| container.hex == candidate)
-            .and_then(|container| select_container_part_for_arm(interior, &arm, &container.items));
+            .and_then(|container| select_stack_part_for_arm(interior, &arm, &container.items));
         if let Some(kind) = selected_from_container {
             if let Some(container) = container_at_mut(interior, candidate) {
                 if take_part(&mut container.items, kind) {
+                    return Some((candidate, kind));
+                }
+            }
+        }
+        let selected_from_assembler = interior
+            .assembly_nodes
+            .iter()
+            .find(|node| node.hex == candidate)
+            .and_then(|node| select_stack_part_for_arm(interior, &arm, &node.completed_outputs));
+        if let Some(kind) = selected_from_assembler {
+            if let Some(node) = interior.assembly_node_mut(candidate) {
+                if take_part(&mut node.completed_outputs, kind) {
                     return Some((candidate, kind));
                 }
             }
@@ -1029,6 +1044,84 @@ mod tests {
                 .map(|stack| stack.amount),
             Some(1)
         );
+    }
+
+    #[test]
+    fn assembler_blocks_new_parts_while_output_waits() {
+        let node = AssemblyNodeState {
+            hex: Axial { q: 0, r: 0 },
+            selected_recipe: AssemblerRecipeId::BuilderTender,
+            inserted: Vec::new(),
+            completed_outputs: vec![InteriorPartStack {
+                kind: InteriorPartKind::BuilderTenderKit,
+                amount: 1,
+            }],
+        };
+        assert!(!assembly_can_accept(&node, InteriorPartKind::ChassisFrame));
+    }
+
+    #[test]
+    fn mechanic_arm_can_pick_completed_output_from_assembler() {
+        let mut interior = BaseInteriorState {
+            blocks: vec![
+                InteriorBlockRecord {
+                    hex: Axial { q: 0, r: 0 },
+                    block: MachineBlock {
+                        kind: MachineBlockType::MechanicArm,
+                        rotation: 0,
+                    },
+                },
+                InteriorBlockRecord {
+                    hex: Axial { q: -1, r: 0 },
+                    block: MachineBlock {
+                        kind: MachineBlockType::Assembler,
+                        rotation: 0,
+                    },
+                },
+                InteriorBlockRecord {
+                    hex: Axial { q: 1, r: 0 },
+                    block: MachineBlock {
+                        kind: MachineBlockType::Crate,
+                        rotation: 0,
+                    },
+                },
+            ],
+            containers: vec![InteriorContainerRecord {
+                hex: Axial { q: 1, r: 0 },
+                items: Vec::new(),
+            }],
+            belt_items: Vec::new(),
+            mechanic_arms: vec![MechanicArmState {
+                hex: Axial { q: 0, r: 0 },
+                held: None,
+                cooldown: 0.0,
+                output_hexes: vec![Axial { q: 1, r: 0 }],
+                input_mode: MechanicArmInputMode::ExplicitInputs,
+                input_hexes: vec![Axial { q: -1, r: 0 }],
+                filters: Vec::new(),
+                action_stage: MechanicArmActionStage::Idle,
+                action_target: None,
+                action_progress: 0.0,
+            }],
+            assembly_nodes: vec![AssemblyNodeState {
+                hex: Axial { q: -1, r: 0 },
+                selected_recipe: AssemblerRecipeId::BuilderTender,
+                inserted: Vec::new(),
+                completed_outputs: vec![InteriorPartStack {
+                    kind: InteriorPartKind::BuilderTenderKit,
+                    amount: 1,
+                }],
+            }],
+            forklifts: Vec::new(),
+            logistics_requests: Vec::new(),
+        };
+
+        tick_base_interior(&mut interior, 0.1);
+        assert_eq!(
+            interior.mechanic_arms[0].held,
+            Some(InteriorPartKind::BuilderTenderKit)
+        );
+        assert!(interior.assembly_nodes[0].completed_outputs.is_empty());
     }
 
     #[test]

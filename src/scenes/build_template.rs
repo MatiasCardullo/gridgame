@@ -1,19 +1,19 @@
 use macroquad::prelude::*;
 
 use crate::core::base_interior::{
+    all_interior_filter_parts, assembly_recipe_ids, assembly_recipe_parts, machine_block_label,
     AssemblerRecipeId, InteriorPartKind, InteriorPartStack, MechanicArmActionStage,
-    MechanicArmInputMode, all_interior_filter_parts, assembly_recipe_ids, assembly_recipe_parts,
-    machine_block_label,
+    MechanicArmInputMode,
 };
 use crate::core::map_common::{
-    ConfirmAction, MapOutline, build_panel_layout, confirm_label_for_target, draw_common_hud,
-    draw_window_frame, handle_camera_drag, handle_cursor_zoom, hex_screen_center,
-    hover_hex_from_mouse, in_bounds, is_ui_capturing, popup_rect_near_mouse, run_confirm_window,
+    build_panel_layout, confirm_label_for_target, draw_common_hud, draw_window_frame,
+    handle_camera_drag, handle_cursor_zoom, hex_screen_center, hover_hex_from_mouse, in_bounds,
+    is_ui_capturing, popup_rect_near_mouse, run_confirm_window, ConfirmAction, MapOutline,
 };
-use crate::core::ui::{WINDOW_TITLE_HEIGHT, WindowState, ui_button};
+use crate::core::ui::{ui_button, WindowState, WINDOW_TITLE_HEIGHT};
 use crate::core::{
-    AppConfig, Axial, FrameContext, MachineBlock, MachineBlockType, RuntimeColors, Scene,
-    draw_hex_filled, draw_hex_outline, hex_to_pixel,
+    draw_hex_filled, draw_hex_outline, hex_corners, hex_to_pixel, AppConfig, Axial,
+    FrameContext, MachineBlock, MachineBlockType, RuntimeColors, Scene,
 };
 use crate::scenes::planet::{InteriorPickMode, PlanetState};
 use crate::{HEX_RADIUS, HEX_SIZE};
@@ -84,25 +84,107 @@ fn part_draw_color(kind: InteriorPartKind) -> Color {
     }
 }
 
-fn arm_hand_center(
+fn draw_square_storage(center: Vec2, half_size: f32, fill: Color, border: Color, line: f32) {
+    draw_rectangle(
+        center.x - half_size,
+        center.y - half_size,
+        half_size * 2.0,
+        half_size * 2.0,
+        fill,
+    );
+    draw_rectangle_lines(
+        center.x - half_size,
+        center.y - half_size,
+        half_size * 2.0,
+        half_size * 2.0,
+        line,
+        border,
+    );
+}
+
+fn arm_hand_center_rotational(
     ctx: &FrameContext,
     cam_offset: Vec2,
     cam_zoom: f32,
     arm_hex: Axial,
+    rest_rotation: u8,
     target: Option<Axial>,
     progress: f32,
 ) -> Vec2 {
     let center = hex_screen_center(ctx, cam_offset, cam_zoom, arm_hex);
     let Some(target_hex) = target else {
-        return center;
+        let rest_angle = rest_rotation as f32 * std::f32::consts::PI / 3.0;
+        let arm_len = HEX_SIZE * 0.62 * cam_zoom;
+        return center + vec2(rest_angle.cos(), rest_angle.sin()) * arm_len;
     };
-    let target_center = hex_screen_center(ctx, cam_offset, cam_zoom, target_hex);
-    let reach = if progress < 0.5 {
+    let target_world = hex_to_pixel(target_hex, HEX_SIZE, Vec2::ZERO);
+    let arm_world = hex_to_pixel(arm_hex, HEX_SIZE, Vec2::ZERO);
+    let target_dir = target_world - arm_world;
+    if target_dir.length_squared() <= f32::EPSILON {
+        return center;
+    }
+    let target_angle = target_dir.y.atan2(target_dir.x);
+    let rest_angle = rest_rotation as f32 * std::f32::consts::PI / 3.0;
+    let sweep = if progress < 0.5 {
         progress * 2.0
     } else {
         (1.0 - progress) * 2.0
     };
-    center.lerp(target_center, reach.clamp(0.0, 1.0))
+    let mut angle_delta = target_angle - rest_angle;
+    while angle_delta > std::f32::consts::PI {
+        angle_delta -= std::f32::consts::TAU;
+    }
+    while angle_delta < -std::f32::consts::PI {
+        angle_delta += std::f32::consts::TAU;
+    }
+    let angle = rest_angle + angle_delta * sweep.clamp(0.0, 1.0);
+    let arm_len = HEX_SIZE * 0.62 * cam_zoom;
+    center + vec2(angle.cos(), angle.sin()) * arm_len
+}
+
+fn map_border_points_screen(ctx: &FrameContext, cam_offset: Vec2, cam_zoom: f32) -> [Vec2; 6] {
+    let corner_hexes = [
+        Axial {
+            q: HEX_RADIUS,
+            r: 0,
+        },
+        Axial {
+            q: HEX_RADIUS,
+            r: -HEX_RADIUS,
+        },
+        Axial {
+            q: 0,
+            r: -HEX_RADIUS,
+        },
+        Axial {
+            q: -HEX_RADIUS,
+            r: 0,
+        },
+        Axial {
+            q: -HEX_RADIUS,
+            r: HEX_RADIUS,
+        },
+        Axial {
+            q: 0,
+            r: HEX_RADIUS,
+        },
+    ];
+    let mut points = [Vec2::ZERO; 6];
+    for (idx, hex) in corner_hexes.iter().enumerate() {
+        let world_center = hex_to_pixel(*hex, HEX_SIZE, Vec2::ZERO);
+        let corners = hex_corners(world_center, HEX_SIZE);
+        let mut outer = corners[0];
+        let mut max_len_sq = outer.length_squared();
+        for corner in corners.iter().skip(1) {
+            let len_sq = corner.length_squared();
+            if len_sq > max_len_sq {
+                max_len_sq = len_sq;
+                outer = *corner;
+            }
+        }
+        points[idx] = ctx.screen_center + cam_offset + outer * cam_zoom;
+    }
+    points
 }
 
 fn forklift_screen_center(
@@ -119,6 +201,24 @@ fn forklift_screen_center(
     };
     let end = hex_screen_center(ctx, cam_offset, cam_zoom, target_hex);
     start.lerp(end, progress.clamp(0.0, 1.0))
+}
+
+fn forklift_cargo_offset(
+    forklift: &crate::core::base_interior::InteriorForkliftState,
+    zoom: f32,
+) -> Vec2 {
+    let mut y = -11.0;
+    if forklift.carried_block.is_some() {
+        y = -15.0;
+        if forklift.target == forklift.request_target && forklift.target == Some(forklift.hex) {
+            let settle = (1.0 - forklift.move_progress.clamp(0.0, 1.0)) * 8.0;
+            y = -7.0 - settle;
+        }
+    } else if forklift.target == forklift.source_hex && forklift.target == Some(forklift.hex) {
+        let dip = forklift.move_progress.clamp(0.0, 1.0) * 6.0;
+        y = -11.0 + dip;
+    }
+    vec2(0.0, y * zoom)
 }
 
 fn hover_summary(state: &PlanetState, hex: Axial) -> Option<String> {
@@ -401,13 +501,47 @@ pub fn run(
                 }
 
                 if let Some(block) = interior.block_at(hex) {
-                    draw_hex_filled(
-                        center,
-                        (HEX_SIZE - 2.5) * *cam_zoom,
-                        machine_block_color(block.kind),
-                    );
-                    if block.kind == MachineBlockType::ConveyorBelt {
-                        draw_belt_chevrons(center, block.rotation, *cam_zoom, colors.text_primary);
+                    match block.kind {
+                        MachineBlockType::Pallet | MachineBlockType::Crate => {
+                            let half = HEX_SIZE * 0.42 * *cam_zoom;
+                            draw_square_storage(
+                                center,
+                                half,
+                                machine_block_color(block.kind),
+                                colors.text_primary,
+                                config.line_thickness.max(1.0),
+                            );
+                            let slat = if block.kind == MachineBlockType::Pallet {
+                                Color::from_rgba(207, 171, 118, 255)
+                            } else {
+                                Color::from_rgba(150, 114, 78, 255)
+                            };
+                            for offset in [-half * 0.42, 0.0, half * 0.42] {
+                                draw_line(
+                                    center.x - half,
+                                    center.y + offset,
+                                    center.x + half,
+                                    center.y + offset,
+                                    config.line_thickness.max(1.0),
+                                    slat,
+                                );
+                            }
+                        }
+                        _ => {
+                            draw_hex_filled(
+                                center,
+                                (HEX_SIZE - 2.5) * *cam_zoom,
+                                machine_block_color(block.kind),
+                            );
+                            if block.kind == MachineBlockType::ConveyorBelt {
+                                draw_belt_chevrons(
+                                    center,
+                                    block.rotation,
+                                    *cam_zoom,
+                                    colors.text_primary,
+                                );
+                            }
+                        }
                     }
                 }
                 if *cam_zoom > 1.1 {
@@ -428,11 +562,16 @@ pub fn run(
         for arm in &interior.mechanic_arms {
             let center = hex_screen_center(ctx, *cam_offset, *cam_zoom, arm.hex);
             if arm.action_stage != MechanicArmActionStage::Idle {
-                let hand_center = arm_hand_center(
+                let rest_rotation = interior
+                    .block_at(arm.hex)
+                    .map(|block| block.rotation)
+                    .unwrap_or(0);
+                let hand_center = arm_hand_center_rotational(
                     ctx,
                     *cam_offset,
                     *cam_zoom,
                     arm.hex,
+                    rest_rotation,
                     arm.action_target,
                     arm.action_progress,
                 );
@@ -471,6 +610,20 @@ pub fn run(
             }
         }
 
+        let border_points = map_border_points_screen(ctx, *cam_offset, *cam_zoom);
+        for i in 0..6 {
+            let a = border_points[i];
+            let b = border_points[(i + 1) % 6];
+            draw_line(
+                a.x,
+                a.y,
+                b.x,
+                b.y,
+                (config.line_thickness * 2.8).max(2.2),
+                colors.hover,
+            );
+        }
+
         for node in &interior.assembly_nodes {
             let center = hex_screen_center(ctx, *cam_offset, *cam_zoom, node.hex);
             if !node.inserted.is_empty() {
@@ -481,11 +634,7 @@ pub fn run(
                     Color::from_rgba(140, 255, 190, 180),
                 );
             }
-            let ready_total: u32 = node
-                .completed_outputs
-                .iter()
-                .map(|stack| stack.amount)
-                .sum();
+            let ready_total: u32 = node.completed_outputs.iter().map(|stack| stack.amount).sum();
             if ready_total > 0 {
                 draw_text(
                     &format!("K{}", ready_total),
@@ -506,27 +655,70 @@ pub fn run(
                 forklift.target,
                 forklift.move_progress,
             );
+            let cargo_center = center + forklift_cargo_offset(forklift, *cam_zoom);
             if let Some(block_kind) = forklift.carried_block {
                 let mut cargo_color = machine_block_color(block_kind);
                 cargo_color.a = 220.0 / 255.0;
-                draw_hex_filled(
-                    center + vec2(0.0, -11.0 * *cam_zoom),
-                    (HEX_SIZE * 0.46) * *cam_zoom,
+                let cargo_half = HEX_SIZE * 0.36 * *cam_zoom;
+                draw_square_storage(
+                    cargo_center,
+                    cargo_half,
                     cargo_color,
-                );
-                draw_hex_outline(
-                    center + vec2(0.0, -11.0 * *cam_zoom),
-                    (HEX_SIZE * 0.46) * *cam_zoom,
                     colors.text_primary,
                     config.line_thickness.max(1.0),
                 );
             }
+            let fork_reach = if forklift.target == forklift.source_hex
+                && forklift.target == Some(forklift.hex)
+                && forklift.carried_block.is_none()
+            {
+                6.0 + 6.0 * forklift.move_progress.clamp(0.0, 1.0)
+            } else {
+                8.0
+            } * *cam_zoom;
             draw_rectangle(
-                center.x - 7.0 * *cam_zoom,
-                center.y - 4.0 * *cam_zoom,
-                14.0 * *cam_zoom,
-                8.0 * *cam_zoom,
+                center.x - 8.0 * *cam_zoom,
+                center.y - 4.5 * *cam_zoom,
+                16.0 * *cam_zoom,
+                9.0 * *cam_zoom,
                 Color::from_rgba(120, 214, 255, 255),
+            );
+            draw_rectangle(
+                center.x - 6.0 * *cam_zoom,
+                center.y - 10.5 * *cam_zoom,
+                3.0 * *cam_zoom,
+                12.0 * *cam_zoom,
+                Color::from_rgba(92, 120, 140, 255),
+            );
+            draw_rectangle(
+                center.x + 3.0 * *cam_zoom,
+                center.y - 10.5 * *cam_zoom,
+                3.0 * *cam_zoom,
+                12.0 * *cam_zoom,
+                Color::from_rgba(92, 120, 140, 255),
+            );
+            draw_line(
+                center.x + 6.0 * *cam_zoom,
+                center.y - 1.0 * *cam_zoom,
+                center.x + 6.0 * *cam_zoom + fork_reach,
+                center.y - 1.0 * *cam_zoom,
+                config.line_thickness.max(1.2),
+                Color::from_rgba(230, 230, 230, 255),
+            );
+            draw_line(
+                center.x + 6.0 * *cam_zoom,
+                center.y + 2.0 * *cam_zoom,
+                center.x + 6.0 * *cam_zoom + fork_reach,
+                center.y + 2.0 * *cam_zoom,
+                config.line_thickness.max(1.2),
+                Color::from_rgba(230, 230, 230, 255),
+            );
+            draw_rectangle(
+                center.x - 2.0 * *cam_zoom,
+                center.y - 13.0 * *cam_zoom,
+                8.0 * *cam_zoom,
+                4.0 * *cam_zoom,
+                Color::from_rgba(187, 231, 255, 255),
             );
             draw_text(
                 &format!("{}", forklift.id),

@@ -63,8 +63,7 @@ pub struct InteriorBeltItem {
     pub progress: f32,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[derive(Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum MechanicArmInputMode {
     #[default]
     AnyNeighbor,
@@ -130,10 +129,13 @@ pub struct InteriorForkliftState {
     pub carried_block: Option<MachineBlockType>,
     #[serde(default)]
     pub carried_items: Vec<InteriorPartStack>,
+    #[serde(default)]
+    pub route: Vec<Axial>,
+    #[serde(default)]
+    pub route_index: usize,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[derive(Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum AssemblerRecipeId {
     #[default]
     BuilderTender,
@@ -567,6 +569,8 @@ pub fn default_base_interior() -> BaseInteriorState {
                 source_hex: None,
                 carried_block: None,
                 carried_items: Vec::new(),
+                route: Vec::new(),
+                route_index: 0,
             },
             InteriorForkliftState {
                 id: 2,
@@ -579,6 +583,8 @@ pub fn default_base_interior() -> BaseInteriorState {
                 source_hex: None,
                 carried_block: None,
                 carried_items: Vec::new(),
+                route: Vec::new(),
+                route_index: 0,
             },
         ],
         logistics_requests: Vec::new(),
@@ -849,26 +855,38 @@ fn tick_belts(interior: &mut BaseInteriorState, dt: f32) {
     let snapshot = interior.belt_items.clone();
     for (index, snapshot_item) in snapshot.iter().enumerate() {
         let new_progress = snapshot_item.progress + dt * 0.65;
-        if let Some(item) = interior.belt_items.get_mut(index) {
-            item.progress = new_progress;
-        }
+        let mut capped_progress = new_progress;
         if new_progress < 1.0 {
+            if let Some(item) = interior.belt_items.get_mut(index) {
+                item.progress = new_progress;
+            }
             continue;
         }
         let Some(block) = interior.block_at(snapshot_item.hex) else {
+            if let Some(item) = interior.belt_items.get_mut(index) {
+                item.progress = new_progress;
+            }
             continue;
         };
         if block.kind != MachineBlockType::ConveyorBelt {
+            if let Some(item) = interior.belt_items.get_mut(index) {
+                item.progress = new_progress;
+            }
             continue;
         }
         let next_hex = direction_hex(snapshot_item.hex, block.rotation);
-        if interior
+        let can_move = interior
             .block_at(next_hex)
             .map(|next| next.kind == MachineBlockType::ConveyorBelt)
             .unwrap_or(false)
-            && !belt_has_item(interior, next_hex)
-        {
+            && !belt_has_item(interior, next_hex);
+        if can_move {
             moves.push((index, next_hex));
+        } else {
+            capped_progress = 0.98;
+        }
+        if let Some(item) = interior.belt_items.get_mut(index) {
+            item.progress = capped_progress;
         }
     }
     for (index, next_hex) in moves.into_iter().rev() {

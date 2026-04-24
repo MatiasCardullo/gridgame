@@ -1,26 +1,27 @@
 use macroquad::prelude::*;
 
+use crate::HEX_SIZE;
 use crate::core::base_interior::{
-    all_interior_filter_parts, assembly_recipe_ids, assembly_recipe_parts, machine_block_label,
-    AssemblerRecipeId, BaseInteriorState, InteriorCameraState, InteriorPartKind,
-    InteriorPartStack, MechanicArmActionStage, MechanicArmInputMode,
+    AssemblerRecipeId, BaseInteriorState, InteriorCameraState, InteriorPartKind, InteriorPartStack,
+    MechanicArmActionStage, MechanicArmInputMode, all_interior_filter_parts, assembly_recipe_ids,
+    assembly_recipe_parts, machine_block_label,
 };
 use crate::core::map_common::{
-    build_panel_layout, confirm_label_for_target, draw_common_hud, draw_window_frame, in_bounds,
-    is_ui_capturing, popup_rect_near_mouse, run_confirm_window, ConfirmAction, MapOutline,
+    ConfirmAction, MapOutline, build_panel_layout, confirm_label_for_target, draw_common_hud,
+    draw_window_frame, in_bounds, is_ui_capturing, popup_rect_near_mouse, run_confirm_window,
 };
-use crate::core::ui::{ui_button, WindowState, WINDOW_TITLE_HEIGHT};
+use crate::core::ui::{WINDOW_TITLE_HEIGHT, WindowState, ui_button};
 use crate::core::{
-    axial_neighbors, hex_corners, hex_to_pixel, pixel_to_hex, AppConfig, Axial, FrameContext,
-    MachineBlock, MachineBlockType, RuntimeColors, Scene,
+    AppConfig, Axial, FrameContext, MachineBlock, MachineBlockType, RuntimeColors, Scene,
+    axial_neighbors, hex_to_pixel, pixel_to_hex,
 };
 use crate::scenes::planet::{InteriorPickMode, PlanetState};
-use crate::{HEX_RADIUS, HEX_SIZE};
 
 const CELL_HEIGHT: f32 = 3.2;
 const CELL_RADIUS_SCALE: f32 = 1.0;
 const BLOCK_Y: f32 = CELL_HEIGHT + 3.0;
 const ARM_BASE_HEIGHT: f32 = 16.0;
+const FLOOR_DRAW_RADIUS: i32 = 22;
 
 fn machine_block_color(kind: MachineBlockType) -> Color {
     match kind {
@@ -93,120 +94,79 @@ fn rotation_dir(rotation: u8) -> Vec3 {
     hex_world_center(neighbor, 0.0).normalize_or_zero()
 }
 
-fn hex_world_corners(hex: Axial, radius_scale: f32, y: f32) -> [Vec3; 6] {
-    let center = hex_to_pixel(hex, HEX_SIZE, Vec2::ZERO);
-    let corners = hex_corners(center, HEX_SIZE * radius_scale);
-    [
-        vec3(corners[0].x, y, corners[0].y),
-        vec3(corners[1].x, y, corners[1].y),
-        vec3(corners[2].x, y, corners[2].y),
-        vec3(corners[3].x, y, corners[3].y),
-        vec3(corners[4].x, y, corners[4].y),
-        vec3(corners[5].x, y, corners[5].y),
-    ]
+fn axial_distance(a: Axial, b: Axial) -> i32 {
+    let dq = a.q - b.q;
+    let dr = a.r - b.r;
+    let ds = (a.q + a.r) - (b.q + b.r);
+    (dq.abs() + dr.abs() + ds.abs()) / 2
 }
 
-fn face_visible(point: Vec3, normal: Vec3, camera_position: Vec3) -> bool {
-    normal.dot(camera_position - point) > 0.0
+fn draw_box(center: Vec3, size: Vec3, fill: Color, outline: Color, wire_only: bool) {
+    if wire_only {
+        draw_cube_wires(center, size, outline);
+        return;
+    }
+    draw_cube(center, size, None, fill);
+    draw_cube_wires(center, size, outline);
 }
 
-fn draw_box(center: Vec3, size: Vec3, fill: Color, outline: Color, camera_position: Vec3) {
-    let hx = size.x * 0.5;
-    let hy = size.y * 0.5;
-    let hz = size.z * 0.5;
-
-    let p000 = center + vec3(-hx, -hy, -hz);
-    let p001 = center + vec3(-hx, -hy, hz);
-    let p010 = center + vec3(-hx, hy, -hz);
-    let p011 = center + vec3(-hx, hy, hz);
-    let p100 = center + vec3(hx, -hy, -hz);
-    let p101 = center + vec3(hx, -hy, hz);
-    let p110 = center + vec3(hx, hy, -hz);
-    let p111 = center + vec3(hx, hy, hz);
-
-    let faces = [
-        ([p000, p001, p011, p010], vec3(-1.0, 0.0, 0.0)),
-        ([p100, p110, p111, p101], vec3(1.0, 0.0, 0.0)),
-        ([p000, p100, p101, p001], vec3(0.0, -1.0, 0.0)),
-        ([p010, p011, p111, p110], vec3(0.0, 1.0, 0.0)),
-        ([p000, p010, p110, p100], vec3(0.0, 0.0, -1.0)),
-        ([p001, p101, p111, p011], vec3(0.0, 0.0, 1.0)),
-    ];
-    for (points, normal) in faces {
-        let face_center = (points[0] + points[1] + points[2] + points[3]) * 0.25;
-        if !face_visible(face_center, normal, camera_position) {
-            continue;
-        }
-        for i in 0..4 {
-            draw_line_3d(points[i], points[(i + 1) % 4], outline);
-        }
-    }
-    if face_visible(center + vec3(0.0, hy, 0.0), vec3(0.0, 1.0, 0.0), camera_position) {
-        draw_line_3d(p010, p101, shade(fill, 0.82));
-        draw_line_3d(p011, p100, shade(fill, 0.82));
-    }
-}
-
-fn draw_hex_column(
-    center: Vec3,
-    radius_scale: f32,
-    height: f32,
-    fill: Color,
-    outline: Color,
-    camera_position: Vec3,
-) {
-    let top_outline = hex_world_corners(
-        pixel_to_hex(vec2(center.x, center.z), HEX_SIZE, Vec2::ZERO),
-        radius_scale,
-        center.y + height * 0.5 + 0.02,
-    );
-    let bottom_outline = hex_world_corners(
-        pixel_to_hex(vec2(center.x, center.z), HEX_SIZE, Vec2::ZERO),
-        radius_scale,
-        center.y - height * 0.5,
-    );
-    if face_visible(center + vec3(0.0, height * 0.5, 0.0), vec3(0.0, 1.0, 0.0), camera_position) {
-        for i in 0..6 {
-            draw_line_3d(top_outline[i], top_outline[(i + 1) % 6], outline);
-        }
-    }
-    for i in 0..6 {
-        let next = (i + 1) % 6;
-        let edge_mid = (top_outline[i] + top_outline[next] + bottom_outline[i] + bottom_outline[next])
-            * 0.25;
-        let outward = vec3(edge_mid.x - center.x, 0.0, edge_mid.z - center.z).normalize_or_zero();
-        if !face_visible(edge_mid, outward, camera_position) {
-            continue;
-        }
-        draw_line_3d(top_outline[i], top_outline[next], outline);
-        draw_line_3d(bottom_outline[i], bottom_outline[next], shade(outline, 0.7));
-        draw_line_3d(bottom_outline[i], top_outline[i], shade(outline, 0.82));
-        draw_line_3d(bottom_outline[next], top_outline[next], shade(outline, 0.82));
-    }
-    let center_top = vec3(center.x, center.y + height * 0.5, center.z);
-    if face_visible(center_top, vec3(0.0, 1.0, 0.0), camera_position) {
-        for corner in top_outline {
-            draw_line_3d(center_top, corner, shade(fill, 0.78));
-        }
-    }
-}
-
-fn draw_hex_outline(hex: Axial, y: f32, color: Color, camera_position: Vec3) {
-    let corners = hex_world_corners(hex, CELL_RADIUS_SCALE, y);
+fn draw_hex_tile(hex: Axial, y: f32, fill: Color, outline: Color, wire_only: bool) {
     let center = hex_world_center(hex, y);
-    if face_visible(center, vec3(0.0, 1.0, 0.0), camera_position) {
-        for i in 0..6 {
-            draw_line_3d(corners[i], corners[(i + 1) % 6], color);
-        }
+    let radius = HEX_SIZE * CELL_RADIUS_SCALE;
+    let height = 0.24;
+    let params = DrawCylinderParams {
+        sides: 6,
+        draw_mode: if wire_only {
+            DrawMode::Lines
+        } else {
+            DrawMode::Triangles
+        },
+    };
+    draw_cylinder_ex(
+        vec3(center.x, y - height, center.z),
+        radius,
+        radius,
+        height,
+        None,
+        fill,
+        params,
+    );
+    if !wire_only {
+        let outline_params = DrawCylinderParams {
+            sides: 6,
+            draw_mode: DrawMode::Lines,
+        };
+        draw_cylinder_ex(
+            vec3(center.x, y - height, center.z),
+            radius,
+            radius,
+            height,
+            None,
+            outline,
+            outline_params,
+        );
     }
 }
 
-fn arm_hand_world(
-    arm_hex: Axial,
-    rest_rotation: u8,
-    target: Option<Axial>,
-    progress: f32,
-) -> Vec3 {
+fn draw_hex_outline(hex: Axial, y: f32, color: Color) {
+    let center = hex_world_center(hex, y);
+    let radius = HEX_SIZE * CELL_RADIUS_SCALE;
+    let params = DrawCylinderParams {
+        sides: 6,
+        draw_mode: DrawMode::Lines,
+    };
+    draw_cylinder_ex(
+        vec3(center.x, y - 0.02, center.z),
+        radius,
+        radius,
+        0.04,
+        None,
+        color,
+        params,
+    );
+}
+
+fn arm_hand_world(arm_hex: Axial, rest_rotation: u8, target: Option<Axial>, progress: f32) -> Vec3 {
     let center = hex_world_center(arm_hex, ARM_BASE_HEIGHT);
     let rest_dir = rotation_dir(rest_rotation);
     let arm_len = HEX_SIZE * 0.68;
@@ -223,7 +183,9 @@ fn arm_hand_world(
     } else {
         (1.0 - progress) * 2.0
     };
-    let dir = rest_dir.lerp(target_dir, sweep.clamp(0.0, 1.0)).normalize_or_zero();
+    let dir = rest_dir
+        .lerp(target_dir, sweep.clamp(0.0, 1.0))
+        .normalize_or_zero();
     center + dir * arm_len
 }
 
@@ -236,16 +198,106 @@ fn forklift_world_center(from: Axial, to: Option<Axial>, progress: f32) -> Vec3 
     start.lerp(end, progress.clamp(0.0, 1.0))
 }
 
+fn forklift_forward_dir(from: Axial, to: Option<Axial>) -> Vec3 {
+    let Some(target_hex) = to else {
+        return vec3(1.0, 0.0, 0.0);
+    };
+    let from_center = hex_world_center(from, BLOCK_Y + 2.0);
+    let to_center = hex_world_center(target_hex, BLOCK_Y + 2.0);
+    let flat = vec3(
+        to_center.x - from_center.x,
+        0.0,
+        to_center.z - from_center.z,
+    );
+    if flat.length_squared() <= f32::EPSILON {
+        vec3(1.0, 0.0, 0.0)
+    } else {
+        flat.normalize()
+    }
+}
+
+fn belt_item_world_center(interior: &BaseInteriorState, hex: Axial, progress: f32) -> Vec3 {
+    let from = hex_world_center(hex, BLOCK_Y + 5.4);
+    let Some(block) = interior.block_at(hex) else {
+        return from;
+    };
+    if block.kind != MachineBlockType::ConveyorBelt {
+        return from;
+    }
+    let next_hex = axial_neighbors(hex)[block.rotation as usize % 6];
+    let next_is_belt = interior
+        .block_at(next_hex)
+        .map(|next| next.kind == MachineBlockType::ConveyorBelt)
+        .unwrap_or(false);
+    if !next_is_belt {
+        return from;
+    }
+    let next_has_item = interior.belt_items.iter().any(|item| item.hex == next_hex);
+    if next_has_item {
+        let stop_progress = progress.clamp(0.0, 0.94);
+        let to = hex_world_center(next_hex, BLOCK_Y + 5.4);
+        return from.lerp(to, stop_progress);
+    }
+    let to = hex_world_center(next_hex, BLOCK_Y + 5.4);
+    from.lerp(to, progress.clamp(0.0, 1.0))
+}
+
+fn draw_oriented_box(
+    center: Vec3,
+    dir: Vec3,
+    side: Vec3,
+    length: f32,
+    height: f32,
+    width: f32,
+    fill: Color,
+    outline: Color,
+    wire_only: bool,
+) {
+    let x = dir.normalize_or_zero() * length;
+    let y = vec3(0.0, height, 0.0);
+    let z = side.normalize_or_zero() * width;
+    let origin = center - x * 0.5 - y * 0.5 - z * 0.5;
+    if !wire_only {
+        draw_affine_parallelepiped(origin, x, y, z, None, fill);
+    }
+    let p000 = origin;
+    let p100 = origin + x;
+    let p010 = origin + y;
+    let p110 = origin + x + y;
+    let p001 = origin + z;
+    let p101 = origin + x + z;
+    let p011 = origin + y + z;
+    let p111 = origin + x + y + z;
+    let edges = [
+        (p000, p100),
+        (p000, p010),
+        (p000, p001),
+        (p100, p110),
+        (p100, p101),
+        (p010, p110),
+        (p010, p011),
+        (p001, p101),
+        (p001, p011),
+        (p110, p111),
+        (p101, p111),
+        (p011, p111),
+    ];
+    for (a, b) in edges {
+        draw_line_3d(a, b, outline);
+    }
+}
+
 fn build_template_camera(state: &InteriorCameraState) -> Camera3D {
-    let focus = vec3(state.focus_x, 0.0, state.focus_z);
-    let orbit = vec3(
+    let position = vec3(state.focus_x, state.distance, state.focus_z);
+    let forward = vec3(
         state.yaw.cos() * state.pitch.cos(),
         state.pitch.sin(),
         state.yaw.sin() * state.pitch.cos(),
-    );
+    )
+    .normalize_or_zero();
     Camera3D {
-        position: focus + orbit.normalize_or_zero() * state.distance,
-        target: focus,
+        position,
+        target: position + forward,
         up: vec3(0.0, 1.0, 0.0),
         fovy: 45.0,
         z_near: 1.0,
@@ -256,36 +308,82 @@ fn build_template_camera(state: &InteriorCameraState) -> Camera3D {
 
 fn update_build_template_camera(
     camera: &mut InteriorCameraState,
+    blocked_hexes: &[Axial],
+    forklift_hexes: &[Axial],
     mouse: Vec2,
     ui_capturing: bool,
     dragging: &mut bool,
     last_mouse: &mut Vec2,
 ) {
-    if !ui_capturing {
-        let (_, wheel_y) = mouse_wheel();
-        if wheel_y.abs() > 0.01 {
-            let zoom_factor = (1.0 - wheel_y * 0.08).clamp(0.72, 1.28);
-            camera.distance = (camera.distance * zoom_factor).clamp(90.0, 720.0);
-        }
+    if camera.distance > 80.0 {
+        camera.distance = 26.0;
     }
-
-    let camera_active = !ui_capturing && is_mouse_button_down(MouseButton::Middle);
+    let camera_active = !ui_capturing && is_mouse_button_down(MouseButton::Right);
     if camera_active {
         let delta = mouse - *last_mouse;
-        if is_key_down(KeyCode::LeftShift) || is_key_down(KeyCode::RightShift) {
-            let pan_scale = camera.distance * 0.18 / screen_height().max(1.0);
-            let forward_flat = vec2(camera.yaw.cos(), camera.yaw.sin()).normalize_or_zero();
-            let right_flat = vec2(-forward_flat.y, forward_flat.x);
-            let pan = right_flat * (-delta.x * pan_scale) + forward_flat * (delta.y * pan_scale);
-            camera.focus_x += pan.x;
-            camera.focus_z += pan.y;
-        } else {
-            camera.yaw -= delta.x * 0.01;
-            camera.pitch = (camera.pitch - delta.y * 0.008).clamp(0.28, 1.3);
-        }
+        camera.yaw -= delta.x * 0.0055;
+        camera.pitch = (camera.pitch - delta.y * 0.0045).clamp(-1.25, 1.25);
         *dragging = true;
     } else {
         *dragging = false;
+    }
+
+    if !ui_capturing {
+        let dt = get_frame_time();
+        let speed = if is_key_down(KeyCode::LeftShift) || is_key_down(KeyCode::RightShift) {
+            320.0
+        } else {
+            180.0
+        };
+        let forward_flat = vec2(camera.yaw.cos(), camera.yaw.sin()).normalize_or_zero();
+        let right_flat = vec2(-forward_flat.y, forward_flat.x);
+        let mut move_dir = vec2(0.0, 0.0);
+        if is_key_down(KeyCode::W) {
+            move_dir += forward_flat;
+        }
+        if is_key_down(KeyCode::S) {
+            move_dir -= forward_flat;
+        }
+        if is_key_down(KeyCode::D) {
+            move_dir += right_flat;
+        }
+        if is_key_down(KeyCode::A) {
+            move_dir -= right_flat;
+        }
+        if move_dir.length_squared() > f32::EPSILON {
+            let step = move_dir.normalize() * (speed * dt);
+            let step_target_x = camera.focus_x + step.x;
+            let step_target_z = camera.focus_z + step.y;
+
+            let can_move_x = {
+                let candidate =
+                    pixel_to_hex(vec2(step_target_x, camera.focus_z), HEX_SIZE, Vec2::ZERO);
+                in_bounds(candidate, MapOutline::Hexagon)
+                    && !blocked_hexes.contains(&candidate)
+                    && !forklift_hexes.contains(&candidate)
+            };
+            if can_move_x {
+                camera.focus_x = step_target_x;
+            }
+
+            let can_move_z = {
+                let candidate =
+                    pixel_to_hex(vec2(camera.focus_x, step_target_z), HEX_SIZE, Vec2::ZERO);
+                in_bounds(candidate, MapOutline::Hexagon)
+                    && !blocked_hexes.contains(&candidate)
+                    && !forklift_hexes.contains(&candidate)
+            };
+            if can_move_z {
+                camera.focus_z = step_target_z;
+            }
+        }
+        if is_key_down(KeyCode::Space) {
+            camera.distance += speed * 0.55 * dt;
+        }
+        if is_key_down(KeyCode::LeftControl) || is_key_down(KeyCode::RightControl) {
+            camera.distance -= speed * 0.55 * dt;
+        }
+        camera.distance = camera.distance.clamp(10.0, 120.0);
     }
     *last_mouse = mouse;
 }
@@ -321,17 +419,137 @@ fn hover_hex_from_mouse_3d(camera: &Camera3D, mouse: Vec2) -> Option<Axial> {
     Some(pixel_to_hex(vec2(hit.x, hit.z), HEX_SIZE, Vec2::ZERO))
 }
 
+fn draw_machine_block(
+    kind: MachineBlockType,
+    rotation: u8,
+    center: Vec3,
+    colors: &RuntimeColors,
+    wire_only: bool,
+) {
+    let fill = machine_block_color(kind);
+    let outline = shade(fill, 0.55);
+    match kind {
+        MachineBlockType::ConveyorBelt => {
+            let dir = rotation_dir(rotation);
+            let side = vec3(-dir.z, 0.0, dir.x);
+            draw_oriented_box(
+                center + vec3(0.0, 1.8, 0.0),
+                dir,
+                side,
+                34.0,
+                3.6,
+                18.0,
+                fill,
+                outline,
+                wire_only,
+            );
+            let top = center + vec3(0.0, 4.4, 0.0);
+            for offset in [-7.0_f32, 6.0] {
+                let mid = top + dir * offset;
+                let a = mid - dir * 5.0 + side * 3.5;
+                let b = mid;
+                let c = mid - dir * 5.0 - side * 3.5;
+                draw_line_3d(a, b, colors.text_primary);
+                draw_line_3d(c, b, colors.text_primary);
+            }
+        }
+        MachineBlockType::MechanicArm => {
+            draw_box(
+                center + vec3(0.0, 4.0, 0.0),
+                vec3(16.0, 8.0, 16.0),
+                fill,
+                outline,
+                wire_only,
+            );
+        }
+        MachineBlockType::Chest => {
+            draw_box(
+                center + vec3(0.0, 8.0, 0.0),
+                vec3(24.0, 16.0, 24.0),
+                fill,
+                outline,
+                wire_only,
+            );
+        }
+        MachineBlockType::Assembler => {
+            draw_box(
+                center + vec3(0.0, 12.0, 0.0),
+                vec3(30.0, 24.0, 30.0),
+                fill,
+                outline,
+                wire_only,
+            );
+            draw_box(
+                center + vec3(0.0, 24.0, 0.0),
+                vec3(18.0, 6.0, 18.0),
+                shade(fill, 1.15),
+                outline,
+                wire_only,
+            );
+        }
+        MachineBlockType::Furnace => {
+            draw_box(
+                center + vec3(0.0, 10.0, 0.0),
+                vec3(28.0, 20.0, 28.0),
+                fill,
+                outline,
+                wire_only,
+            );
+            draw_box(
+                center + vec3(0.0, 23.0, 0.0),
+                vec3(14.0, 8.0, 14.0),
+                shade(fill, 0.82),
+                outline,
+                wire_only,
+            );
+        }
+        MachineBlockType::Pallet => {
+            draw_box(
+                center + vec3(0.0, 2.2, 0.0),
+                vec3(26.0, 4.4, 26.0),
+                fill,
+                outline,
+                wire_only,
+            );
+            for offset in [-7.0_f32, 0.0, 7.0] {
+                draw_box(
+                    center + vec3(0.0, 4.7, offset),
+                    vec3(28.0, 1.2, 3.2),
+                    Color::from_rgba(207, 171, 118, 255),
+                    outline,
+                    wire_only,
+                );
+            }
+        }
+        MachineBlockType::Crate => {
+            draw_box(
+                center + vec3(0.0, 7.0, 0.0),
+                vec3(24.0, 14.0, 24.0),
+                fill,
+                outline,
+                wire_only,
+            );
+        }
+    }
+}
+
 fn draw_world(
     interior: &BaseInteriorState,
     hover_hex: Option<Axial>,
+    preview: Option<(Axial, MachineBlockType, u8)>,
+    camera_center_hex: Axial,
     config: &AppConfig,
     colors: &RuntimeColors,
-    camera_position: Vec3,
 ) {
-    for r in -HEX_RADIUS..=HEX_RADIUS {
-        for q in -HEX_RADIUS..=HEX_RADIUS {
+    for r in (camera_center_hex.r - FLOOR_DRAW_RADIUS)..=(camera_center_hex.r + FLOOR_DRAW_RADIUS) {
+        for q in
+            (camera_center_hex.q - FLOOR_DRAW_RADIUS)..=(camera_center_hex.q + FLOOR_DRAW_RADIUS)
+        {
             let hex = Axial { q, r };
             if !in_bounds(hex, MapOutline::Hexagon) {
+                continue;
+            }
+            if axial_distance(hex, camera_center_hex) > FLOOR_DRAW_RADIUS {
                 continue;
             }
             let occupied = interior.block_at(hex).is_some();
@@ -347,25 +565,18 @@ fn draw_world(
                 base
             };
             let outline = if hovered { colors.hover } else { colors.grid };
-            draw_hex_column(
-                hex_world_center(hex, CELL_HEIGHT * 0.5),
-                CELL_RADIUS_SCALE,
-                CELL_HEIGHT,
-                fill,
-                outline,
-                camera_position,
-            );
+            draw_hex_tile(hex, 0.0, fill, outline, false);
         }
     }
 
     for belt_item in &interior.belt_items {
         let color = part_draw_color(belt_item.kind);
         draw_box(
-            hex_world_center(belt_item.hex, BLOCK_Y + 3.0 + belt_item.progress * 2.0),
+            belt_item_world_center(interior, belt_item.hex, belt_item.progress),
             vec3(6.0, 4.0, 6.0),
             color,
             shade(color, 0.55),
-            camera_position,
+            false,
         );
     }
 
@@ -373,89 +584,7 @@ fn draw_world(
         let hex = block_record.hex;
         let block = &block_record.block;
         let center = hex_world_center(hex, BLOCK_Y);
-        let fill = machine_block_color(block.kind);
-        let outline = shade(fill, 0.55);
-        match block.kind {
-            MachineBlockType::ConveyorBelt => {
-                draw_box(
-                    center + vec3(0.0, 1.8, 0.0),
-                    vec3(34.0, 3.6, 18.0),
-                    fill,
-                    outline,
-                    camera_position,
-                );
-                let dir = rotation_dir(block.rotation);
-                let side = vec3(-dir.z, 0.0, dir.x);
-                let top = center + vec3(0.0, 4.4, 0.0);
-                for offset in [-7.0_f32, 6.0] {
-                    let mid = top + dir * offset;
-                    let a = mid - dir * 5.0 + side * 3.5;
-                    let b = mid;
-                    let c = mid - dir * 5.0 - side * 3.5;
-                    draw_line_3d(a, b, colors.text_primary);
-                    draw_line_3d(c, b, colors.text_primary);
-                }
-            }
-            MachineBlockType::MechanicArm => {
-                draw_box(center + vec3(0.0, 4.0, 0.0), vec3(16.0, 8.0, 16.0), fill, outline, camera_position);
-            }
-            MachineBlockType::Chest => {
-                draw_box(center + vec3(0.0, 8.0, 0.0), vec3(24.0, 16.0, 24.0), fill, outline, camera_position);
-            }
-            MachineBlockType::Assembler => {
-                draw_box(
-                    center + vec3(0.0, 12.0, 0.0),
-                    vec3(30.0, 24.0, 30.0),
-                    fill,
-                    outline,
-                    camera_position,
-                );
-                draw_box(
-                    center + vec3(0.0, 24.0, 0.0),
-                    vec3(18.0, 6.0, 18.0),
-                    shade(fill, 1.15),
-                    outline,
-                    camera_position,
-                );
-            }
-            MachineBlockType::Furnace => {
-                draw_box(
-                    center + vec3(0.0, 10.0, 0.0),
-                    vec3(28.0, 20.0, 28.0),
-                    fill,
-                    outline,
-                    camera_position,
-                );
-                draw_box(
-                    center + vec3(0.0, 23.0, 0.0),
-                    vec3(14.0, 8.0, 14.0),
-                    shade(fill, 0.82),
-                    outline,
-                    camera_position,
-                );
-            }
-            MachineBlockType::Pallet => {
-                draw_box(
-                    center + vec3(0.0, 2.2, 0.0),
-                    vec3(26.0, 4.4, 26.0),
-                    fill,
-                    outline,
-                    camera_position,
-                );
-                for offset in [-7.0_f32, 0.0, 7.0] {
-                    draw_box(
-                        center + vec3(0.0, 4.7, offset),
-                        vec3(28.0, 1.2, 3.2),
-                        Color::from_rgba(207, 171, 118, 255),
-                        outline,
-                        camera_position,
-                    );
-                }
-            }
-            MachineBlockType::Crate => {
-                draw_box(center + vec3(0.0, 7.0, 0.0), vec3(24.0, 14.0, 24.0), fill, outline, camera_position);
-            }
-        }
+        draw_machine_block(block.kind, block.rotation, center, colors, false);
     }
 
     for container in &interior.containers {
@@ -468,11 +597,15 @@ fn draw_world(
             let color = part_draw_color(stack.kind);
             draw_box(
                 hex_world_center(container.hex, BLOCK_Y + 8.0)
-                    + vec3(offset_x, 3.5 + (stack.amount.min(3) as f32 - 1.0) * 1.3, offset_z),
+                    + vec3(
+                        offset_x,
+                        3.5 + (stack.amount.min(3) as f32 - 1.0) * 1.3,
+                        offset_z,
+                    ),
                 vec3(7.0, 7.0, 7.0),
                 color,
                 shade(color, 0.55),
-                camera_position,
+                false,
             );
         }
     }
@@ -489,12 +622,17 @@ fn draw_world(
             vec3(10.0, 10.0, 10.0),
             Color::from_rgba(82, 92, 106, 255),
             colors.text_primary,
-            camera_position,
+            false,
         );
         let hand = if arm.action_stage == MechanicArmActionStage::Idle {
             arm_hand_world(arm.hex, rest_rotation, None, 0.0)
         } else {
-            arm_hand_world(arm.hex, rest_rotation, arm.action_target, arm.action_progress)
+            arm_hand_world(
+                arm.hex,
+                rest_rotation,
+                arm.action_target,
+                arm.action_progress,
+            )
         };
         draw_line_3d(arm_center, hand, colors.hover);
         draw_box(
@@ -502,7 +640,7 @@ fn draw_world(
             vec3(4.0, 4.0, 4.0),
             colors.hover,
             colors.text_primary,
-            camera_position,
+            false,
         );
         let show_item = match arm.action_stage {
             MechanicArmActionStage::Pickup => arm.action_progress >= 0.5,
@@ -517,7 +655,7 @@ fn draw_world(
                     vec3(3.6, 3.6, 3.6),
                     color,
                     shade(color, 0.55),
-                    camera_position,
+                    false,
                 );
             }
         } else if let Some(kind) = arm.held {
@@ -527,7 +665,7 @@ fn draw_world(
                 vec3(3.6, 3.6, 3.6),
                 color,
                 shade(color, 0.55),
-                camera_position,
+                false,
             );
         }
         for output_hex in &arm.output_hexes {
@@ -549,14 +687,18 @@ fn draw_world(
     }
 
     for node in &interior.assembly_nodes {
-        let ready_total: u32 = node.completed_outputs.iter().map(|stack| stack.amount).sum();
+        let ready_total: u32 = node
+            .completed_outputs
+            .iter()
+            .map(|stack| stack.amount)
+            .sum();
         if !node.inserted.is_empty() {
             draw_box(
                 hex_world_center(node.hex, BLOCK_Y + 19.0),
                 vec3(8.0, 5.0, 8.0),
                 Color::from_rgba(140, 255, 190, 180),
                 Color::from_rgba(200, 255, 220, 220),
-                camera_position,
+                false,
             );
         }
         if ready_total > 0 {
@@ -567,7 +709,7 @@ fn draw_world(
                     vec3(7.0, 4.0, 7.0),
                     Color::from_rgba(255, 226, 126, 255),
                     Color::from_rgba(255, 245, 185, 255),
-                    camera_position,
+                    false,
                 );
             }
         }
@@ -575,57 +717,76 @@ fn draw_world(
 
     for forklift in &interior.forklifts {
         let center = forklift_world_center(forklift.hex, forklift.target, forklift.move_progress);
+        let forward = forklift_forward_dir(forklift.hex, forklift.target);
+        let side = vec3(-forward.z, 0.0, forward.x);
         draw_box(
             center,
             vec3(14.0, 9.0, 12.0),
             Color::from_rgba(120, 214, 255, 255),
             Color::from_rgba(200, 235, 255, 255),
-            camera_position,
+            false,
         );
         draw_box(
-            center + vec3(-3.0, 7.0, 0.0),
+            center + forward * -3.0 + vec3(0.0, 7.0, 0.0),
             vec3(4.0, 7.0, 10.0),
             Color::from_rgba(92, 120, 140, 255),
             Color::from_rgba(180, 200, 215, 255),
-            camera_position,
+            false,
         );
         draw_line_3d(
-            center + vec3(7.0, -2.0, -3.0),
-            center + vec3(16.0, -2.0, -3.0),
+            center + forward * 7.0 + side * -3.0 + vec3(0.0, -2.0, 0.0),
+            center + forward * 16.0 + side * -3.0 + vec3(0.0, -2.0, 0.0),
             Color::from_rgba(230, 230, 230, 255),
         );
         draw_line_3d(
-            center + vec3(7.0, -2.0, 3.0),
-            center + vec3(16.0, -2.0, 3.0),
+            center + forward * 7.0 + side * 3.0 + vec3(0.0, -2.0, 0.0),
+            center + forward * 16.0 + side * 3.0 + vec3(0.0, -2.0, 0.0),
             Color::from_rgba(230, 230, 230, 255),
         );
         if let Some(block_kind) = forklift.carried_block {
             draw_box(
-                center + vec3(9.0, 7.5, 0.0),
+                center + forward * 11.0 + vec3(0.0, 7.5, 0.0),
                 vec3(10.0, 8.0, 10.0),
                 machine_block_color(block_kind),
                 colors.text_primary,
-                camera_position,
+                false,
             );
         }
     }
 
+    if let Some((hex, kind, rotation)) = preview {
+        let center = hex_world_center(hex, BLOCK_Y);
+        draw_machine_block(kind, rotation, center, colors, true);
+        draw_hex_tile(
+            hex,
+            0.04,
+            Color::from_rgba(160, 220, 255, 24),
+            colors.hover,
+            true,
+        );
+    }
+
     if let Some(hover_hex) = hover_hex {
-        draw_hex_outline(hover_hex, CELL_HEIGHT + 0.24, colors.hover, camera_position);
+        draw_hex_outline(hover_hex, 0.08, colors.hover);
     }
 
     let border_color = shade(colors.hover, 0.72);
-    for r in -HEX_RADIUS..=HEX_RADIUS {
-        for q in -HEX_RADIUS..=HEX_RADIUS {
+    for r in (camera_center_hex.r - FLOOR_DRAW_RADIUS)..=(camera_center_hex.r + FLOOR_DRAW_RADIUS) {
+        for q in
+            (camera_center_hex.q - FLOOR_DRAW_RADIUS)..=(camera_center_hex.q + FLOOR_DRAW_RADIUS)
+        {
             let hex = Axial { q, r };
             if !in_bounds(hex, MapOutline::Hexagon) {
+                continue;
+            }
+            if axial_distance(hex, camera_center_hex) > FLOOR_DRAW_RADIUS {
                 continue;
             }
             if axial_neighbors(hex)
                 .iter()
                 .any(|neighbor| !in_bounds(*neighbor, MapOutline::Hexagon))
             {
-                draw_hex_outline(hex, CELL_HEIGHT + 0.01, border_color, camera_position);
+                draw_hex_outline(hex, 0.04, border_color);
             }
         }
     }
@@ -740,24 +901,61 @@ pub fn run(
     let panel_rect = panel_layout.rect;
     let ui_capturing = is_ui_capturing(panel_rect, window, confirm_window, ctx.mouse);
 
+    let (blocked_hexes, forklift_hexes) = state
+        .active_base_interior()
+        .map(|interior| {
+            (
+                interior
+                    .blocks
+                    .iter()
+                    .map(|record| record.hex)
+                    .collect::<Vec<_>>(),
+                interior
+                    .forklifts
+                    .iter()
+                    .map(|forklift| forklift.hex)
+                    .collect::<Vec<_>>(),
+            )
+        })
+        .unwrap_or_default();
+
     if let Some(interior) = state.active_base_interior_mut() {
-        update_build_template_camera(&mut interior.camera, ctx.mouse, ui_capturing, dragging, last_mouse);
+        update_build_template_camera(
+            &mut interior.camera,
+            &blocked_hexes,
+            &forklift_hexes,
+            ctx.mouse,
+            ui_capturing,
+            dragging,
+            last_mouse,
+        );
     }
 
     let camera = state
         .active_base_interior()
         .map(|interior| build_template_camera(&interior.camera))
         .unwrap_or_default();
-    let hover_hex = hover_hex_from_mouse_3d(&camera, ctx.mouse).filter(|hex| in_bounds(*hex, outline));
+    let hover_hex =
+        hover_hex_from_mouse_3d(&camera, ctx.mouse).filter(|hex| in_bounds(*hex, outline));
     let hover_hex_fallback = hover_hex.unwrap_or(Axial { q: 0, r: 0 });
     let hovered_summary = hover_hex.and_then(|hex| hover_summary(state, hex));
     let hover_occupied = hover_hex
         .and_then(|hex| {
-            state.active_base_interior()
+            state
+                .active_base_interior()
                 .and_then(|interior| interior.block_at(hex))
                 .map(|_| true)
         })
         .unwrap_or(false);
+    let preview = selected.and_then(|kind| {
+        hover_hex.and_then(|hex| {
+            if hover_occupied {
+                None
+            } else {
+                Some((hex, kind, *placement_rotation))
+            }
+        })
+    });
     let pick_mode = state.interior_pick_mode();
 
     if is_mouse_button_pressed(MouseButton::Left)
@@ -876,9 +1074,13 @@ pub fn run(
                 state.clear_interior_pick_mode();
             }
             None => {
-                state.clear_base_interior_edit();
-                *scene = Scene::Planet;
-                return;
+                if selected.is_some() {
+                    *selected = None;
+                } else {
+                    state.clear_base_interior_edit();
+                    *scene = Scene::Planet;
+                    return;
+                }
             }
         }
     }
@@ -901,13 +1103,16 @@ pub fn run(
         }
     }
 
+    let camera_center_hex =
+        pixel_to_hex(vec2(camera.target.x, camera.target.z), HEX_SIZE, Vec2::ZERO);
     set_camera(&camera);
     draw_world(
         state.active_base_interior().unwrap(),
         hover_hex,
+        preview,
+        camera_center_hex,
         config,
         colors,
-        camera.position,
     );
     set_default_camera();
 
@@ -923,7 +1128,7 @@ pub fn run(
         colors.text_primary,
     );
     draw_text(
-        "3D: middle drag orbit | Shift+middle drag pan | wheel zoom",
+        "3D FPS: RMB look | WASD move | Shift sprint | Space/Ctrl up/down",
         24.0,
         60.0,
         ctx.font_sm,
@@ -960,6 +1165,9 @@ pub fn run(
     let mut tooltip: Option<String> = None;
     if panel_result.toggled {
         *panel_collapsed = !*panel_collapsed;
+        if *panel_collapsed {
+            *selected = None;
+        }
     }
     if let Some(tip) = panel_result.hovered_tip {
         tooltip = Some(tip.to_string());

@@ -183,6 +183,7 @@ pub enum Scene {
     Config,
     Planet,
     BuildTemplate,
+    CadPrototype,
 }
 
 // UI/frame context passed into scenes.

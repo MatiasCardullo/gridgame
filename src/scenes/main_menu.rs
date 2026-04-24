@@ -1,9 +1,7 @@
 use macroquad::prelude::*;
 
-use crate::core::{
-    save_map, Axial, FrameContext, PlacedBlock, Scene, TileData, Unit,
-};
 use crate::core::ui::{draw_log_panel, draw_progress_bar, ui_button};
+use crate::core::{Axial, FrameContext, PlacedBlock, Scene, TileData, Unit, save_map};
 use std::collections::HashMap;
 
 // Render and handle input for the main menu scene.
@@ -44,22 +42,52 @@ pub fn run(
     } else {
         "Planet"
     };
-    let (clicked_planet, _) =
-        ui_button(rect_planet, planet_label, ctx.mouse, ctx.font_md, ctx.button_colors);
+    let (clicked_planet, _) = ui_button(
+        rect_planet,
+        planet_label,
+        ctx.mouse,
+        ctx.font_md,
+        ctx.button_colors,
+    );
     if clicked_planet {
         *scene = Scene::Planet;
     }
     y += btn_h + 12.0;
 
+    let rect_cad = Rect::new((screen_width() - btn_w) * 0.5, y, btn_w, btn_h);
+    let (clicked_cad, _) = ui_button(
+        rect_cad,
+        "CAD Prototype",
+        ctx.mouse,
+        ctx.font_md,
+        ctx.button_colors,
+    );
+    if clicked_cad {
+        *scene = Scene::CadPrototype;
+    }
+    y += btn_h + 12.0;
+
     let rect_cfg = Rect::new((screen_width() - btn_w) * 0.5, y, btn_w, btn_h);
-    let (clicked_cfg, _) = ui_button(rect_cfg, "Configuracion", ctx.mouse, ctx.font_md, ctx.button_colors);
+    let (clicked_cfg, _) = ui_button(
+        rect_cfg,
+        "Configuracion",
+        ctx.mouse,
+        ctx.font_md,
+        ctx.button_colors,
+    );
     if clicked_cfg {
         *scene = Scene::Config;
     }
     y += btn_h + 12.0;
 
     let rect_exit = Rect::new((screen_width() - btn_w) * 0.5, y, btn_w, btn_h);
-    let (clicked_exit, _) = ui_button(rect_exit, "Salir", ctx.mouse, ctx.font_md, ctx.button_colors);
+    let (clicked_exit, _) = ui_button(
+        rect_exit,
+        "Salir",
+        ctx.mouse,
+        ctx.font_md,
+        ctx.button_colors,
+    );
     if clicked_exit {
         if !blocks.is_empty() || !tiles.is_empty() {
             save_map(map_path, blocks, tiles, units);
@@ -92,7 +120,14 @@ fn draw_planet_loading_panel(
     }
     let panel = Rect::new(24.0, screen_height() - 220.0, 420.0, 190.0);
     draw_rectangle(panel.x, panel.y, panel.w, panel.h, ctx.colors_rt.panel_bg);
-    draw_rectangle_lines(panel.x, panel.y, panel.w, panel.h, 1.5, ctx.colors_rt.panel_border);
+    draw_rectangle_lines(
+        panel.x,
+        panel.y,
+        panel.w,
+        panel.h,
+        1.5,
+        ctx.colors_rt.panel_border,
+    );
     draw_text(
         "Cargando planeta",
         panel.x + 12.0,
@@ -109,7 +144,12 @@ fn draw_planet_loading_panel(
         ctx.colors_rt.button_base,
     );
 
-    let log_rect = Rect::new(panel.x + 12.0, panel.y + 64.0, panel.w - 24.0, panel.h - 76.0);
+    let log_rect = Rect::new(
+        panel.x + 12.0,
+        panel.y + 64.0,
+        panel.w - 24.0,
+        panel.h - 76.0,
+    );
     if let Some(message) = error {
         let lines = vec![message.to_string()];
         draw_log_panel(
@@ -131,4 +171,3 @@ fn draw_planet_loading_panel(
         );
     }
 }
-

@@ -57,6 +57,7 @@ async fn main() {
         show_units: false,
     };
     let mut units: Vec<Unit> = Vec::new();
+    let mut cad_state = scenes::cad::CadState::default();
     let mut planet_state: Option<scenes::planet::PlanetState> = None;
     let mut planet_loader = scenes::planet::PlanetLoader::start();
     let greek_font = load_ttf_font("C:/Windows/Fonts/CascadiaMono.ttf")
@@ -166,6 +167,15 @@ async fn main() {
                 } else {
                     scene = Scene::Planet;
                 }
+            }
+            Scene::CadPrototype => {
+                scenes::cad::run(
+                    &ctx,
+                    &mut scene,
+                    &mut cad_state,
+                    &mut last_mouse,
+                    &colors_rt,
+                );
             }
         }
 

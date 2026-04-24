@@ -2,21 +2,25 @@ use macroquad::prelude::*;
 
 use crate::core::base_interior::{
     all_interior_filter_parts, assembly_recipe_ids, assembly_recipe_parts, machine_block_label,
-    AssemblerRecipeId, InteriorPartKind, InteriorPartStack, MechanicArmActionStage,
-    MechanicArmInputMode,
+    AssemblerRecipeId, BaseInteriorState, InteriorCameraState, InteriorPartKind,
+    InteriorPartStack, MechanicArmActionStage, MechanicArmInputMode,
 };
 use crate::core::map_common::{
-    build_panel_layout, confirm_label_for_target, draw_common_hud, draw_window_frame,
-    handle_camera_drag, handle_cursor_zoom, hex_screen_center, hover_hex_from_mouse, in_bounds,
+    build_panel_layout, confirm_label_for_target, draw_common_hud, draw_window_frame, in_bounds,
     is_ui_capturing, popup_rect_near_mouse, run_confirm_window, ConfirmAction, MapOutline,
 };
 use crate::core::ui::{ui_button, WindowState, WINDOW_TITLE_HEIGHT};
 use crate::core::{
-    draw_hex_filled, draw_hex_outline, hex_corners, hex_to_pixel, AppConfig, Axial,
-    FrameContext, MachineBlock, MachineBlockType, RuntimeColors, Scene,
+    axial_neighbors, hex_corners, hex_to_pixel, pixel_to_hex, AppConfig, Axial, FrameContext,
+    MachineBlock, MachineBlockType, RuntimeColors, Scene,
 };
 use crate::scenes::planet::{InteriorPickMode, PlanetState};
 use crate::{HEX_RADIUS, HEX_SIZE};
+
+const CELL_HEIGHT: f32 = 3.2;
+const CELL_RADIUS_SCALE: f32 = 1.0;
+const BLOCK_Y: f32 = CELL_HEIGHT + 3.0;
+const ARM_BASE_HEIGHT: f32 = 16.0;
 
 fn machine_block_color(kind: MachineBlockType) -> Color {
     match kind {
@@ -28,6 +32,15 @@ fn machine_block_color(kind: MachineBlockType) -> Color {
         MachineBlockType::Pallet => Color::from_rgba(151, 108, 66, 255),
         MachineBlockType::Crate => Color::from_rgba(119, 84, 54, 255),
     }
+}
+
+fn shade(color: Color, factor: f32) -> Color {
+    Color::new(
+        (color.r * factor).clamp(0.0, 1.0),
+        (color.g * factor).clamp(0.0, 1.0),
+        (color.b * factor).clamp(0.0, 1.0),
+        color.a,
+    )
 }
 
 fn stack_summary(items: &[InteriorPartStack]) -> String {
@@ -53,20 +66,6 @@ fn selected_filter_summary(filters: &[InteriorPartKind]) -> String {
     }
 }
 
-fn draw_belt_chevrons(center: Vec2, rotation: u8, zoom: f32, color: Color) {
-    let angle = rotation as f32 * std::f32::consts::PI / 3.0;
-    let forward = vec2(angle.cos(), angle.sin());
-    let side = vec2(-forward.y, forward.x);
-    for offset in [-5.0_f32, 3.0] {
-        let mid = center + forward * offset * zoom;
-        let a = mid - forward * 4.0 * zoom + side * 3.0 * zoom;
-        let b = mid;
-        let c = mid - forward * 4.0 * zoom - side * 3.0 * zoom;
-        draw_line(a.x, a.y, b.x, b.y, 1.8, color);
-        draw_line(c.x, c.y, b.x, b.y, 1.8, color);
-    }
-}
-
 fn part_draw_color(kind: InteriorPartKind) -> Color {
     match kind {
         InteriorPartKind::ChassisFrame => Color::from_rgba(196, 204, 216, 255),
@@ -84,141 +83,554 @@ fn part_draw_color(kind: InteriorPartKind) -> Color {
     }
 }
 
-fn draw_square_storage(center: Vec2, half_size: f32, fill: Color, border: Color, line: f32) {
-    draw_rectangle(
-        center.x - half_size,
-        center.y - half_size,
-        half_size * 2.0,
-        half_size * 2.0,
-        fill,
-    );
-    draw_rectangle_lines(
-        center.x - half_size,
-        center.y - half_size,
-        half_size * 2.0,
-        half_size * 2.0,
-        line,
-        border,
-    );
+fn hex_world_center(hex: Axial, y: f32) -> Vec3 {
+    let center = hex_to_pixel(hex, HEX_SIZE, Vec2::ZERO);
+    vec3(center.x, y, center.y)
 }
 
-fn arm_hand_center_rotational(
-    ctx: &FrameContext,
-    cam_offset: Vec2,
-    cam_zoom: f32,
+fn rotation_dir(rotation: u8) -> Vec3 {
+    let neighbor = axial_neighbors(Axial { q: 0, r: 0 })[rotation as usize % 6];
+    hex_world_center(neighbor, 0.0).normalize_or_zero()
+}
+
+fn hex_world_corners(hex: Axial, radius_scale: f32, y: f32) -> [Vec3; 6] {
+    let center = hex_to_pixel(hex, HEX_SIZE, Vec2::ZERO);
+    let corners = hex_corners(center, HEX_SIZE * radius_scale);
+    [
+        vec3(corners[0].x, y, corners[0].y),
+        vec3(corners[1].x, y, corners[1].y),
+        vec3(corners[2].x, y, corners[2].y),
+        vec3(corners[3].x, y, corners[3].y),
+        vec3(corners[4].x, y, corners[4].y),
+        vec3(corners[5].x, y, corners[5].y),
+    ]
+}
+
+fn face_visible(point: Vec3, normal: Vec3, camera_position: Vec3) -> bool {
+    normal.dot(camera_position - point) > 0.0
+}
+
+fn draw_box(center: Vec3, size: Vec3, fill: Color, outline: Color, camera_position: Vec3) {
+    let hx = size.x * 0.5;
+    let hy = size.y * 0.5;
+    let hz = size.z * 0.5;
+
+    let p000 = center + vec3(-hx, -hy, -hz);
+    let p001 = center + vec3(-hx, -hy, hz);
+    let p010 = center + vec3(-hx, hy, -hz);
+    let p011 = center + vec3(-hx, hy, hz);
+    let p100 = center + vec3(hx, -hy, -hz);
+    let p101 = center + vec3(hx, -hy, hz);
+    let p110 = center + vec3(hx, hy, -hz);
+    let p111 = center + vec3(hx, hy, hz);
+
+    let faces = [
+        ([p000, p001, p011, p010], vec3(-1.0, 0.0, 0.0)),
+        ([p100, p110, p111, p101], vec3(1.0, 0.0, 0.0)),
+        ([p000, p100, p101, p001], vec3(0.0, -1.0, 0.0)),
+        ([p010, p011, p111, p110], vec3(0.0, 1.0, 0.0)),
+        ([p000, p010, p110, p100], vec3(0.0, 0.0, -1.0)),
+        ([p001, p101, p111, p011], vec3(0.0, 0.0, 1.0)),
+    ];
+    for (points, normal) in faces {
+        let face_center = (points[0] + points[1] + points[2] + points[3]) * 0.25;
+        if !face_visible(face_center, normal, camera_position) {
+            continue;
+        }
+        for i in 0..4 {
+            draw_line_3d(points[i], points[(i + 1) % 4], outline);
+        }
+    }
+    if face_visible(center + vec3(0.0, hy, 0.0), vec3(0.0, 1.0, 0.0), camera_position) {
+        draw_line_3d(p010, p101, shade(fill, 0.82));
+        draw_line_3d(p011, p100, shade(fill, 0.82));
+    }
+}
+
+fn draw_hex_column(
+    center: Vec3,
+    radius_scale: f32,
+    height: f32,
+    fill: Color,
+    outline: Color,
+    camera_position: Vec3,
+) {
+    let top_outline = hex_world_corners(
+        pixel_to_hex(vec2(center.x, center.z), HEX_SIZE, Vec2::ZERO),
+        radius_scale,
+        center.y + height * 0.5 + 0.02,
+    );
+    let bottom_outline = hex_world_corners(
+        pixel_to_hex(vec2(center.x, center.z), HEX_SIZE, Vec2::ZERO),
+        radius_scale,
+        center.y - height * 0.5,
+    );
+    if face_visible(center + vec3(0.0, height * 0.5, 0.0), vec3(0.0, 1.0, 0.0), camera_position) {
+        for i in 0..6 {
+            draw_line_3d(top_outline[i], top_outline[(i + 1) % 6], outline);
+        }
+    }
+    for i in 0..6 {
+        let next = (i + 1) % 6;
+        let edge_mid = (top_outline[i] + top_outline[next] + bottom_outline[i] + bottom_outline[next])
+            * 0.25;
+        let outward = vec3(edge_mid.x - center.x, 0.0, edge_mid.z - center.z).normalize_or_zero();
+        if !face_visible(edge_mid, outward, camera_position) {
+            continue;
+        }
+        draw_line_3d(top_outline[i], top_outline[next], outline);
+        draw_line_3d(bottom_outline[i], bottom_outline[next], shade(outline, 0.7));
+        draw_line_3d(bottom_outline[i], top_outline[i], shade(outline, 0.82));
+        draw_line_3d(bottom_outline[next], top_outline[next], shade(outline, 0.82));
+    }
+    let center_top = vec3(center.x, center.y + height * 0.5, center.z);
+    if face_visible(center_top, vec3(0.0, 1.0, 0.0), camera_position) {
+        for corner in top_outline {
+            draw_line_3d(center_top, corner, shade(fill, 0.78));
+        }
+    }
+}
+
+fn draw_hex_outline(hex: Axial, y: f32, color: Color, camera_position: Vec3) {
+    let corners = hex_world_corners(hex, CELL_RADIUS_SCALE, y);
+    let center = hex_world_center(hex, y);
+    if face_visible(center, vec3(0.0, 1.0, 0.0), camera_position) {
+        for i in 0..6 {
+            draw_line_3d(corners[i], corners[(i + 1) % 6], color);
+        }
+    }
+}
+
+fn arm_hand_world(
     arm_hex: Axial,
     rest_rotation: u8,
     target: Option<Axial>,
     progress: f32,
-) -> Vec2 {
-    let center = hex_screen_center(ctx, cam_offset, cam_zoom, arm_hex);
+) -> Vec3 {
+    let center = hex_world_center(arm_hex, ARM_BASE_HEIGHT);
+    let rest_dir = rotation_dir(rest_rotation);
+    let arm_len = HEX_SIZE * 0.68;
     let Some(target_hex) = target else {
-        let rest_angle = rest_rotation as f32 * std::f32::consts::PI / 3.0;
-        let arm_len = HEX_SIZE * 0.62 * cam_zoom;
-        return center + vec2(rest_angle.cos(), rest_angle.sin()) * arm_len;
+        return center + rest_dir * arm_len;
     };
-    let target_world = hex_to_pixel(target_hex, HEX_SIZE, Vec2::ZERO);
-    let arm_world = hex_to_pixel(arm_hex, HEX_SIZE, Vec2::ZERO);
-    let target_dir = target_world - arm_world;
-    if target_dir.length_squared() <= f32::EPSILON {
+    let target_vec = hex_world_center(target_hex, ARM_BASE_HEIGHT) - center;
+    if target_vec.length_squared() <= f32::EPSILON {
         return center;
     }
-    let target_angle = target_dir.y.atan2(target_dir.x);
-    let rest_angle = rest_rotation as f32 * std::f32::consts::PI / 3.0;
+    let target_dir = target_vec.normalize();
     let sweep = if progress < 0.5 {
         progress * 2.0
     } else {
         (1.0 - progress) * 2.0
     };
-    let mut angle_delta = target_angle - rest_angle;
-    while angle_delta > std::f32::consts::PI {
-        angle_delta -= std::f32::consts::TAU;
-    }
-    while angle_delta < -std::f32::consts::PI {
-        angle_delta += std::f32::consts::TAU;
-    }
-    let angle = rest_angle + angle_delta * sweep.clamp(0.0, 1.0);
-    let arm_len = HEX_SIZE * 0.62 * cam_zoom;
-    center + vec2(angle.cos(), angle.sin()) * arm_len
+    let dir = rest_dir.lerp(target_dir, sweep.clamp(0.0, 1.0)).normalize_or_zero();
+    center + dir * arm_len
 }
 
-fn map_border_points_screen(ctx: &FrameContext, cam_offset: Vec2, cam_zoom: f32) -> [Vec2; 6] {
-    let corner_hexes = [
-        Axial {
-            q: HEX_RADIUS,
-            r: 0,
-        },
-        Axial {
-            q: HEX_RADIUS,
-            r: -HEX_RADIUS,
-        },
-        Axial {
-            q: 0,
-            r: -HEX_RADIUS,
-        },
-        Axial {
-            q: -HEX_RADIUS,
-            r: 0,
-        },
-        Axial {
-            q: -HEX_RADIUS,
-            r: HEX_RADIUS,
-        },
-        Axial {
-            q: 0,
-            r: HEX_RADIUS,
-        },
-    ];
-    let mut points = [Vec2::ZERO; 6];
-    for (idx, hex) in corner_hexes.iter().enumerate() {
-        let world_center = hex_to_pixel(*hex, HEX_SIZE, Vec2::ZERO);
-        let corners = hex_corners(world_center, HEX_SIZE);
-        let mut outer = corners[0];
-        let mut max_len_sq = outer.length_squared();
-        for corner in corners.iter().skip(1) {
-            let len_sq = corner.length_squared();
-            if len_sq > max_len_sq {
-                max_len_sq = len_sq;
-                outer = *corner;
-            }
-        }
-        points[idx] = ctx.screen_center + cam_offset + outer * cam_zoom;
-    }
-    points
-}
-
-fn forklift_screen_center(
-    ctx: &FrameContext,
-    cam_offset: Vec2,
-    cam_zoom: f32,
-    from: Axial,
-    to: Option<Axial>,
-    progress: f32,
-) -> Vec2 {
-    let start = hex_screen_center(ctx, cam_offset, cam_zoom, from);
+fn forklift_world_center(from: Axial, to: Option<Axial>, progress: f32) -> Vec3 {
+    let start = hex_world_center(from, BLOCK_Y + 2.0);
     let Some(target_hex) = to else {
         return start;
     };
-    let end = hex_screen_center(ctx, cam_offset, cam_zoom, target_hex);
+    let end = hex_world_center(target_hex, BLOCK_Y + 2.0);
     start.lerp(end, progress.clamp(0.0, 1.0))
 }
 
-fn forklift_cargo_offset(
-    forklift: &crate::core::base_interior::InteriorForkliftState,
-    zoom: f32,
-) -> Vec2 {
-    let mut y = -11.0;
-    if forklift.carried_block.is_some() {
-        y = -15.0;
-        if forklift.target == forklift.request_target && forklift.target == Some(forklift.hex) {
-            let settle = (1.0 - forklift.move_progress.clamp(0.0, 1.0)) * 8.0;
-            y = -7.0 - settle;
-        }
-    } else if forklift.target == forklift.source_hex && forklift.target == Some(forklift.hex) {
-        let dip = forklift.move_progress.clamp(0.0, 1.0) * 6.0;
-        y = -11.0 + dip;
+fn build_template_camera(state: &InteriorCameraState) -> Camera3D {
+    let focus = vec3(state.focus_x, 0.0, state.focus_z);
+    let orbit = vec3(
+        state.yaw.cos() * state.pitch.cos(),
+        state.pitch.sin(),
+        state.yaw.sin() * state.pitch.cos(),
+    );
+    Camera3D {
+        position: focus + orbit.normalize_or_zero() * state.distance,
+        target: focus,
+        up: vec3(0.0, 1.0, 0.0),
+        fovy: 45.0,
+        z_near: 1.0,
+        z_far: 4_000.0,
+        ..Default::default()
     }
-    vec2(0.0, y * zoom)
+}
+
+fn update_build_template_camera(
+    camera: &mut InteriorCameraState,
+    mouse: Vec2,
+    ui_capturing: bool,
+    dragging: &mut bool,
+    last_mouse: &mut Vec2,
+) {
+    if !ui_capturing {
+        let (_, wheel_y) = mouse_wheel();
+        if wheel_y.abs() > 0.01 {
+            let zoom_factor = (1.0 - wheel_y * 0.08).clamp(0.72, 1.28);
+            camera.distance = (camera.distance * zoom_factor).clamp(90.0, 720.0);
+        }
+    }
+
+    let camera_active = !ui_capturing && is_mouse_button_down(MouseButton::Middle);
+    if camera_active {
+        let delta = mouse - *last_mouse;
+        if is_key_down(KeyCode::LeftShift) || is_key_down(KeyCode::RightShift) {
+            let pan_scale = camera.distance * 0.18 / screen_height().max(1.0);
+            let forward_flat = vec2(camera.yaw.cos(), camera.yaw.sin()).normalize_or_zero();
+            let right_flat = vec2(-forward_flat.y, forward_flat.x);
+            let pan = right_flat * (-delta.x * pan_scale) + forward_flat * (delta.y * pan_scale);
+            camera.focus_x += pan.x;
+            camera.focus_z += pan.y;
+        } else {
+            camera.yaw -= delta.x * 0.01;
+            camera.pitch = (camera.pitch - delta.y * 0.008).clamp(0.28, 1.3);
+        }
+        *dragging = true;
+    } else {
+        *dragging = false;
+    }
+    *last_mouse = mouse;
+}
+
+fn ray_from_mouse(camera: &Camera3D, mouse: Vec2) -> Option<(Vec3, Vec3)> {
+    let x = (mouse.x / screen_width()) * 2.0 - 1.0;
+    let y = 1.0 - (mouse.y / screen_height()) * 2.0;
+    let inv = camera.matrix().inverse();
+    let near = inv * vec4(x, y, -1.0, 1.0);
+    let far = inv * vec4(x, y, 1.0, 1.0);
+    if near.w.abs() < 1e-5 || far.w.abs() < 1e-5 {
+        return None;
+    }
+    let p0 = vec3(near.x / near.w, near.y / near.w, near.z / near.w);
+    let p1 = vec3(far.x / far.w, far.y / far.w, far.z / far.w);
+    Some((p0, (p1 - p0).normalize_or_zero()))
+}
+
+fn ray_ground_intersection(origin: Vec3, dir: Vec3, y: f32) -> Option<Vec3> {
+    if dir.y.abs() < 1e-5 {
+        return None;
+    }
+    let t = (y - origin.y) / dir.y;
+    if t <= 0.0 {
+        return None;
+    }
+    Some(origin + dir * t)
+}
+
+fn hover_hex_from_mouse_3d(camera: &Camera3D, mouse: Vec2) -> Option<Axial> {
+    let (origin, dir) = ray_from_mouse(camera, mouse)?;
+    let hit = ray_ground_intersection(origin, dir, 0.0)?;
+    Some(pixel_to_hex(vec2(hit.x, hit.z), HEX_SIZE, Vec2::ZERO))
+}
+
+fn draw_world(
+    interior: &BaseInteriorState,
+    hover_hex: Option<Axial>,
+    config: &AppConfig,
+    colors: &RuntimeColors,
+    camera_position: Vec3,
+) {
+    for r in -HEX_RADIUS..=HEX_RADIUS {
+        for q in -HEX_RADIUS..=HEX_RADIUS {
+            let hex = Axial { q, r };
+            if !in_bounds(hex, MapOutline::Hexagon) {
+                continue;
+            }
+            let occupied = interior.block_at(hex).is_some();
+            let hovered = hover_hex == Some(hex);
+            let base = if occupied {
+                Color::from_rgba(58, 70, 82, 255)
+            } else {
+                Color::from_rgba(34, 44, 56, 255)
+            };
+            let fill = if hovered {
+                Color::from_rgba(92, 132, 170, 255)
+            } else {
+                base
+            };
+            let outline = if hovered { colors.hover } else { colors.grid };
+            draw_hex_column(
+                hex_world_center(hex, CELL_HEIGHT * 0.5),
+                CELL_RADIUS_SCALE,
+                CELL_HEIGHT,
+                fill,
+                outline,
+                camera_position,
+            );
+        }
+    }
+
+    for belt_item in &interior.belt_items {
+        let color = part_draw_color(belt_item.kind);
+        draw_box(
+            hex_world_center(belt_item.hex, BLOCK_Y + 3.0 + belt_item.progress * 2.0),
+            vec3(6.0, 4.0, 6.0),
+            color,
+            shade(color, 0.55),
+            camera_position,
+        );
+    }
+
+    for block_record in &interior.blocks {
+        let hex = block_record.hex;
+        let block = &block_record.block;
+        let center = hex_world_center(hex, BLOCK_Y);
+        let fill = machine_block_color(block.kind);
+        let outline = shade(fill, 0.55);
+        match block.kind {
+            MachineBlockType::ConveyorBelt => {
+                draw_box(
+                    center + vec3(0.0, 1.8, 0.0),
+                    vec3(34.0, 3.6, 18.0),
+                    fill,
+                    outline,
+                    camera_position,
+                );
+                let dir = rotation_dir(block.rotation);
+                let side = vec3(-dir.z, 0.0, dir.x);
+                let top = center + vec3(0.0, 4.4, 0.0);
+                for offset in [-7.0_f32, 6.0] {
+                    let mid = top + dir * offset;
+                    let a = mid - dir * 5.0 + side * 3.5;
+                    let b = mid;
+                    let c = mid - dir * 5.0 - side * 3.5;
+                    draw_line_3d(a, b, colors.text_primary);
+                    draw_line_3d(c, b, colors.text_primary);
+                }
+            }
+            MachineBlockType::MechanicArm => {
+                draw_box(center + vec3(0.0, 4.0, 0.0), vec3(16.0, 8.0, 16.0), fill, outline, camera_position);
+            }
+            MachineBlockType::Chest => {
+                draw_box(center + vec3(0.0, 8.0, 0.0), vec3(24.0, 16.0, 24.0), fill, outline, camera_position);
+            }
+            MachineBlockType::Assembler => {
+                draw_box(
+                    center + vec3(0.0, 12.0, 0.0),
+                    vec3(30.0, 24.0, 30.0),
+                    fill,
+                    outline,
+                    camera_position,
+                );
+                draw_box(
+                    center + vec3(0.0, 24.0, 0.0),
+                    vec3(18.0, 6.0, 18.0),
+                    shade(fill, 1.15),
+                    outline,
+                    camera_position,
+                );
+            }
+            MachineBlockType::Furnace => {
+                draw_box(
+                    center + vec3(0.0, 10.0, 0.0),
+                    vec3(28.0, 20.0, 28.0),
+                    fill,
+                    outline,
+                    camera_position,
+                );
+                draw_box(
+                    center + vec3(0.0, 23.0, 0.0),
+                    vec3(14.0, 8.0, 14.0),
+                    shade(fill, 0.82),
+                    outline,
+                    camera_position,
+                );
+            }
+            MachineBlockType::Pallet => {
+                draw_box(
+                    center + vec3(0.0, 2.2, 0.0),
+                    vec3(26.0, 4.4, 26.0),
+                    fill,
+                    outline,
+                    camera_position,
+                );
+                for offset in [-7.0_f32, 0.0, 7.0] {
+                    draw_box(
+                        center + vec3(0.0, 4.7, offset),
+                        vec3(28.0, 1.2, 3.2),
+                        Color::from_rgba(207, 171, 118, 255),
+                        outline,
+                        camera_position,
+                    );
+                }
+            }
+            MachineBlockType::Crate => {
+                draw_box(center + vec3(0.0, 7.0, 0.0), vec3(24.0, 14.0, 24.0), fill, outline, camera_position);
+            }
+        }
+    }
+
+    for container in &interior.containers {
+        for (index, stack) in container.items.iter().enumerate() {
+            if index >= 4 || stack.amount == 0 {
+                continue;
+            }
+            let offset_x = -8.0 + (index as f32 % 2.0) * 16.0;
+            let offset_z = -8.0 + (index as f32 / 2.0).floor() * 16.0;
+            let color = part_draw_color(stack.kind);
+            draw_box(
+                hex_world_center(container.hex, BLOCK_Y + 8.0)
+                    + vec3(offset_x, 3.5 + (stack.amount.min(3) as f32 - 1.0) * 1.3, offset_z),
+                vec3(7.0, 7.0, 7.0),
+                color,
+                shade(color, 0.55),
+                camera_position,
+            );
+        }
+    }
+
+    for arm in &interior.mechanic_arms {
+        let base_center = hex_world_center(arm.hex, ARM_BASE_HEIGHT - 4.0);
+        let arm_center = hex_world_center(arm.hex, ARM_BASE_HEIGHT);
+        let rest_rotation = interior
+            .block_at(arm.hex)
+            .map(|block| block.rotation)
+            .unwrap_or(0);
+        draw_box(
+            base_center,
+            vec3(10.0, 10.0, 10.0),
+            Color::from_rgba(82, 92, 106, 255),
+            colors.text_primary,
+            camera_position,
+        );
+        let hand = if arm.action_stage == MechanicArmActionStage::Idle {
+            arm_hand_world(arm.hex, rest_rotation, None, 0.0)
+        } else {
+            arm_hand_world(arm.hex, rest_rotation, arm.action_target, arm.action_progress)
+        };
+        draw_line_3d(arm_center, hand, colors.hover);
+        draw_box(
+            hand,
+            vec3(4.0, 4.0, 4.0),
+            colors.hover,
+            colors.text_primary,
+            camera_position,
+        );
+        let show_item = match arm.action_stage {
+            MechanicArmActionStage::Pickup => arm.action_progress >= 0.5,
+            MechanicArmActionStage::Deliver => true,
+            MechanicArmActionStage::Idle => arm.held.is_some(),
+        };
+        if show_item {
+            if let Some(kind) = arm.held {
+                let color = part_draw_color(kind);
+                draw_box(
+                    hand + vec3(0.0, 5.0, 0.0),
+                    vec3(3.6, 3.6, 3.6),
+                    color,
+                    shade(color, 0.55),
+                    camera_position,
+                );
+            }
+        } else if let Some(kind) = arm.held {
+            let color = part_draw_color(kind);
+            draw_box(
+                arm_center + vec3(0.0, 5.0, 0.0),
+                vec3(3.6, 3.6, 3.6),
+                color,
+                shade(color, 0.55),
+                camera_position,
+            );
+        }
+        for output_hex in &arm.output_hexes {
+            draw_line_3d(
+                hex_world_center(arm.hex, ARM_BASE_HEIGHT - 3.0),
+                hex_world_center(*output_hex, CELL_HEIGHT + 1.4),
+                Color::from_rgba(125, 213, 255, 190),
+            );
+        }
+        if arm.input_mode == MechanicArmInputMode::ExplicitInputs {
+            for input_hex in &arm.input_hexes {
+                draw_line_3d(
+                    hex_world_center(*input_hex, CELL_HEIGHT + 0.8),
+                    hex_world_center(arm.hex, ARM_BASE_HEIGHT - 5.0),
+                    Color::from_rgba(255, 185, 110, 180),
+                );
+            }
+        }
+    }
+
+    for node in &interior.assembly_nodes {
+        let ready_total: u32 = node.completed_outputs.iter().map(|stack| stack.amount).sum();
+        if !node.inserted.is_empty() {
+            draw_box(
+                hex_world_center(node.hex, BLOCK_Y + 19.0),
+                vec3(8.0, 5.0, 8.0),
+                Color::from_rgba(140, 255, 190, 180),
+                Color::from_rgba(200, 255, 220, 220),
+                camera_position,
+            );
+        }
+        if ready_total > 0 {
+            for offset in 0..ready_total.min(3) {
+                draw_box(
+                    hex_world_center(node.hex, BLOCK_Y + 8.0 + offset as f32 * 4.8)
+                        + vec3(9.0, 0.0, -9.0),
+                    vec3(7.0, 4.0, 7.0),
+                    Color::from_rgba(255, 226, 126, 255),
+                    Color::from_rgba(255, 245, 185, 255),
+                    camera_position,
+                );
+            }
+        }
+    }
+
+    for forklift in &interior.forklifts {
+        let center = forklift_world_center(forklift.hex, forklift.target, forklift.move_progress);
+        draw_box(
+            center,
+            vec3(14.0, 9.0, 12.0),
+            Color::from_rgba(120, 214, 255, 255),
+            Color::from_rgba(200, 235, 255, 255),
+            camera_position,
+        );
+        draw_box(
+            center + vec3(-3.0, 7.0, 0.0),
+            vec3(4.0, 7.0, 10.0),
+            Color::from_rgba(92, 120, 140, 255),
+            Color::from_rgba(180, 200, 215, 255),
+            camera_position,
+        );
+        draw_line_3d(
+            center + vec3(7.0, -2.0, -3.0),
+            center + vec3(16.0, -2.0, -3.0),
+            Color::from_rgba(230, 230, 230, 255),
+        );
+        draw_line_3d(
+            center + vec3(7.0, -2.0, 3.0),
+            center + vec3(16.0, -2.0, 3.0),
+            Color::from_rgba(230, 230, 230, 255),
+        );
+        if let Some(block_kind) = forklift.carried_block {
+            draw_box(
+                center + vec3(9.0, 7.5, 0.0),
+                vec3(10.0, 8.0, 10.0),
+                machine_block_color(block_kind),
+                colors.text_primary,
+                camera_position,
+            );
+        }
+    }
+
+    if let Some(hover_hex) = hover_hex {
+        draw_hex_outline(hover_hex, CELL_HEIGHT + 0.24, colors.hover, camera_position);
+    }
+
+    let border_color = shade(colors.hover, 0.72);
+    for r in -HEX_RADIUS..=HEX_RADIUS {
+        for q in -HEX_RADIUS..=HEX_RADIUS {
+            let hex = Axial { q, r };
+            if !in_bounds(hex, MapOutline::Hexagon) {
+                continue;
+            }
+            if axial_neighbors(hex)
+                .iter()
+                .any(|neighbor| !in_bounds(*neighbor, MapOutline::Hexagon))
+            {
+                draw_hex_outline(hex, CELL_HEIGHT + 0.01, border_color, camera_position);
+            }
+        }
+    }
+
+    let _ = config;
 }
 
 fn hover_summary(state: &PlanetState, hex: Axial) -> Option<String> {
@@ -249,7 +661,7 @@ fn hover_summary(state: &PlanetState, hex: Axial) -> Option<String> {
                 "Outputs: {}",
                 arm.output_hexes
                     .iter()
-                    .map(|hex| format!("({}, {})", hex.q, hex.r))
+                    .map(|entry| format!("({}, {})", entry.q, entry.r))
                     .collect::<Vec<_>>()
                     .join(" | ")
             ));
@@ -293,8 +705,8 @@ fn hover_summary(state: &PlanetState, hex: Axial) -> Option<String> {
 pub fn run(
     ctx: &FrameContext,
     state: &mut PlanetState,
-    cam_offset: &mut Vec2,
-    cam_zoom: &mut f32,
+    _cam_offset: &mut Vec2,
+    _cam_zoom: &mut f32,
     dragging: &mut bool,
     last_mouse: &mut Vec2,
     selected: &mut Option<MachineBlockType>,
@@ -313,10 +725,6 @@ pub fn run(
     state.tick_active_base_interior(get_frame_time());
 
     let outline = MapOutline::Hexagon;
-    handle_cursor_zoom(ctx, cam_offset, cam_zoom, config.zoom_speed);
-    handle_camera_drag(ctx, cam_offset, dragging, last_mouse);
-
-    let hover_hex = hover_hex_from_mouse(ctx, *cam_offset, *cam_zoom);
     let buttons: [(Option<MachineBlockType>, &str); 8] = [
         (None, "Delete"),
         (Some(MachineBlockType::ConveyorBelt), "Belt"),
@@ -331,15 +739,31 @@ pub fn run(
     let panel_layout = build_panel_layout(buttons.len(), *panel_collapsed);
     let panel_rect = panel_layout.rect;
     let ui_capturing = is_ui_capturing(panel_rect, window, confirm_window, ctx.mouse);
-    let mut tooltip: Option<String> = None;
-    let hovered_summary = hover_summary(state, hover_hex);
-    let hover_occupied = state
+
+    if let Some(interior) = state.active_base_interior_mut() {
+        update_build_template_camera(&mut interior.camera, ctx.mouse, ui_capturing, dragging, last_mouse);
+    }
+
+    let camera = state
         .active_base_interior()
-        .and_then(|interior| interior.block_at(hover_hex))
-        .is_some();
+        .map(|interior| build_template_camera(&interior.camera))
+        .unwrap_or_default();
+    let hover_hex = hover_hex_from_mouse_3d(&camera, ctx.mouse).filter(|hex| in_bounds(*hex, outline));
+    let hover_hex_fallback = hover_hex.unwrap_or(Axial { q: 0, r: 0 });
+    let hovered_summary = hover_hex.and_then(|hex| hover_summary(state, hex));
+    let hover_occupied = hover_hex
+        .and_then(|hex| {
+            state.active_base_interior()
+                .and_then(|interior| interior.block_at(hex))
+                .map(|_| true)
+        })
+        .unwrap_or(false);
     let pick_mode = state.interior_pick_mode();
 
-    if is_mouse_button_pressed(MouseButton::Left) && !ui_capturing && in_bounds(hover_hex, outline)
+    if is_mouse_button_pressed(MouseButton::Left)
+        && !ui_capturing
+        && let Some(hover_hex) = hover_hex
+        && in_bounds(hover_hex, outline)
     {
         let mut changed = false;
         match pick_mode {
@@ -390,7 +814,10 @@ pub fn run(
         }
     }
 
-    if is_mouse_button_pressed(MouseButton::Right) && !ui_capturing {
+    if is_mouse_button_pressed(MouseButton::Right)
+        && !ui_capturing
+        && let Some(hover_hex) = hover_hex
+    {
         if let Some(interior) = state.active_base_interior() {
             if let Some(block) = interior.block_at(hover_hex) {
                 let win_h = match block.kind {
@@ -411,9 +838,13 @@ pub fn run(
     if is_key_pressed(KeyCode::R) {
         let mut changed = false;
         if let Some(interior) = state.active_base_interior_mut() {
-            if let Some(block) = interior.block_at_mut(hover_hex) {
-                block.rotation = (block.rotation + 1) % 6;
-                changed = true;
+            if let Some(hover_hex) = hover_hex {
+                if let Some(block) = interior.block_at_mut(hover_hex) {
+                    block.rotation = (block.rotation + 1) % 6;
+                    changed = true;
+                } else {
+                    *placement_rotation = (*placement_rotation + 1) % 6;
+                }
             } else {
                 *placement_rotation = (*placement_rotation + 1) % 6;
             }
@@ -470,6 +901,16 @@ pub fn run(
         }
     }
 
+    set_camera(&camera);
+    draw_world(
+        state.active_base_interior().unwrap(),
+        hover_hex,
+        config,
+        colors,
+        camera.position,
+    );
+    set_default_camera();
+
     let interior_label = state
         .active_base_cell()
         .map(|cell| format!("Base Interior {}", cell))
@@ -481,290 +922,15 @@ pub fn run(
         ctx.font_md,
         colors.text_primary,
     );
+    draw_text(
+        "3D: middle drag orbit | Shift+middle drag pan | wheel zoom",
+        24.0,
+        60.0,
+        ctx.font_sm,
+        colors.text_secondary,
+    );
 
-    if let Some(interior) = state.active_base_interior() {
-        for r in -HEX_RADIUS..=HEX_RADIUS {
-            for q in -HEX_RADIUS..=HEX_RADIUS {
-                let hex = Axial { q, r };
-                if !in_bounds(hex, outline) {
-                    continue;
-                }
-                let world_center = hex_to_pixel(hex, HEX_SIZE, Vec2::ZERO);
-                let center = ctx.screen_center + *cam_offset + world_center * *cam_zoom;
-                let size = HEX_SIZE * *cam_zoom;
-                if center.x < -size
-                    || center.y < -size
-                    || center.x > screen_width() + size
-                    || center.y > screen_height() + size
-                {
-                    continue;
-                }
-
-                if let Some(block) = interior.block_at(hex) {
-                    match block.kind {
-                        MachineBlockType::Pallet | MachineBlockType::Crate => {
-                            let half = HEX_SIZE * 0.42 * *cam_zoom;
-                            draw_square_storage(
-                                center,
-                                half,
-                                machine_block_color(block.kind),
-                                colors.text_primary,
-                                config.line_thickness.max(1.0),
-                            );
-                            let slat = if block.kind == MachineBlockType::Pallet {
-                                Color::from_rgba(207, 171, 118, 255)
-                            } else {
-                                Color::from_rgba(150, 114, 78, 255)
-                            };
-                            for offset in [-half * 0.42, 0.0, half * 0.42] {
-                                draw_line(
-                                    center.x - half,
-                                    center.y + offset,
-                                    center.x + half,
-                                    center.y + offset,
-                                    config.line_thickness.max(1.0),
-                                    slat,
-                                );
-                            }
-                        }
-                        _ => {
-                            draw_hex_filled(
-                                center,
-                                (HEX_SIZE - 2.5) * *cam_zoom,
-                                machine_block_color(block.kind),
-                            );
-                            if block.kind == MachineBlockType::ConveyorBelt {
-                                draw_belt_chevrons(
-                                    center,
-                                    block.rotation,
-                                    *cam_zoom,
-                                    colors.text_primary,
-                                );
-                            }
-                        }
-                    }
-                }
-                if *cam_zoom > 1.1 {
-                    draw_hex_outline(center, size, colors.grid, config.line_thickness);
-                }
-            }
-        }
-        for belt_item in &interior.belt_items {
-            let center = hex_screen_center(ctx, *cam_offset, *cam_zoom, belt_item.hex);
-            draw_circle(
-                center.x,
-                center.y,
-                4.0 * *cam_zoom,
-                Color::from_rgba(255, 250, 220, 255),
-            );
-        }
-
-        for arm in &interior.mechanic_arms {
-            let center = hex_screen_center(ctx, *cam_offset, *cam_zoom, arm.hex);
-            if arm.action_stage != MechanicArmActionStage::Idle {
-                let rest_rotation = interior
-                    .block_at(arm.hex)
-                    .map(|block| block.rotation)
-                    .unwrap_or(0);
-                let hand_center = arm_hand_center_rotational(
-                    ctx,
-                    *cam_offset,
-                    *cam_zoom,
-                    arm.hex,
-                    rest_rotation,
-                    arm.action_target,
-                    arm.action_progress,
-                );
-                draw_line(
-                    center.x,
-                    center.y,
-                    hand_center.x,
-                    hand_center.y,
-                    (config.line_thickness * 2.2).max(2.0),
-                    colors.hover,
-                );
-                draw_circle(hand_center.x, hand_center.y, 4.0 * *cam_zoom, colors.hover);
-                let show_item = match arm.action_stage {
-                    MechanicArmActionStage::Pickup => arm.action_progress >= 0.5,
-                    MechanicArmActionStage::Deliver => true,
-                    MechanicArmActionStage::Idle => arm.held.is_some(),
-                };
-                if show_item {
-                    if let Some(kind) = arm.held {
-                        draw_circle(
-                            hand_center.x,
-                            hand_center.y - 6.0 * *cam_zoom,
-                            3.4 * *cam_zoom,
-                            part_draw_color(kind),
-                        );
-                    }
-                }
-            } else if let Some(kind) = arm.held {
-                draw_circle_lines(center.x, center.y, 7.0 * *cam_zoom, 2.0, colors.hover);
-                draw_circle(
-                    center.x,
-                    center.y - 6.0 * *cam_zoom,
-                    3.4 * *cam_zoom,
-                    part_draw_color(kind),
-                );
-            }
-        }
-
-        let border_points = map_border_points_screen(ctx, *cam_offset, *cam_zoom);
-        for i in 0..6 {
-            let a = border_points[i];
-            let b = border_points[(i + 1) % 6];
-            draw_line(
-                a.x,
-                a.y,
-                b.x,
-                b.y,
-                (config.line_thickness * 2.8).max(2.2),
-                colors.hover,
-            );
-        }
-
-        for node in &interior.assembly_nodes {
-            let center = hex_screen_center(ctx, *cam_offset, *cam_zoom, node.hex);
-            if !node.inserted.is_empty() {
-                draw_circle(
-                    center.x,
-                    center.y,
-                    6.0 * *cam_zoom,
-                    Color::from_rgba(140, 255, 190, 180),
-                );
-            }
-            let ready_total: u32 = node.completed_outputs.iter().map(|stack| stack.amount).sum();
-            if ready_total > 0 {
-                draw_text(
-                    &format!("K{}", ready_total),
-                    center.x - 8.0,
-                    center.y - 10.0,
-                    ctx.font_sm,
-                    colors.text_primary,
-                );
-            }
-        }
-
-        for forklift in &interior.forklifts {
-            let center = forklift_screen_center(
-                ctx,
-                *cam_offset,
-                *cam_zoom,
-                forklift.hex,
-                forklift.target,
-                forklift.move_progress,
-            );
-            let cargo_center = center + forklift_cargo_offset(forklift, *cam_zoom);
-            if let Some(block_kind) = forklift.carried_block {
-                let mut cargo_color = machine_block_color(block_kind);
-                cargo_color.a = 220.0 / 255.0;
-                let cargo_half = HEX_SIZE * 0.36 * *cam_zoom;
-                draw_square_storage(
-                    cargo_center,
-                    cargo_half,
-                    cargo_color,
-                    colors.text_primary,
-                    config.line_thickness.max(1.0),
-                );
-            }
-            let fork_reach = if forklift.target == forklift.source_hex
-                && forklift.target == Some(forklift.hex)
-                && forklift.carried_block.is_none()
-            {
-                6.0 + 6.0 * forklift.move_progress.clamp(0.0, 1.0)
-            } else {
-                8.0
-            } * *cam_zoom;
-            draw_rectangle(
-                center.x - 8.0 * *cam_zoom,
-                center.y - 4.5 * *cam_zoom,
-                16.0 * *cam_zoom,
-                9.0 * *cam_zoom,
-                Color::from_rgba(120, 214, 255, 255),
-            );
-            draw_rectangle(
-                center.x - 6.0 * *cam_zoom,
-                center.y - 10.5 * *cam_zoom,
-                3.0 * *cam_zoom,
-                12.0 * *cam_zoom,
-                Color::from_rgba(92, 120, 140, 255),
-            );
-            draw_rectangle(
-                center.x + 3.0 * *cam_zoom,
-                center.y - 10.5 * *cam_zoom,
-                3.0 * *cam_zoom,
-                12.0 * *cam_zoom,
-                Color::from_rgba(92, 120, 140, 255),
-            );
-            draw_line(
-                center.x + 6.0 * *cam_zoom,
-                center.y - 1.0 * *cam_zoom,
-                center.x + 6.0 * *cam_zoom + fork_reach,
-                center.y - 1.0 * *cam_zoom,
-                config.line_thickness.max(1.2),
-                Color::from_rgba(230, 230, 230, 255),
-            );
-            draw_line(
-                center.x + 6.0 * *cam_zoom,
-                center.y + 2.0 * *cam_zoom,
-                center.x + 6.0 * *cam_zoom + fork_reach,
-                center.y + 2.0 * *cam_zoom,
-                config.line_thickness.max(1.2),
-                Color::from_rgba(230, 230, 230, 255),
-            );
-            draw_rectangle(
-                center.x - 2.0 * *cam_zoom,
-                center.y - 13.0 * *cam_zoom,
-                8.0 * *cam_zoom,
-                4.0 * *cam_zoom,
-                Color::from_rgba(187, 231, 255, 255),
-            );
-            draw_text(
-                &format!("{}", forklift.id),
-                center.x - 4.0,
-                center.y - 8.0,
-                ctx.font_sm,
-                colors.text_primary,
-            );
-        }
-    }
-
-    if let Some(kind) = *selected {
-        if let Some(interior) = state.active_base_interior() {
-            if in_bounds(hover_hex, outline) {
-                let hover_center = hex_screen_center(ctx, *cam_offset, *cam_zoom, hover_hex);
-                let mut ghost = machine_block_color(kind);
-                ghost.a = if interior.block_at(hover_hex).is_none() {
-                    0.3
-                } else {
-                    0.15
-                };
-                draw_hex_filled(hover_center, (HEX_SIZE - 2.5) * *cam_zoom, ghost);
-                if interior.block_at(hover_hex).is_some() {
-                    draw_circle_lines(
-                        hover_center.x,
-                        hover_center.y,
-                        9.0 * *cam_zoom,
-                        2.0,
-                        Color::from_rgba(255, 110, 110, 255),
-                    );
-                }
-            }
-        }
-    }
-
-    if in_bounds(hover_hex, outline) {
-        let hover_center = hex_screen_center(ctx, *cam_offset, *cam_zoom, hover_hex);
-        draw_hex_outline(
-            hover_center,
-            HEX_SIZE * *cam_zoom,
-            colors.hover,
-            config.line_thickness * 2.0,
-        );
-    }
-
-    draw_common_hud(ctx, colors, *placement_rotation, hover_hex);
+    draw_common_hud(ctx, colors, *placement_rotation, hover_hex_fallback);
 
     if let Some(mode) = state.interior_pick_mode() {
         let message = match mode {
@@ -791,6 +957,7 @@ pub fn run(
         *selected,
         machine_block_color,
     );
+    let mut tooltip: Option<String> = None;
     if panel_result.toggled {
         *panel_collapsed = !*panel_collapsed;
     }
@@ -808,7 +975,6 @@ pub fn run(
             None
         }
     });
-
     if tooltip.is_none() {
         tooltip = hover_tip;
     }

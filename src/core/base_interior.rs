@@ -180,6 +180,42 @@ pub struct InteriorLogisticsRequest {
     pub assigned_forklift: Option<u32>,
 }
 
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub struct InteriorCameraState {
+    #[serde(default = "default_interior_camera_yaw")]
+    pub yaw: f32,
+    #[serde(default = "default_interior_camera_pitch")]
+    pub pitch: f32,
+    #[serde(default = "default_interior_camera_distance")]
+    pub distance: f32,
+    #[serde(default)]
+    pub focus_x: f32,
+    #[serde(default)]
+    pub focus_z: f32,
+}
+
+fn default_interior_camera_yaw() -> f32 {
+    0.85
+}
+
+fn default_interior_camera_pitch() -> f32 {
+    0.72
+}
+
+fn default_interior_camera_distance() -> f32 {
+    240.0
+}
+
+pub fn default_interior_camera() -> InteriorCameraState {
+    InteriorCameraState {
+        yaw: default_interior_camera_yaw(),
+        pitch: default_interior_camera_pitch(),
+        distance: default_interior_camera_distance(),
+        focus_x: 0.0,
+        focus_z: 0.0,
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct BaseInteriorState {
     #[serde(default)]
@@ -196,6 +232,8 @@ pub struct BaseInteriorState {
     pub forklifts: Vec<InteriorForkliftState>,
     #[serde(default)]
     pub logistics_requests: Vec<InteriorLogisticsRequest>,
+    #[serde(default = "default_interior_camera")]
+    pub camera: InteriorCameraState,
 }
 
 impl Default for BaseInteriorState {
@@ -544,6 +582,7 @@ pub fn default_base_interior() -> BaseInteriorState {
             },
         ],
         logistics_requests: Vec::new(),
+        camera: default_interior_camera(),
     };
     state.ensure_runtime_state();
     state

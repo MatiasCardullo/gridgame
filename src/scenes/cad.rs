@@ -80,7 +80,6 @@ impl Vec3Sign {
 
 #[derive(Clone, Copy, Debug)]
 struct ResizeHandle {
-    local_pos: Vec3,
     kind: ResizeHandleKind,
 }
 
@@ -248,6 +247,9 @@ pub struct CadState {
     align_face: usize,
     add_menu_open: bool,
     selected_vertices: Vec<usize>,
+    selection_rect_start: Option<Vec2>,
+    selection_rect_current: Vec2,
+    pending_align_point: Option<Vec3>,
     status: String,
 }
 
@@ -268,6 +270,9 @@ impl Default for CadState {
             align_face: 0,
             add_menu_open: false,
             selected_vertices: Vec::new(),
+            selection_rect_start: None,
+            selection_rect_current: Vec2::ZERO,
+            pending_align_point: None,
             status: "OpenGeometry CAD".to_string(),
         }
     }
@@ -301,11 +306,6 @@ fn figure_quat(fig: &CadFigure) -> Quat {
 fn figure_basis(fig: &CadFigure) -> (Vec3, Vec3, Vec3) {
     let q = figure_quat(fig);
     (q * Vec3::X, q * Vec3::Y, q * Vec3::Z)
-}
-
-fn local_to_world(fig: &CadFigure, local: Vec3) -> Vec3 {
-    let (x, y, z) = figure_basis(fig);
-    fig.pos + x * local.x + y * local.y + z * local.z
 }
 
 fn mesh_from_brep(brep: &Brep) -> CadMeshData {
@@ -394,56 +394,44 @@ fn draw_figure(fig: &CadFigure, selected: bool) {
     draw_cad_mesh(&fig.mesh, fill, wire);
 }
 
-fn box_handles(fig: &CadFigure) -> Vec<ResizeHandle> {
-    let h = fig.size * 0.5;
+fn box_handles() -> Vec<ResizeHandle> {
     let mut out = Vec::new();
     for sx in [-1, 1] {
         out.push(ResizeHandle {
-            local_pos: vec3(h.x * sx as f32, 0.0, 0.0),
             kind: ResizeHandleKind::BoxDir(Vec3Sign { x: sx, y: 0, z: 0 }),
         });
     }
     for sy in [-1, 1] {
         out.push(ResizeHandle {
-            local_pos: vec3(0.0, h.y * sy as f32, 0.0),
             kind: ResizeHandleKind::BoxDir(Vec3Sign { x: 0, y: sy, z: 0 }),
         });
     }
     for sz in [-1, 1] {
         out.push(ResizeHandle {
-            local_pos: vec3(0.0, 0.0, h.z * sz as f32),
             kind: ResizeHandleKind::BoxDir(Vec3Sign { x: 0, y: 0, z: sz }),
         });
     }
     out
 }
 
-fn cylinder_handles(fig: &CadFigure) -> Vec<ResizeHandle> {
-    let hy = fig.size.y * 0.5;
-    let r = (fig.size.x + fig.size.z) * 0.25;
+fn cylinder_handles() -> Vec<ResizeHandle> {
     vec![
         ResizeHandle {
-            local_pos: vec3(0.0, hy, 0.0),
             kind: ResizeHandleKind::CylinderTop,
         },
         ResizeHandle {
-            local_pos: vec3(0.0, -hy, 0.0),
             kind: ResizeHandleKind::CylinderBottom,
         },
         ResizeHandle {
-            local_pos: vec3(r, 0.0, 0.0),
             kind: ResizeHandleKind::CylinderRadial(Vec3Sign { x: 1, y: 0, z: 0 }),
         },
         ResizeHandle {
-            local_pos: vec3(-r, 0.0, 0.0),
             kind: ResizeHandleKind::CylinderRadial(Vec3Sign { x: -1, y: 0, z: 0 }),
         },
         ResizeHandle {
-            local_pos: vec3(0.0, 0.0, r),
             kind: ResizeHandleKind::CylinderRadial(Vec3Sign { x: 0, y: 0, z: 1 }),
         },
         ResizeHandle {
-            local_pos: vec3(0.0, 0.0, -r),
             kind: ResizeHandleKind::CylinderRadial(Vec3Sign { x: 0, y: 0, z: -1 }),
         },
     ]
@@ -451,11 +439,11 @@ fn cylinder_handles(fig: &CadFigure) -> Vec<ResizeHandle> {
 
 fn resize_handles(fig: &CadFigure) -> Vec<ResizeHandle> {
     match fig.kind {
-        CadPrimitiveKind::Cylinder => cylinder_handles(fig),
+        CadPrimitiveKind::Cylinder => cylinder_handles(),
         CadPrimitiveKind::Square
         | CadPrimitiveKind::Sphere
         | CadPrimitiveKind::Wedge
-        | CadPrimitiveKind::Mesh => box_handles(fig),
+        | CadPrimitiveKind::Mesh => box_handles(),
     }
 }
 
@@ -643,6 +631,34 @@ fn add_vertex_selection(
     }
 }
 
+fn selected_vertices_center(fig: &CadFigure, selected_vertices: &[usize]) -> Option<Vec3> {
+    let anchors: Vec<Vec3> = selected_vertices
+        .iter()
+        .filter_map(|idx| fig.mesh.vertices.get(*idx).copied())
+        .collect();
+    if anchors.is_empty() {
+        return None;
+    }
+    Some(anchors.iter().copied().sum::<Vec3>() / anchors.len() as f32)
+}
+
+fn vertex_indices_in_rect(camera: &Camera3D, fig: &CadFigure, start: Vec2, end: Vec2) -> Vec<usize> {
+    let min = start.min(end);
+    let max = start.max(end);
+    unique_vertex_indices(&fig.mesh)
+        .into_iter()
+        .filter(|idx| {
+            fig.mesh
+                .vertices
+                .get(*idx)
+                .and_then(|pos| project_world_to_screen(camera, *pos))
+                .is_some_and(|screen| {
+                    screen.x >= min.x && screen.x <= max.x && screen.y >= min.y && screen.y <= max.y
+                })
+        })
+        .collect()
+}
+
 fn apply_vertex_delta(fig: &mut CadFigure, selected_vertices: &[usize], delta: Vec3) {
     if selected_vertices.is_empty() || delta.length_squared() == 0.0 {
         return;
@@ -670,25 +686,37 @@ fn apply_move_tool(fig: &mut CadFigure, dt: f32) {
     } else {
         28.0
     };
+    let mut delta = Vec3::ZERO;
     if is_key_down(KeyCode::Left) {
-        fig.pos.x -= speed * dt;
+        delta.x -= speed * dt;
     }
     if is_key_down(KeyCode::Right) {
-        fig.pos.x += speed * dt;
+        delta.x += speed * dt;
     }
     if is_key_down(KeyCode::Up) {
-        fig.pos.z -= speed * dt;
+        delta.z -= speed * dt;
     }
     if is_key_down(KeyCode::Down) {
-        fig.pos.z += speed * dt;
+        delta.z += speed * dt;
     }
     if is_key_down(KeyCode::Q) {
-        fig.pos.y += speed * dt;
+        delta.y += speed * dt;
     }
     if is_key_down(KeyCode::E) {
-        fig.pos.y -= speed * dt;
+        delta.y -= speed * dt;
     }
-    fig.rebuild();
+    if delta.length_squared() == 0.0 {
+        return;
+    }
+    fig.pos += delta;
+    if fig.kind == CadPrimitiveKind::Mesh {
+        // Mesh figures have no rebuild(); translate vertices directly.
+        for v in &mut fig.mesh.vertices {
+            *v += delta;
+        }
+    } else {
+        fig.rebuild();
+    }
 }
 
 fn nudge_delta(dt: f32) -> Vec3 {
@@ -776,30 +804,30 @@ fn rotate_selected(fig: &mut CadFigure, axis_i: usize, amount: f32) {
     let new_q = (Quat::from_axis_angle(world_axis, amount) * q).normalize();
     let (rx, ry, rz) = new_q.to_euler(EulerRot::XYZ);
     fig.rot = vec3(rx, ry, rz);
-    fig.rebuild();
+    if fig.kind == CadPrimitiveKind::Mesh {
+        // Mesh figures have no rebuild(); rotate vertices around fig.pos directly.
+        let rot_q = Quat::from_axis_angle(world_axis, amount);
+        let center = fig.pos;
+        for v in &mut fig.mesh.vertices {
+            *v = center + rot_q * (*v - center);
+        }
+        if let Some((pos, size)) = mesh_bounds(&fig.mesh) {
+            fig.pos = pos;
+            fig.size = size;
+        }
+    } else {
+        fig.rebuild();
+    }
 }
 
-fn apply_align(
+fn apply_align_points(
     figures: &mut [CadFigure],
     source: usize,
-    target: usize,
-    mode: AlignMode,
-    face: usize,
+    source_point: Vec3,
+    target_point: Vec3,
 ) {
-    if source >= figures.len() || target >= figures.len() || source == target {
-        return;
-    }
-    let target_fig = figures[target].clone();
     if let Some(source_fig) = figures.get_mut(source) {
-        match mode {
-            AlignMode::Center => source_fig.pos = target_fig.pos,
-            AlignMode::Face => {
-                let normals = [Vec3::X, -Vec3::X, Vec3::Y, -Vec3::Y, Vec3::Z, -Vec3::Z];
-                let n = figure_quat(&target_fig) * normals[face % normals.len()];
-                source_fig.pos = target_fig.pos
-                    + n * ((target_fig.size.dot(n.abs()) + source_fig.size.dot(n.abs())) * 0.5);
-            }
-        }
+        source_fig.pos += target_point - source_point;
         source_fig.rebuild();
     }
 }
@@ -853,6 +881,9 @@ fn switch_tool(state: &mut CadState, tool: CadTool) {
     state.tool = tool;
     state.pending_source = None;
     state.pair_phase = PairPhase::PickSource;
+    state.pending_align_point = None;
+    state.selected_vertices.clear();
+    state.selection_rect_start = None;
 }
 
 fn is_pair_tool(tool: CadTool) -> bool {
@@ -860,6 +891,12 @@ fn is_pair_tool(tool: CadTool) -> bool {
 }
 
 fn pair_selection_click(state: &mut CadState, picked_figure: usize) {
+    if state.tool == CadTool::Align {
+        state.selected = Some(picked_figure);
+        state.selected_vertices.clear();
+        state.status = "Align: select vertices, Enter locks point".to_string();
+        return;
+    }
     match state.pair_phase {
         PairPhase::PickSource => {
             state.pending_source = Some(picked_figure);
@@ -876,17 +913,6 @@ fn pair_selection_click(state: &mut CadState, picked_figure: usize) {
                 return;
             }
             match state.tool {
-                CadTool::Align => {
-                    apply_align(
-                        &mut state.figures,
-                        source_idx,
-                        picked_figure,
-                        state.align_mode,
-                        state.align_face,
-                    );
-                    state.selected = Some(source_idx);
-                    state.status = "Aligned".to_string();
-                }
                 CadTool::Join | CadTool::Subtract => {
                     let op = if state.tool == CadTool::Join {
                         OGBooleanOperation::Union
@@ -1219,34 +1245,13 @@ fn draw_tools_panel(ctx: &FrameContext, state: &mut CadState, colors: &RuntimeCo
     y += 34.0;
 
     if state.tool == CadTool::Align {
-        let label = match state.align_mode {
-            AlignMode::Center => "Align Mode: Center",
-            AlignMode::Face => "Align Mode: Face",
-        };
-        let (toggle, _) = ui_button(
-            Rect::new(panel.x + 10.0, y, bw, bh),
-            label,
-            ctx.mouse,
+        draw_text(
+            "Select verts, Enter = lock point",
+            panel.x + 10.0,
+            y + 16.0,
             ctx.font_sm,
-            ctx.button_colors,
+            colors.text_secondary,
         );
-        if toggle {
-            state.align_mode = match state.align_mode {
-                AlignMode::Center => AlignMode::Face,
-                AlignMode::Face => AlignMode::Center,
-            };
-        }
-        y += 30.0;
-        let (face, _) = ui_button(
-            Rect::new(panel.x + 10.0, y, bw, bh),
-            &format!("Face {}", state.align_face + 1),
-            ctx.mouse,
-            ctx.font_sm,
-            ctx.button_colors,
-        );
-        if face {
-            state.align_face = (state.align_face + 1) % 6;
-        }
     }
 }
 
@@ -1261,8 +1266,57 @@ pub fn run(
     let camera = cad_camera(state);
 
     if is_key_pressed(KeyCode::Escape) {
+        if state.selection_rect_start.is_some()
+            || !state.selected_vertices.is_empty()
+            || state.pending_align_point.is_some()
+            || state.pending_source.is_some()
+        {
+            state.selection_rect_start = None;
+            state.selected_vertices.clear();
+            state.pending_align_point = None;
+            state.pending_source = None;
+            state.pair_phase = PairPhase::PickSource;
+            state.status = "Selection cleared".to_string();
+            *last_mouse = ctx.mouse;
+            return;
+        }
         *scene = Scene::MainMenu;
         return;
+    }
+
+    if state.selection_rect_start.is_some() {
+        state.selection_rect_current = ctx.mouse;
+    }
+
+    if state.tool == CadTool::Align && is_key_pressed(KeyCode::Enter) {
+        if let Some(selected_idx) = state.selected {
+            if let Some(fig) = state.figures.get(selected_idx) {
+                let point =
+                    selected_vertices_center(fig, &state.selected_vertices).unwrap_or(fig.pos);
+                match state.pair_phase {
+                    PairPhase::PickSource => {
+                        state.pending_source = Some(selected_idx);
+                        state.pending_align_point = Some(point);
+                        state.selected_vertices.clear();
+                        state.pair_phase = PairPhase::PickTarget;
+                        state.status = "Align: select target vertices, Enter applies".to_string();
+                    }
+                    PairPhase::PickTarget => {
+                        if let (Some(source_idx), Some(source_point)) =
+                            (state.pending_source, state.pending_align_point)
+                        {
+                            apply_align_points(&mut state.figures, source_idx, source_point, point);
+                            state.selected = Some(source_idx);
+                            state.selected_vertices.clear();
+                            state.pending_source = None;
+                            state.pending_align_point = None;
+                            state.pair_phase = PairPhase::PickSource;
+                            state.status = "Aligned by vertex center".to_string();
+                        }
+                    }
+                }
+            }
+        }
     }
 
     if is_mouse_button_down(MouseButton::Right) {
@@ -1321,22 +1375,26 @@ pub fn run(
     }
 
     if is_mouse_button_pressed(MouseButton::Left) && ctx.mouse.x > 220.0 {
+        let mut consumed = false;
         if let Some(i) = state.selected {
-            if state.tool == CadTool::Resize {
+            if matches!(state.tool, CadTool::Resize | CadTool::Align) {
                 if let Some(fig) = state.figures.get(i) {
                     if let Some(vertex_idx) = pick_vertex(&camera, ctx.mouse, fig) {
                         let additive =
                             is_key_down(KeyCode::LeftShift) || is_key_down(KeyCode::RightShift);
                         add_vertex_selection(state, i, vertex_idx, additive);
+                        consumed = true;
                     } else {
-                        let points: Vec<Vec3> = resize_handles(fig)
-                            .iter()
-                            .map(|h| local_to_world(fig, h.local_pos))
-                            .collect();
-                        if let Some(handle) = pick_closest_index(&camera, ctx.mouse, &points, 14.0)
-                        {
-                            state.selected_resize_handle = handle;
-                            state.selected_vertices.clear();
+                        let picked_body = pick_figure_by_body(&camera, ctx.mouse, &state.figures);
+                        if picked_body.is_none() || picked_body == Some(i) {
+                            if !(is_key_down(KeyCode::LeftShift)
+                                || is_key_down(KeyCode::RightShift))
+                            {
+                                state.selected_vertices.clear();
+                            }
+                            state.selection_rect_start = Some(ctx.mouse);
+                            state.selection_rect_current = ctx.mouse;
+                            consumed = true;
                         }
                     }
                 }
@@ -1350,7 +1408,7 @@ pub fn run(
                 }
             }
         }
-        if let Some(picked) = pick_figure_by_body(&camera, ctx.mouse, &state.figures) {
+        if !consumed && let Some(picked) = pick_figure_by_body(&camera, ctx.mouse, &state.figures) {
             if is_pair_tool(state.tool) {
                 pair_selection_click(state, picked);
             } else {
@@ -1358,6 +1416,29 @@ pub fn run(
                     state.selected_vertices.clear();
                 }
                 state.selected = Some(picked);
+            }
+        }
+    }
+
+    if is_mouse_button_released(MouseButton::Left) {
+        if let Some(start) = state.selection_rect_start.take() {
+            if let Some(i) = state.selected {
+                if let Some(fig) = state.figures.get(i) {
+                    let additive =
+                        is_key_down(KeyCode::LeftShift) || is_key_down(KeyCode::RightShift);
+                    if !additive {
+                        state.selected_vertices.clear();
+                    }
+                    if start.distance(ctx.mouse) > 4.0 {
+                        for idx in vertex_indices_in_rect(&camera, fig, start, ctx.mouse) {
+                            if !state.selected_vertices.contains(&idx) {
+                                state.selected_vertices.push(idx);
+                            }
+                        }
+                        state.status =
+                            format!("Selected {} vertices", state.selected_vertices.len());
+                    }
+                }
             }
         }
     }
@@ -1387,7 +1468,7 @@ pub fn run(
     }
     if let Some(i) = state.selected {
         if let Some(fig) = state.figures.get(i) {
-            if state.tool == CadTool::Resize {
+            if matches!(state.tool, CadTool::Resize | CadTool::Align) {
                 for vertex_idx in unique_vertex_indices(&fig.mesh) {
                     let Some(pos) = fig.mesh.vertices.get(vertex_idx) else {
                         continue;
@@ -1421,6 +1502,13 @@ pub fn run(
     }
     set_default_camera();
 
+    if let Some(start) = state.selection_rect_start {
+        let end = state.selection_rect_current;
+        let min = start.min(end);
+        let size = (start - end).abs();
+        draw_rectangle_lines(min.x, min.y, size.x, size.y, 1.0, colors.hover);
+    }
+
     draw_text(
         "CAD Prototype",
         24.0,
@@ -1439,6 +1527,8 @@ pub fn run(
     };
     let phase = if is_pair_tool(state.tool) {
         match state.pair_phase {
+            PairPhase::PickSource if state.tool == CadTool::Align => "select source vertices",
+            PairPhase::PickTarget if state.tool == CadTool::Align => "select target vertices",
             PairPhase::PickSource => "pick source",
             PairPhase::PickTarget => "pick target",
         }

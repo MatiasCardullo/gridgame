@@ -1,12 +1,16 @@
 use macroquad::prelude::*;
+use std::fs;
 
 use crate::core::ui::ui_button;
 use crate::core::{FrameContext, RuntimeColors, Scene};
+
+const CAD_OBJ_PATH: &str = "cad_scene.obj";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CadPrimitiveKind {
     Square,
     Cylinder,
+    Mesh,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -58,12 +62,28 @@ struct ResizeHandle {
     kind: ResizeHandleKind,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
+struct CadMeshData {
+    vertices: Vec<Vec3>,
+    triangles: Vec<[usize; 3]>,
+}
+
+impl CadMeshData {
+    fn new() -> Self {
+        Self {
+            vertices: Vec::new(),
+            triangles: Vec::new(),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
 struct CadPart {
     kind: CadPrimitiveKind,
     pos: Vec3,
     size: Vec3,
     rot: Vec3,
+    mesh: Option<CadMeshData>,
 }
 
 #[derive(Clone, Debug)]
@@ -73,6 +93,7 @@ struct CadFigure {
     size: Vec3,
     rot: Vec3, // x/y/z radians in local form
     parts: Vec<CadPart>,
+    mesh: Option<CadMeshData>,
 }
 
 impl CadFigure {
@@ -83,6 +104,7 @@ impl CadFigure {
             size,
             rot,
             parts: Vec::new(),
+            mesh: None,
         }
     }
 }
@@ -103,6 +125,7 @@ pub struct CadState {
     drag_last_mouse: Vec2,
     align_mode: AlignMode,
     align_face: usize,
+    obj_status: String,
 }
 
 impl Default for CadState {
@@ -123,6 +146,7 @@ impl Default for CadState {
             drag_last_mouse: Vec2::ZERO,
             align_mode: AlignMode::Center,
             align_face: 0,
+            obj_status: "OBJ: cad_scene.obj".to_string(),
         }
     }
 }
@@ -165,12 +189,14 @@ fn part_quat(part: &CadPart) -> Quat {
 fn part_as_world_figure(parent: &CadFigure, part: &CadPart) -> CadFigure {
     let q = (figure_quat(parent) * part_quat(part)).normalize();
     let (rx, ry, rz) = q.to_euler(EulerRot::XYZ);
-    CadFigure::new(
+    let mut fig = CadFigure::new(
         part.kind,
         local_to_world(parent, part.pos),
         part.size,
         vec3(rx, ry, rz),
-    )
+    );
+    fig.mesh = part.mesh.clone();
+    fig
 }
 
 fn figure_leaf_world_figures(fig: &CadFigure) -> Vec<CadFigure> {
@@ -297,10 +323,70 @@ fn draw_oriented_cylinder(fig: &CadFigure, fill: Color, wire: Color) {
     );
 }
 
+fn draw_cad_mesh(fig: &CadFigure, mesh: &CadMeshData, fill: Color, wire: Color) {
+    let mut vertices: Vec<Vertex> = Vec::new();
+    let mut indices: Vec<u16> = Vec::new();
+
+    for tri in &mesh.triangles {
+        if vertices.len() + 3 >= u16::MAX as usize {
+            draw_mesh(&Mesh {
+                vertices,
+                indices,
+                texture: None,
+            });
+            vertices = Vec::new();
+            indices = Vec::new();
+        }
+        let base = vertices.len() as u16;
+        for idx in tri {
+            let Some(local) = mesh.vertices.get(*idx) else {
+                continue;
+            };
+            vertices.push(Vertex::new2(
+                local_to_world(fig, *local),
+                vec2(0.0, 0.0),
+                fill,
+            ));
+        }
+        indices.extend_from_slice(&[base, base + 1, base + 2]);
+    }
+
+    if !vertices.is_empty() {
+        draw_mesh(&Mesh {
+            vertices,
+            indices,
+            texture: None,
+        });
+    }
+
+    for tri in &mesh.triangles {
+        let Some(a) = mesh.vertices.get(tri[0]) else {
+            continue;
+        };
+        let Some(b) = mesh.vertices.get(tri[1]) else {
+            continue;
+        };
+        let Some(c) = mesh.vertices.get(tri[2]) else {
+            continue;
+        };
+        let aw = local_to_world(fig, *a);
+        let bw = local_to_world(fig, *b);
+        let cw = local_to_world(fig, *c);
+        draw_line_3d(aw, bw, wire);
+        draw_line_3d(bw, cw, wire);
+        draw_line_3d(cw, aw, wire);
+    }
+}
+
 fn draw_figure_body(fig: &CadFigure, fill: Color, wire: Color) {
     match fig.kind {
         CadPrimitiveKind::Square => draw_oriented_box(fig, fill, wire),
         CadPrimitiveKind::Cylinder => draw_oriented_cylinder(fig, fill, wire),
+        CadPrimitiveKind::Mesh => {
+            if let Some(mesh) = &fig.mesh {
+                draw_cad_mesh(fig, mesh, fill, wire);
+            }
+        }
     }
 }
 
@@ -383,7 +469,7 @@ fn cylinder_handles(fig: &CadFigure) -> Vec<ResizeHandle> {
 
 fn resize_handles(fig: &CadFigure) -> Vec<ResizeHandle> {
     match fig.kind {
-        CadPrimitiveKind::Square => box_handles(fig),
+        CadPrimitiveKind::Square | CadPrimitiveKind::Mesh => box_handles(fig),
         CadPrimitiveKind::Cylinder => cylinder_handles(fig),
     }
 }
@@ -434,6 +520,132 @@ fn pick_closest_index(
         }
     }
     best.map(|(_, i)| i)
+}
+
+fn mouse_world_ray(camera: &Camera3D, mouse: Vec2) -> (Vec3, Vec3) {
+    let forward = (camera.target - camera.position).normalize_or_zero();
+    let right = forward.cross(camera.up).normalize_or_zero();
+    let up = right.cross(forward).normalize_or_zero();
+    let aspect = screen_width() / screen_height().max(1.0);
+    let fovy = camera.fovy.to_radians();
+    let sx = mouse.x / screen_width().max(1.0) * 2.0 - 1.0;
+    let sy = 1.0 - mouse.y / screen_height().max(1.0) * 2.0;
+    let tan_half = (fovy * 0.5).tan();
+    let dir =
+        (forward + right * (sx * tan_half * aspect) + up * (sy * tan_half)).normalize_or_zero();
+    (camera.position, dir)
+}
+
+fn ray_box_t(origin: Vec3, dir: Vec3, half: Vec3) -> Option<f32> {
+    let mut t_min = f32::NEG_INFINITY;
+    let mut t_max = f32::INFINITY;
+    for (o, d, h) in [
+        (origin.x, dir.x, half.x),
+        (origin.y, dir.y, half.y),
+        (origin.z, dir.z, half.z),
+    ] {
+        if d.abs() < 0.00001 {
+            if o < -h || o > h {
+                return None;
+            }
+            continue;
+        }
+        let mut t1 = (-h - o) / d;
+        let mut t2 = (h - o) / d;
+        if t1 > t2 {
+            std::mem::swap(&mut t1, &mut t2);
+        }
+        t_min = t_min.max(t1);
+        t_max = t_max.min(t2);
+        if t_min > t_max {
+            return None;
+        }
+    }
+    if t_max < 0.0 {
+        None
+    } else {
+        Some(t_min.max(0.0))
+    }
+}
+
+fn ray_cylinder_t(origin: Vec3, dir: Vec3, size: Vec3) -> Option<f32> {
+    let rx = (size.x * 0.5).max(0.001);
+    let rz = (size.z * 0.5).max(0.001);
+    let hy = size.y * 0.5;
+    let mut best: Option<f32> = None;
+
+    let a = (dir.x * dir.x) / (rx * rx) + (dir.z * dir.z) / (rz * rz);
+    let b = 2.0 * ((origin.x * dir.x) / (rx * rx) + (origin.z * dir.z) / (rz * rz));
+    let c = (origin.x * origin.x) / (rx * rx) + (origin.z * origin.z) / (rz * rz) - 1.0;
+    let disc = b * b - 4.0 * a * c;
+    if a.abs() > 0.00001 && disc >= 0.0 {
+        let root = disc.sqrt();
+        for t in [(-b - root) / (2.0 * a), (-b + root) / (2.0 * a)] {
+            let y = origin.y + dir.y * t;
+            if t >= 0.0 && y >= -hy && y <= hy {
+                best = Some(best.map_or(t, |old| old.min(t)));
+            }
+        }
+    }
+
+    if dir.y.abs() > 0.00001 {
+        for y in [-hy, hy] {
+            let t = (y - origin.y) / dir.y;
+            let x = origin.x + dir.x * t;
+            let z = origin.z + dir.z * t;
+            if t >= 0.0 && (x / rx).powi(2) + (z / rz).powi(2) <= 1.0 {
+                best = Some(best.map_or(t, |old| old.min(t)));
+            }
+        }
+    }
+
+    best
+}
+
+fn ray_mesh_t(origin: Vec3, dir: Vec3, mesh: &CadMeshData) -> Option<f32> {
+    let mut best: Option<f32> = None;
+    for tri in &mesh.triangles {
+        let Some((a, b, c)) = triangle_points(mesh, *tri) else {
+            continue;
+        };
+        if let Some(t) = ray_triangle_t(origin, dir, a, b, c) {
+            best = Some(best.map_or(t, |old| old.min(t)));
+        }
+    }
+    best
+}
+
+fn ray_leaf_t(fig: &CadFigure, ray_origin: Vec3, ray_dir: Vec3) -> Option<f32> {
+    let local_origin = world_to_local(fig, ray_origin);
+    let local_dir = figure_quat(fig).conjugate() * ray_dir;
+    match fig.kind {
+        CadPrimitiveKind::Square => ray_box_t(local_origin, local_dir, fig.size * 0.5),
+        CadPrimitiveKind::Cylinder => ray_cylinder_t(local_origin, local_dir, fig.size),
+        CadPrimitiveKind::Mesh => fig
+            .mesh
+            .as_ref()
+            .and_then(|mesh| ray_mesh_t(local_origin, local_dir, mesh)),
+    }
+}
+
+fn ray_figure_t(fig: &CadFigure, ray_origin: Vec3, ray_dir: Vec3) -> Option<f32> {
+    if fig.parts.is_empty() {
+        return ray_leaf_t(fig, ray_origin, ray_dir);
+    }
+    figure_leaf_world_figures(fig)
+        .iter()
+        .filter_map(|leaf| ray_leaf_t(leaf, ray_origin, ray_dir))
+        .min_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+}
+
+fn pick_figure_by_body(camera: &Camera3D, mouse: Vec2, figures: &[CadFigure]) -> Option<usize> {
+    let (origin, dir) = mouse_world_ray(camera, mouse);
+    figures
+        .iter()
+        .enumerate()
+        .filter_map(|(i, fig)| ray_figure_t(fig, origin, dir).map(|t| (i, t)))
+        .min_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+        .map(|(i, _)| i)
 }
 
 fn apply_move_tool(fig: &mut CadFigure, dt: f32) {
@@ -647,202 +859,363 @@ fn world_to_local(fig: &CadFigure, world: Vec3) -> Vec3 {
     q.conjugate() * (world - fig.pos)
 }
 
-fn figure_local_corners(fig: &CadFigure) -> [Vec3; 8] {
-    let hx = fig.size.x * 0.5;
-    let hy = fig.size.y * 0.5;
-    let hz = fig.size.z * 0.5;
-    [
-        vec3(-hx, -hy, -hz),
+fn push_mesh_triangle(mesh: &mut CadMeshData, a: Vec3, b: Vec3, c: Vec3) {
+    let base = mesh.vertices.len();
+    mesh.vertices.extend_from_slice(&[a, b, c]);
+    mesh.triangles.push([base, base + 1, base + 2]);
+}
+
+fn push_mesh_quad(mesh: &mut CadMeshData, a: Vec3, b: Vec3, c: Vec3, d: Vec3) {
+    push_mesh_triangle(mesh, a, b, c);
+    push_mesh_triangle(mesh, a, c, d);
+}
+
+fn add_grid_face(mesh: &mut CadMeshData, corner: Vec3, u: Vec3, v: Vec3, steps: usize) {
+    let steps = steps.max(1);
+    for i in 0..steps {
+        for j in 0..steps {
+            let u0 = i as f32 / steps as f32;
+            let u1 = (i + 1) as f32 / steps as f32;
+            let v0 = j as f32 / steps as f32;
+            let v1 = (j + 1) as f32 / steps as f32;
+            let a = corner + u * u0 + v * v0;
+            let b = corner + u * u1 + v * v0;
+            let c = corner + u * u1 + v * v1;
+            let d = corner + u * u0 + v * v1;
+            push_mesh_quad(mesh, a, b, c, d);
+        }
+    }
+}
+
+fn box_mesh_local(size: Vec3, steps: usize) -> CadMeshData {
+    let mut mesh = CadMeshData::new();
+    let hx = size.x * 0.5;
+    let hy = size.y * 0.5;
+    let hz = size.z * 0.5;
+    add_grid_face(
+        &mut mesh,
         vec3(hx, -hy, -hz),
-        vec3(-hx, hy, -hz),
-        vec3(hx, hy, -hz),
+        vec3(0.0, 0.0, size.z),
+        vec3(0.0, size.y, 0.0),
+        steps,
+    );
+    add_grid_face(
+        &mut mesh,
         vec3(-hx, -hy, hz),
-        vec3(hx, -hy, hz),
-        vec3(-hx, hy, hz),
-        vec3(hx, hy, hz),
-    ]
+        vec3(0.0, 0.0, -size.z),
+        vec3(0.0, size.y, 0.0),
+        steps,
+    );
+    add_grid_face(
+        &mut mesh,
+        vec3(-hx, hy, -hz),
+        vec3(size.x, 0.0, 0.0),
+        vec3(0.0, 0.0, size.z),
+        steps,
+    );
+    add_grid_face(
+        &mut mesh,
+        vec3(-hx, -hy, hz),
+        vec3(size.x, 0.0, 0.0),
+        vec3(0.0, 0.0, -size.z),
+        steps,
+    );
+    add_grid_face(
+        &mut mesh,
+        vec3(-hx, -hy, hz),
+        vec3(size.x, 0.0, 0.0),
+        vec3(0.0, size.y, 0.0),
+        steps,
+    );
+    add_grid_face(
+        &mut mesh,
+        vec3(hx, -hy, -hz),
+        vec3(-size.x, 0.0, 0.0),
+        vec3(0.0, size.y, 0.0),
+        steps,
+    );
+    mesh
 }
 
-fn approximate_aabb_in_space(fig: &CadFigure, space: &CadFigure) -> (Vec3, Vec3) {
-    // Approximate fig by AABB expressed in space figure local basis.
-    let mut min_v = vec3(f32::INFINITY, f32::INFINITY, f32::INFINITY);
-    let mut max_v = vec3(f32::NEG_INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY);
-    for corner in figure_local_corners(fig) {
-        let world = local_to_world(fig, corner);
-        let in_space = world_to_local(space, world);
-        min_v = min_v.min(in_space);
-        max_v = max_v.max(in_space);
+fn cylinder_mesh_local(size: Vec3, sides: usize, y_steps: usize) -> CadMeshData {
+    let mut mesh = CadMeshData::new();
+    let sides = sides.max(12);
+    let y_steps = y_steps.max(1);
+    let rx = size.x * 0.5;
+    let rz = size.z * 0.5;
+    let hy = size.y * 0.5;
+
+    for yi in 0..y_steps {
+        let y0 = -hy + size.y * yi as f32 / y_steps as f32;
+        let y1 = -hy + size.y * (yi + 1) as f32 / y_steps as f32;
+        for i in 0..sides {
+            let a0 = i as f32 / sides as f32 * std::f32::consts::TAU;
+            let a1 = (i + 1) as f32 / sides as f32 * std::f32::consts::TAU;
+            let p00 = vec3(a0.sin() * rx, y0, a0.cos() * rz);
+            let p10 = vec3(a1.sin() * rx, y0, a1.cos() * rz);
+            let p11 = vec3(a1.sin() * rx, y1, a1.cos() * rz);
+            let p01 = vec3(a0.sin() * rx, y1, a0.cos() * rz);
+            push_mesh_quad(&mut mesh, p00, p10, p11, p01);
+        }
     }
-    (min_v, max_v)
+
+    let bottom = vec3(0.0, -hy, 0.0);
+    let top = vec3(0.0, hy, 0.0);
+    for i in 0..sides {
+        let a0 = i as f32 / sides as f32 * std::f32::consts::TAU;
+        let a1 = (i + 1) as f32 / sides as f32 * std::f32::consts::TAU;
+        let b0 = vec3(a0.sin() * rx, -hy, a0.cos() * rz);
+        let b1 = vec3(a1.sin() * rx, -hy, a1.cos() * rz);
+        let t0 = vec3(a0.sin() * rx, hy, a0.cos() * rz);
+        let t1 = vec3(a1.sin() * rx, hy, a1.cos() * rz);
+        push_mesh_triangle(&mut mesh, bottom, b1, b0);
+        push_mesh_triangle(&mut mesh, top, t0, t1);
+    }
+    mesh
 }
 
-fn base_local_aabb(base: &CadFigure) -> (Vec3, Vec3) {
-    let half = base.size * 0.5;
-    (-half, half)
-}
-
-fn figure_from_local_aabb(min_v: Vec3, max_v: Vec3, space: &CadFigure) -> CadFigure {
-    let center_local = (min_v + max_v) * 0.5;
-    CadFigure::new(
-        CadPrimitiveKind::Square,
-        local_to_world(space, center_local),
-        (max_v - min_v).max(vec3(0.0, 0.0, 0.0)),
-        space.rot,
-    )
-}
-
-fn part_from_world_figure(fig: &CadFigure, root: &CadFigure) -> CadPart {
-    let q = (figure_quat(root).conjugate() * figure_quat(fig)).normalize();
-    let (rx, ry, rz) = q.to_euler(EulerRot::XYZ);
-    CadPart {
-        kind: fig.kind,
-        pos: world_to_local(root, fig.pos),
-        size: fig.size,
-        rot: vec3(rx, ry, rz),
+fn local_mesh_for_figure(fig: &CadFigure, csg: bool) -> Option<CadMeshData> {
+    match fig.kind {
+        CadPrimitiveKind::Square => Some(box_mesh_local(fig.size, if csg { 24 } else { 1 })),
+        CadPrimitiveKind::Cylinder => Some(cylinder_mesh_local(
+            fig.size,
+            if csg { 48 } else { 32 },
+            if csg { 12 } else { 1 },
+        )),
+        CadPrimitiveKind::Mesh => fig.mesh.clone(),
     }
 }
 
-fn build_composite_from_world_parts(parts: Vec<CadFigure>, space: &CadFigure) -> Option<CadFigure> {
-    // Result keeps real pieces; root only supplies transform, selection, and gizmo bounds.
-    if parts.is_empty() {
+fn world_mesh_for_leaf(fig: &CadFigure, csg: bool) -> Option<CadMeshData> {
+    let mut mesh = local_mesh_for_figure(fig, csg)?;
+    for v in &mut mesh.vertices {
+        *v = local_to_world(fig, *v);
+    }
+    Some(mesh)
+}
+
+fn figure_world_meshes(fig: &CadFigure, csg: bool) -> Vec<CadMeshData> {
+    figure_leaf_world_figures(fig)
+        .iter()
+        .filter_map(|leaf| world_mesh_for_leaf(leaf, csg))
+        .collect()
+}
+
+fn triangle_points(mesh: &CadMeshData, tri: [usize; 3]) -> Option<(Vec3, Vec3, Vec3)> {
+    Some((
+        *mesh.vertices.get(tri[0])?,
+        *mesh.vertices.get(tri[1])?,
+        *mesh.vertices.get(tri[2])?,
+    ))
+}
+
+fn triangle_centroid(a: Vec3, b: Vec3, c: Vec3) -> Vec3 {
+    (a + b + c) / 3.0
+}
+
+fn append_world_triangle(out: &mut CadMeshData, a: Vec3, b: Vec3, c: Vec3, flip: bool) {
+    if flip {
+        push_mesh_triangle(out, c, b, a);
+    } else {
+        push_mesh_triangle(out, a, b, c);
+    }
+}
+
+fn figure_from_world_mesh(world_mesh: CadMeshData) -> Option<CadFigure> {
+    if world_mesh.vertices.is_empty() || world_mesh.triangles.is_empty() {
         return None;
     }
-    if parts.len() == 1 {
-        return parts.into_iter().next();
-    }
 
     let mut min_v = vec3(f32::INFINITY, f32::INFINITY, f32::INFINITY);
     let mut max_v = vec3(f32::NEG_INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY);
-    for part in &parts {
-        let (part_min, part_max) = approximate_aabb_in_space(part, space);
-        min_v = min_v.min(part_min);
-        max_v = max_v.max(part_max);
+    for v in &world_mesh.vertices {
+        min_v = min_v.min(*v);
+        max_v = max_v.max(*v);
     }
 
     let center = (min_v + max_v) * 0.5;
-    let mut root = CadFigure::new(
-        CadPrimitiveKind::Square,
-        local_to_world(space, center),
+    let mut local_mesh = world_mesh;
+    for v in &mut local_mesh.vertices {
+        *v -= center;
+    }
+
+    let mut fig = CadFigure::new(
+        CadPrimitiveKind::Mesh,
+        center,
         (max_v - min_v).max(vec3(0.1, 0.1, 0.1)),
-        space.rot,
+        Vec3::ZERO,
     );
-    root.parts = parts
-        .iter()
-        .map(|part| part_from_world_figure(part, &root))
-        .collect();
-    Some(root)
+    fig.mesh = Some(local_mesh);
+    Some(fig)
 }
 
-fn apply_join(base: CadFigure, tool: CadFigure) -> Option<CadFigure> {
-    let mut parts = figure_leaf_world_figures(&base);
-    parts.extend(figure_leaf_world_figures(&tool));
-    build_composite_from_world_parts(parts, &base)
-}
-
-fn overlap_aabb(a_min: Vec3, a_max: Vec3, b_min: Vec3, b_max: Vec3) -> Option<(Vec3, Vec3)> {
-    let min_v = a_min.max(b_min);
-    let max_v = a_max.min(b_max);
-    if min_v.x < max_v.x && min_v.y < max_v.y && min_v.z < max_v.z {
-        Some((min_v, max_v))
+fn ray_triangle_t(origin: Vec3, dir: Vec3, a: Vec3, b: Vec3, c: Vec3) -> Option<f32> {
+    let edge1 = b - a;
+    let edge2 = c - a;
+    let h = dir.cross(edge2);
+    let det = edge1.dot(h);
+    if det.abs() < 0.00001 {
+        return None;
+    }
+    let inv_det = 1.0 / det;
+    let s = origin - a;
+    let u = inv_det * s.dot(h);
+    if !(0.0..=1.0).contains(&u) {
+        return None;
+    }
+    let q = s.cross(edge1);
+    let v = inv_det * dir.dot(q);
+    if v < 0.0 || u + v > 1.0 {
+        return None;
+    }
+    let t = inv_det * edge2.dot(q);
+    if t > 0.0001 {
+        Some(t)
     } else {
         None
     }
 }
 
-fn push_aabb_piece(out: &mut Vec<(Vec3, Vec3)>, min_v: Vec3, max_v: Vec3) {
-    const EPS: f32 = 0.05;
-    if max_v.x - min_v.x > EPS && max_v.y - min_v.y > EPS && max_v.z - min_v.z > EPS {
-        out.push((min_v, max_v));
+fn point_inside_mesh(mesh: &CadMeshData, local_point: Vec3) -> bool {
+    let dir = vec3(1.0, 0.137, 0.061).normalize();
+    let mut hits = Vec::new();
+    for tri in &mesh.triangles {
+        let Some((a, b, c)) = triangle_points(mesh, *tri) else {
+            continue;
+        };
+        if let Some(t) = ray_triangle_t(local_point, dir, a, b, c) {
+            hits.push(t);
+        }
+    }
+    hits.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    hits.dedup_by(|a, b| (*a - *b).abs() < 0.001);
+    hits.len() % 2 == 1
+}
+
+fn point_inside_leaf(fig: &CadFigure, world_point: Vec3) -> bool {
+    let p = world_to_local(fig, world_point);
+    match fig.kind {
+        CadPrimitiveKind::Square => {
+            let h = fig.size * 0.5 + vec3(0.001, 0.001, 0.001);
+            p.x.abs() <= h.x && p.y.abs() <= h.y && p.z.abs() <= h.z
+        }
+        CadPrimitiveKind::Cylinder => {
+            let hy = fig.size.y * 0.5 + 0.001;
+            let rx = (fig.size.x * 0.5).max(0.001);
+            let rz = (fig.size.z * 0.5).max(0.001);
+            p.y.abs() <= hy && (p.x / rx).powi(2) + (p.z / rz).powi(2) <= 1.001
+        }
+        CadPrimitiveKind::Mesh => fig
+            .mesh
+            .as_ref()
+            .is_some_and(|mesh| point_inside_mesh(mesh, p)),
     }
 }
 
-fn split_aabb_difference(a_min: Vec3, a_max: Vec3, o_min: Vec3, o_max: Vec3) -> Vec<(Vec3, Vec3)> {
-    // Six-piece box difference: remove overlap, keep every remaining slab.
-    let mut out = Vec::new();
-
-    push_aabb_piece(
-        &mut out,
-        vec3(a_min.x, a_min.y, a_min.z),
-        vec3(o_min.x, a_max.y, a_max.z),
-    );
-    push_aabb_piece(
-        &mut out,
-        vec3(o_max.x, a_min.y, a_min.z),
-        vec3(a_max.x, a_max.y, a_max.z),
-    );
-
-    let mid_x_min = o_min.x.max(a_min.x);
-    let mid_x_max = o_max.x.min(a_max.x);
-    push_aabb_piece(
-        &mut out,
-        vec3(mid_x_min, a_min.y, a_min.z),
-        vec3(mid_x_max, o_min.y, a_max.z),
-    );
-    push_aabb_piece(
-        &mut out,
-        vec3(mid_x_min, o_max.y, a_min.z),
-        vec3(mid_x_max, a_max.y, a_max.z),
-    );
-
-    let mid_y_min = o_min.y.max(a_min.y);
-    let mid_y_max = o_max.y.min(a_max.y);
-    push_aabb_piece(
-        &mut out,
-        vec3(mid_x_min, mid_y_min, a_min.z),
-        vec3(mid_x_max, mid_y_max, o_min.z),
-    );
-    push_aabb_piece(
-        &mut out,
-        vec3(mid_x_min, mid_y_min, o_max.z),
-        vec3(mid_x_max, mid_y_max, a_max.z),
-    );
-
-    out
-}
-
-fn overlap_consumes_aabb(a_min: Vec3, a_max: Vec3, o_min: Vec3, o_max: Vec3) -> bool {
-    const EPS: f32 = 0.05;
-    o_min.x <= a_min.x + EPS
-        && o_min.y <= a_min.y + EPS
-        && o_min.z <= a_min.z + EPS
-        && o_max.x >= a_max.x - EPS
-        && o_max.y >= a_max.y - EPS
-        && o_max.z >= a_max.z - EPS
-}
-
-fn subtract_leaf_by_tool(base_leaf: CadFigure, tool_leaf: &CadFigure) -> Vec<CadFigure> {
-    let (a_min, a_max) = base_local_aabb(&base_leaf);
-    let (b_min, b_max) = approximate_aabb_in_space(tool_leaf, &base_leaf);
-    let Some((o_min, o_max)) = overlap_aabb(a_min, a_max, b_min, b_max) else {
-        return vec![base_leaf];
-    };
-
-    if overlap_consumes_aabb(a_min, a_max, o_min, o_max) {
-        return Vec::new();
+fn point_inside_figure(fig: &CadFigure, world_point: Vec3) -> bool {
+    if fig.parts.is_empty() {
+        return point_inside_leaf(fig, world_point);
     }
+    figure_leaf_world_figures(fig)
+        .iter()
+        .any(|leaf| point_inside_leaf(leaf, world_point))
+}
 
-    split_aabb_difference(a_min, a_max, o_min, o_max)
-        .into_iter()
-        .map(|(min_v, max_v)| figure_from_local_aabb(min_v, max_v, &base_leaf))
-        .collect()
+fn point_strict_inside_leaf(fig: &CadFigure, world_point: Vec3, margin: f32) -> bool {
+    let p = world_to_local(fig, world_point);
+    match fig.kind {
+        CadPrimitiveKind::Square => {
+            let h = fig.size * 0.5 - vec3(margin, margin, margin);
+            h.x > 0.0
+                && h.y > 0.0
+                && h.z > 0.0
+                && p.x.abs() < h.x
+                && p.y.abs() < h.y
+                && p.z.abs() < h.z
+        }
+        CadPrimitiveKind::Cylinder => {
+            let hy = fig.size.y * 0.5 - margin;
+            let rx = (fig.size.x * 0.5 - margin).max(0.001);
+            let rz = (fig.size.z * 0.5 - margin).max(0.001);
+            hy > 0.0 && p.y.abs() < hy && (p.x / rx).powi(2) + (p.z / rz).powi(2) < 1.0
+        }
+        CadPrimitiveKind::Mesh => point_inside_leaf(fig, world_point),
+    }
+}
+
+fn point_strict_inside_figure(fig: &CadFigure, world_point: Vec3, margin: f32) -> bool {
+    if fig.parts.is_empty() {
+        return point_strict_inside_leaf(fig, world_point, margin);
+    }
+    figure_leaf_world_figures(fig)
+        .iter()
+        .any(|leaf| point_strict_inside_leaf(leaf, world_point, margin))
+}
+
+fn csg_join_mesh(base: &CadFigure, tool: &CadFigure) -> Option<CadMeshData> {
+    let mut out = CadMeshData::new();
+    for mesh in figure_world_meshes(base, true) {
+        for tri in &mesh.triangles {
+            let Some((a, b, c)) = triangle_points(&mesh, *tri) else {
+                continue;
+            };
+            if !point_inside_figure(tool, triangle_centroid(a, b, c)) {
+                append_world_triangle(&mut out, a, b, c, false);
+            }
+        }
+    }
+    for mesh in figure_world_meshes(tool, true) {
+        for tri in &mesh.triangles {
+            let Some((a, b, c)) = triangle_points(&mesh, *tri) else {
+                continue;
+            };
+            if !point_inside_figure(base, triangle_centroid(a, b, c)) {
+                append_world_triangle(&mut out, a, b, c, false);
+            }
+        }
+    }
+    if out.triangles.is_empty() {
+        None
+    } else {
+        Some(out)
+    }
+}
+
+fn csg_subtract_mesh(base: &CadFigure, tool: &CadFigure) -> Option<CadMeshData> {
+    let mut out = CadMeshData::new();
+    for mesh in figure_world_meshes(base, true) {
+        for tri in &mesh.triangles {
+            let Some((a, b, c)) = triangle_points(&mesh, *tri) else {
+                continue;
+            };
+            if !point_inside_figure(tool, triangle_centroid(a, b, c)) {
+                append_world_triangle(&mut out, a, b, c, false);
+            }
+        }
+    }
+    for mesh in figure_world_meshes(tool, true) {
+        for tri in &mesh.triangles {
+            let Some((a, b, c)) = triangle_points(&mesh, *tri) else {
+                continue;
+            };
+            if point_strict_inside_figure(base, triangle_centroid(a, b, c), 0.05) {
+                append_world_triangle(&mut out, a, b, c, true);
+            }
+        }
+    }
+    if out.triangles.is_empty() {
+        None
+    } else {
+        Some(out)
+    }
+}
+
+fn apply_join(base: CadFigure, tool: CadFigure) -> Option<CadFigure> {
+    csg_join_mesh(&base, &tool).and_then(figure_from_world_mesh)
 }
 
 fn apply_subtract(base: CadFigure, tool: CadFigure) -> Option<CadFigure> {
-    let tool_leaves = figure_leaf_world_figures(&tool);
-    let mut result_leaves = figure_leaf_world_figures(&base);
-
-    for tool_leaf in &tool_leaves {
-        let mut next = Vec::new();
-        for base_leaf in result_leaves {
-            next.extend(subtract_leaf_by_tool(base_leaf, tool_leaf));
-        }
-        if next.is_empty() {
-            return None;
-        }
-        result_leaves = next;
-    }
-
-    build_composite_from_world_parts(result_leaves, &base)
+    csg_subtract_mesh(&base, &tool).and_then(figure_from_world_mesh)
 }
 
 fn replace_pair_with_result(
@@ -982,6 +1355,92 @@ fn align_face_label(i: usize) -> &'static str {
     }
 }
 
+fn export_obj(figures: &[CadFigure], path: &str) -> Result<(), String> {
+    let mut out = String::from("# GridGame CAD OBJ\n");
+    let mut vertex_offset = 1usize;
+
+    for (fig_i, fig) in figures.iter().enumerate() {
+        out.push_str(&format!("o figure_{}\n", fig_i + 1));
+        for mesh in figure_world_meshes(fig, false) {
+            for v in &mesh.vertices {
+                out.push_str(&format!("v {:.6} {:.6} {:.6}\n", v.x, v.y, v.z));
+            }
+            for tri in &mesh.triangles {
+                out.push_str(&format!(
+                    "f {} {} {}\n",
+                    tri[0] + vertex_offset,
+                    tri[1] + vertex_offset,
+                    tri[2] + vertex_offset
+                ));
+            }
+            vertex_offset += mesh.vertices.len();
+        }
+    }
+
+    fs::write(path, out).map_err(|err| format!("Export failed: {}", err))
+}
+
+fn parse_obj_index(raw: &str, vertex_count: usize) -> Option<usize> {
+    let first = raw.split('/').next()?;
+    let idx = first.parse::<isize>().ok()?;
+    if idx > 0 {
+        Some((idx as usize).saturating_sub(1))
+    } else if idx < 0 {
+        Some((vertex_count as isize + idx) as usize)
+    } else {
+        None
+    }
+}
+
+fn import_obj(path: &str) -> Result<CadFigure, String> {
+    let text = fs::read_to_string(path).map_err(|err| format!("Import failed: {}", err))?;
+    let mut vertices = Vec::new();
+    let mut triangles = Vec::new();
+
+    for line in text.lines() {
+        let clean = line.trim();
+        if clean.is_empty() || clean.starts_with('#') {
+            continue;
+        }
+        let mut parts = clean.split_whitespace();
+        match parts.next() {
+            Some("v") => {
+                let x = parts
+                    .next()
+                    .and_then(|v| v.parse::<f32>().ok())
+                    .unwrap_or(0.0);
+                let y = parts
+                    .next()
+                    .and_then(|v| v.parse::<f32>().ok())
+                    .unwrap_or(0.0);
+                let z = parts
+                    .next()
+                    .and_then(|v| v.parse::<f32>().ok())
+                    .unwrap_or(0.0);
+                vertices.push(vec3(x, y, z));
+            }
+            Some("f") => {
+                let face: Vec<usize> = parts
+                    .filter_map(|p| parse_obj_index(p, vertices.len()))
+                    .filter(|idx| *idx < vertices.len())
+                    .collect();
+                if face.len() >= 3 {
+                    for i in 1..face.len() - 1 {
+                        triangles.push([face[0], face[i], face[i + 1]]);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    figure_from_world_mesh(CadMeshData {
+        vertices,
+        triangles,
+    })
+    .ok_or_else(|| "Import failed: OBJ has no mesh faces".to_string())
+}
+
 pub fn run(
     ctx: &FrameContext,
     scene: &mut Scene,
@@ -995,7 +1454,7 @@ pub fn run(
     }
 
     let camera = cad_camera(state);
-    let panel = Rect::new(screen_width() - 290.0, 24.0, 266.0, 560.0);
+    let panel = Rect::new(screen_width() - 290.0, 24.0, 266.0, 640.0);
     let ui_capturing = panel.contains(ctx.mouse);
 
     if is_mouse_button_down(MouseButton::Right) {
@@ -1037,12 +1496,20 @@ pub fn run(
         }
 
         if !state.dragging_handle && !state.dragging_axis {
-            let centers: Vec<Vec3> = state.figures.iter().map(|f| f.pos).collect();
-            if let Some(picked) = pick_closest_index(&camera, ctx.mouse, &centers, 28.0) {
+            if let Some(picked) = pick_figure_by_body(&camera, ctx.mouse, &state.figures) {
                 if is_pair_tool(state.tool) {
                     pair_selection_click(state, picked);
                 } else {
                     state.selected = Some(picked);
+                }
+            } else {
+                let centers: Vec<Vec3> = state.figures.iter().map(|f| f.pos).collect();
+                if let Some(picked) = pick_closest_index(&camera, ctx.mouse, &centers, 28.0) {
+                    if is_pair_tool(state.tool) {
+                        pair_selection_click(state, picked);
+                    } else {
+                        state.selected = Some(picked);
+                    }
                 }
             }
         }
@@ -1130,6 +1597,22 @@ pub fn run(
     let (tool_subtract, _) = ui_button(
         Rect::new(panel.x + 10.0, y, bw, bh),
         "Subtract",
+        ctx.mouse,
+        ctx.font_sm,
+        ctx.button_colors,
+    );
+    y += 34.0;
+    let (export_obj_clicked, _) = ui_button(
+        Rect::new(panel.x + 10.0, y, bw, bh),
+        "Export OBJ",
+        ctx.mouse,
+        ctx.font_sm,
+        ctx.button_colors,
+    );
+    y += 30.0;
+    let (import_obj_clicked, _) = ui_button(
+        Rect::new(panel.x + 10.0, y, bw, bh),
+        "Import OBJ",
         ctx.mouse,
         ctx.font_sm,
         ctx.button_colors,
@@ -1224,6 +1707,22 @@ pub fn run(
     }
     if tool_subtract {
         switch_tool(state, CadTool::Subtract);
+    }
+    if export_obj_clicked {
+        state.obj_status = match export_obj(&state.figures, CAD_OBJ_PATH) {
+            Ok(()) => format!("Exported {}", CAD_OBJ_PATH),
+            Err(err) => err,
+        };
+    }
+    if import_obj_clicked {
+        match import_obj(CAD_OBJ_PATH) {
+            Ok(fig) => {
+                state.figures.push(fig);
+                state.selected = Some(state.figures.len().saturating_sub(1));
+                state.obj_status = format!("Imported {}", CAD_OBJ_PATH);
+            }
+            Err(err) => state.obj_status = err,
+        }
     }
 
     if let Some(i) = state.selected {
@@ -1407,4 +1906,11 @@ pub fn run(
             colors.text_secondary,
         );
     }
+    draw_text(
+        &state.obj_status,
+        24.0,
+        128.0,
+        ctx.font_sm,
+        colors.text_secondary,
+    );
 }

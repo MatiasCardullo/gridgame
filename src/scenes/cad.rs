@@ -1,15 +1,29 @@
 use macroquad::prelude::*;
+use opengeometry::booleans::{
+    OGBooleanOperation, OGBooleanOptions, boolean_subtraction, boolean_union,
+};
+use opengeometry::brep::Brep;
+use opengeometry::export::stl::{StlExportConfig, export_breps_to_stl_file};
+use opengeometry::primitives::cuboid::OGCuboid;
+use opengeometry::primitives::cylinder::OGCylinder;
+use opengeometry::primitives::sphere::OGSphere;
+use opengeometry::primitives::wedge::OGWedge;
+use openmaths::Vector3;
+use rfd::FileDialog;
 use std::fs;
+use std::fs::File;
+use std::io::BufReader;
+use std::path::Path;
 
 use crate::core::ui::ui_button;
 use crate::core::{FrameContext, RuntimeColors, Scene};
-
-const CAD_OBJ_PATH: &str = "cad_scene.obj";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CadPrimitiveKind {
     Square,
     Cylinder,
+    Sphere,
+    Wedge,
     Mesh,
 }
 
@@ -21,6 +35,14 @@ enum CadTool {
     Align,
     Join,
     Subtract,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AddShapeKind {
+    Square,
+    Cylinder,
+    Sphere,
+    Wedge,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -77,34 +99,136 @@ impl CadMeshData {
     }
 }
 
-#[derive(Clone, Debug)]
-struct CadPart {
-    kind: CadPrimitiveKind,
-    pos: Vec3,
-    size: Vec3,
-    rot: Vec3,
-    mesh: Option<CadMeshData>,
-}
-
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 struct CadFigure {
     kind: CadPrimitiveKind,
     pos: Vec3,
     size: Vec3,
-    rot: Vec3, // x/y/z radians in local form
-    parts: Vec<CadPart>,
-    mesh: Option<CadMeshData>,
+    rot: Vec3,
+    mesh: CadMeshData,
+    brep: Option<Brep>,
 }
 
 impl CadFigure {
-    fn new(kind: CadPrimitiveKind, pos: Vec3, size: Vec3, rot: Vec3) -> Self {
+    fn new(kind: CadPrimitiveKind, pos: Vec3, size: Vec3) -> Self {
+        let mut fig = Self {
+            kind,
+            pos,
+            size,
+            rot: Vec3::ZERO,
+            mesh: CadMeshData::new(),
+            brep: None,
+        };
+        fig.rebuild();
+        fig
+    }
+
+    fn from_brep(kind: CadPrimitiveKind, brep: Brep) -> Self {
+        let mesh = mesh_from_brep(&brep);
+        let (pos, size) = mesh_bounds(&mesh).unwrap_or((Vec3::ZERO, vec3(12.0, 12.0, 12.0)));
         Self {
             kind,
             pos,
             size,
-            rot,
-            parts: Vec::new(),
-            mesh: None,
+            rot: Vec3::ZERO,
+            mesh,
+            brep: Some(brep),
+        }
+    }
+
+    fn from_mesh(mesh: CadMeshData) -> Self {
+        let (pos, size) = mesh_bounds(&mesh).unwrap_or((Vec3::ZERO, vec3(12.0, 12.0, 12.0)));
+        Self {
+            kind: CadPrimitiveKind::Mesh,
+            pos,
+            size,
+            rot: Vec3::ZERO,
+            mesh,
+            brep: None,
+        }
+    }
+
+    // Rebuilds OpenGeometry BRep, then refreshes render triangles.
+    fn rebuild(&mut self) {
+        match self.kind {
+            CadPrimitiveKind::Square => {
+                let mut cuboid = OGCuboid::new("gridgame-cuboid".to_string());
+                if cuboid
+                    .set_config(
+                        og_vec(Vec3::ZERO),
+                        self.size.x.max(1.0) as f64,
+                        self.size.y.max(1.0) as f64,
+                        self.size.z.max(1.0) as f64,
+                    )
+                    .is_ok()
+                    && cuboid
+                        .set_transform(og_vec(self.pos), og_vec(self.rot), og_vec(Vec3::ONE))
+                        .is_ok()
+                {
+                    let brep = cuboid.world_brep();
+                    self.mesh = mesh_from_brep(&brep);
+                    self.brep = Some(brep);
+                }
+            }
+            CadPrimitiveKind::Cylinder => {
+                let radius = ((self.size.x + self.size.z) * 0.25).max(1.0);
+                self.size.x = radius * 2.0;
+                self.size.z = radius * 2.0;
+                let mut cylinder = OGCylinder::new("gridgame-cylinder".to_string());
+                if cylinder
+                    .set_config(
+                        og_vec(Vec3::ZERO),
+                        radius as f64,
+                        self.size.y.max(1.0) as f64,
+                        std::f64::consts::TAU,
+                        48,
+                    )
+                    .is_ok()
+                    && cylinder
+                        .set_transform(og_vec(self.pos), og_vec(self.rot), og_vec(Vec3::ONE))
+                        .is_ok()
+                {
+                    let brep = cylinder.world_brep();
+                    self.mesh = mesh_from_brep(&brep);
+                    self.brep = Some(brep);
+                }
+            }
+            CadPrimitiveKind::Sphere => {
+                let radius = (self.size.x + self.size.y + self.size.z).max(3.0) / 6.0;
+                self.size = Vec3::splat(radius * 2.0);
+                let mut sphere = OGSphere::new("gridgame-sphere".to_string());
+                if sphere
+                    .set_config(og_vec(Vec3::ZERO), radius as f64, 32, 18)
+                    .is_ok()
+                    && sphere
+                        .set_transform(og_vec(self.pos), og_vec(self.rot), og_vec(Vec3::ONE))
+                        .is_ok()
+                {
+                    let brep = sphere.world_brep();
+                    self.mesh = mesh_from_brep(&brep);
+                    self.brep = Some(brep);
+                }
+            }
+            CadPrimitiveKind::Wedge => {
+                let mut wedge = OGWedge::new("gridgame-wedge".to_string());
+                if wedge
+                    .set_config(
+                        og_vec(Vec3::ZERO),
+                        self.size.x.max(1.0) as f64,
+                        self.size.y.max(1.0) as f64,
+                        self.size.z.max(1.0) as f64,
+                    )
+                    .is_ok()
+                    && wedge
+                        .set_transform(og_vec(self.pos), og_vec(self.rot), og_vec(Vec3::ONE))
+                        .is_ok()
+                {
+                    let brep = wedge.world_brep();
+                    self.mesh = mesh_from_brep(&brep);
+                    self.brep = Some(brep);
+                }
+            }
+            CadPrimitiveKind::Mesh => {}
         }
     }
 }
@@ -120,12 +244,11 @@ pub struct CadState {
     pending_source: Option<usize>,
     selected_resize_handle: usize,
     selected_rotate_axis: usize,
-    dragging_handle: bool,
-    dragging_axis: bool,
-    drag_last_mouse: Vec2,
     align_mode: AlignMode,
     align_face: usize,
-    obj_status: String,
+    add_menu_open: bool,
+    selected_vertices: Vec<usize>,
+    status: String,
 }
 
 impl Default for CadState {
@@ -141,14 +264,17 @@ impl Default for CadState {
             pending_source: None,
             selected_resize_handle: 0,
             selected_rotate_axis: 1,
-            dragging_handle: false,
-            dragging_axis: false,
-            drag_last_mouse: Vec2::ZERO,
             align_mode: AlignMode::Center,
             align_face: 0,
-            obj_status: "OBJ: cad_scene.obj".to_string(),
+            add_menu_open: false,
+            selected_vertices: Vec::new(),
+            status: "OpenGeometry CAD".to_string(),
         }
     }
+}
+
+fn og_vec(v: Vec3) -> Vector3 {
+    Vector3::new(v.x as f64, v.y as f64, v.z as f64)
 }
 
 fn cad_camera(state: &CadState) -> Camera3D {
@@ -182,151 +308,36 @@ fn local_to_world(fig: &CadFigure, local: Vec3) -> Vec3 {
     fig.pos + x * local.x + y * local.y + z * local.z
 }
 
-fn part_quat(part: &CadPart) -> Quat {
-    Quat::from_euler(EulerRot::XYZ, part.rot.x, part.rot.y, part.rot.z)
+fn mesh_from_brep(brep: &Brep) -> CadMeshData {
+    let mut mesh = CadMeshData::new();
+    let buffer = brep.get_triangle_vertex_buffer();
+    for tri in buffer.chunks_exact(9) {
+        let base = mesh.vertices.len();
+        mesh.vertices
+            .push(vec3(tri[0] as f32, tri[1] as f32, tri[2] as f32));
+        mesh.vertices
+            .push(vec3(tri[3] as f32, tri[4] as f32, tri[5] as f32));
+        mesh.vertices
+            .push(vec3(tri[6] as f32, tri[7] as f32, tri[8] as f32));
+        mesh.triangles.push([base, base + 1, base + 2]);
+    }
+    mesh
 }
 
-fn part_as_world_figure(parent: &CadFigure, part: &CadPart) -> CadFigure {
-    let q = (figure_quat(parent) * part_quat(part)).normalize();
-    let (rx, ry, rz) = q.to_euler(EulerRot::XYZ);
-    let mut fig = CadFigure::new(
-        part.kind,
-        local_to_world(parent, part.pos),
-        part.size,
-        vec3(rx, ry, rz),
-    );
-    fig.mesh = part.mesh.clone();
-    fig
+fn mesh_bounds(mesh: &CadMeshData) -> Option<(Vec3, Vec3)> {
+    let first = *mesh.vertices.first()?;
+    let mut min = first;
+    let mut max = first;
+    for v in &mesh.vertices[1..] {
+        min = min.min(*v);
+        max = max.max(*v);
+    }
+    Some(((min + max) * 0.5, (max - min).max(vec3(1.0, 1.0, 1.0))))
 }
 
-fn figure_leaf_world_figures(fig: &CadFigure) -> Vec<CadFigure> {
-    if fig.parts.is_empty() {
-        return vec![CadFigure::new(fig.kind, fig.pos, fig.size, fig.rot)];
-    }
-    fig.parts
-        .iter()
-        .map(|part| part_as_world_figure(fig, part))
-        .collect()
-}
-
-fn draw_oriented_box(fig: &CadFigure, fill: Color, wire: Color) {
-    let (x_axis, y_axis, z_axis) = figure_basis(fig);
-    let origin = fig.pos
-        - x_axis * (fig.size.x * 0.5)
-        - y_axis * (fig.size.y * 0.5)
-        - z_axis * (fig.size.z * 0.5);
-    draw_affine_parallelepiped(
-        origin,
-        x_axis * fig.size.x,
-        y_axis * fig.size.y,
-        z_axis * fig.size.z,
-        None,
-        fill,
-    );
-
-    let hx = fig.size.x * 0.5;
-    let hy = fig.size.y * 0.5;
-    let hz = fig.size.z * 0.5;
-    let p000 = local_to_world(fig, vec3(-hx, -hy, -hz));
-    let p100 = local_to_world(fig, vec3(hx, -hy, -hz));
-    let p010 = local_to_world(fig, vec3(-hx, hy, -hz));
-    let p110 = local_to_world(fig, vec3(hx, hy, -hz));
-    let p001 = local_to_world(fig, vec3(-hx, -hy, hz));
-    let p101 = local_to_world(fig, vec3(hx, -hy, hz));
-    let p011 = local_to_world(fig, vec3(-hx, hy, hz));
-    let p111 = local_to_world(fig, vec3(hx, hy, hz));
-    let edges = [
-        (p000, p100),
-        (p000, p010),
-        (p000, p001),
-        (p100, p110),
-        (p100, p101),
-        (p010, p110),
-        (p010, p011),
-        (p001, p101),
-        (p001, p011),
-        (p110, p111),
-        (p101, p111),
-        (p011, p111),
-    ];
-    for (a, b) in edges {
-        draw_line_3d(a, b, wire);
-    }
-}
-
-fn draw_oriented_cylinder(fig: &CadFigure, fill: Color, wire: Color) {
-    let sides: usize = 24;
-    let hy = fig.size.y * 0.5;
-    let rx = fig.size.x * 0.5;
-    let rz = fig.size.z * 0.5;
-    let mut ring_bottom: Vec<Vec3> = Vec::with_capacity(sides);
-    let mut ring_top: Vec<Vec3> = Vec::with_capacity(sides);
-
-    for i in 0..sides {
-        let a = (i as f32 / sides as f32) * std::f32::consts::TAU;
-        let local = vec3(a.sin() * rx, 0.0, a.cos() * rz);
-        ring_bottom.push(local_to_world(fig, vec3(local.x, -hy, local.z)));
-        ring_top.push(local_to_world(fig, vec3(local.x, hy, local.z)));
-    }
-
-    let mut vertices: Vec<Vertex> = Vec::with_capacity(sides * 2 + 2);
-    for i in 0..sides {
-        vertices.push(Vertex::new2(ring_bottom[i], vec2(0.0, 0.0), fill));
-        vertices.push(Vertex::new2(ring_top[i], vec2(0.0, 1.0), fill));
-    }
-    let bottom_center_idx = vertices.len() as u16;
-    vertices.push(Vertex::new2(
-        local_to_world(fig, vec3(0.0, -hy, 0.0)),
-        vec2(0.5, 0.5),
-        fill,
-    ));
-    let top_center_idx = vertices.len() as u16;
-    vertices.push(Vertex::new2(
-        local_to_world(fig, vec3(0.0, hy, 0.0)),
-        vec2(0.5, 0.5),
-        fill,
-    ));
-
-    let mut indices: Vec<u16> = Vec::with_capacity(sides * 12);
-    for i in 0..sides {
-        let ni = (i + 1) % sides;
-        let bi = (i * 2) as u16;
-        let ti = bi + 1;
-        let bni = (ni * 2) as u16;
-        let tni = bni + 1;
-
-        indices.extend_from_slice(&[bi, bni, tni, bi, tni, ti]);
-        indices.extend_from_slice(&[bottom_center_idx, bni, bi]);
-        indices.extend_from_slice(&[top_center_idx, ti, tni]);
-    }
-
-    draw_mesh(&Mesh {
-        vertices,
-        indices,
-        texture: None,
-    });
-
-    for i in 0..sides {
-        let ni = (i + 1) % sides;
-        draw_line_3d(ring_bottom[i], ring_bottom[ni], wire);
-        draw_line_3d(ring_top[i], ring_top[ni], wire);
-        if i % 6 == 0 {
-            draw_line_3d(ring_bottom[i], ring_top[i], wire);
-        }
-    }
-
-    // seam line shows local yaw rotation on symmetric body.
-    draw_line_3d(
-        local_to_world(fig, vec3(rx, -hy, 0.0)),
-        local_to_world(fig, vec3(rx, hy, 0.0)),
-        wire,
-    );
-}
-
-fn draw_cad_mesh(fig: &CadFigure, mesh: &CadMeshData, fill: Color, wire: Color) {
+fn draw_cad_mesh(mesh: &CadMeshData, fill: Color, wire: Color) {
     let mut vertices: Vec<Vertex> = Vec::new();
     let mut indices: Vec<u16> = Vec::new();
-
     for tri in &mesh.triangles {
         if vertices.len() + 3 >= u16::MAX as usize {
             draw_mesh(&Mesh {
@@ -339,18 +350,12 @@ fn draw_cad_mesh(fig: &CadFigure, mesh: &CadMeshData, fill: Color, wire: Color) 
         }
         let base = vertices.len() as u16;
         for idx in tri {
-            let Some(local) = mesh.vertices.get(*idx) else {
-                continue;
-            };
-            vertices.push(Vertex::new2(
-                local_to_world(fig, *local),
-                vec2(0.0, 0.0),
-                fill,
-            ));
+            if let Some(p) = mesh.vertices.get(*idx) {
+                vertices.push(Vertex::new2(*p, vec2(0.0, 0.0), fill));
+            }
         }
         indices.extend_from_slice(&[base, base + 1, base + 2]);
     }
-
     if !vertices.is_empty() {
         draw_mesh(&Mesh {
             vertices,
@@ -358,7 +363,6 @@ fn draw_cad_mesh(fig: &CadFigure, mesh: &CadMeshData, fill: Color, wire: Color) 
             texture: None,
         });
     }
-
     for tri in &mesh.triangles {
         let Some(a) = mesh.vertices.get(tri[0]) else {
             continue;
@@ -369,69 +373,47 @@ fn draw_cad_mesh(fig: &CadFigure, mesh: &CadMeshData, fill: Color, wire: Color) 
         let Some(c) = mesh.vertices.get(tri[2]) else {
             continue;
         };
-        let aw = local_to_world(fig, *a);
-        let bw = local_to_world(fig, *b);
-        let cw = local_to_world(fig, *c);
-        draw_line_3d(aw, bw, wire);
-        draw_line_3d(bw, cw, wire);
-        draw_line_3d(cw, aw, wire);
-    }
-}
-
-fn draw_figure_body(fig: &CadFigure, fill: Color, wire: Color) {
-    match fig.kind {
-        CadPrimitiveKind::Square => draw_oriented_box(fig, fill, wire),
-        CadPrimitiveKind::Cylinder => draw_oriented_cylinder(fig, fill, wire),
-        CadPrimitiveKind::Mesh => {
-            if let Some(mesh) = &fig.mesh {
-                draw_cad_mesh(fig, mesh, fill, wire);
-            }
-        }
+        draw_line_3d(*a, *b, wire);
+        draw_line_3d(*b, *c, wire);
+        draw_line_3d(*c, *a, wire);
     }
 }
 
 fn draw_figure(fig: &CadFigure, selected: bool) {
     let (fill, wire) = if selected {
         (
-            Color::from_rgba(125, 210, 255, 255),
-            Color::from_rgba(250, 255, 255, 255),
+            Color::from_rgba(67, 120, 155, 160),
+            Color::from_rgba(165, 228, 255, 255),
         )
     } else {
         (
-            Color::from_rgba(95, 145, 180, 215),
-            Color::from_rgba(170, 200, 225, 255),
+            Color::from_rgba(68, 84, 105, 130),
+            Color::from_rgba(105, 132, 150, 255),
         )
     };
-    if fig.parts.is_empty() {
-        draw_figure_body(fig, fill, wire);
-        return;
-    }
-    for part in &fig.parts {
-        let part_fig = part_as_world_figure(fig, part);
-        draw_figure_body(&part_fig, fill, wire);
-    }
+    draw_cad_mesh(&fig.mesh, fill, wire);
 }
 
 fn box_handles(fig: &CadFigure) -> Vec<ResizeHandle> {
+    let h = fig.size * 0.5;
     let mut out = Vec::new();
-    let half = fig.size * 0.5;
-    for sx in [-1_i8, 0, 1] {
-        for sy in [-1_i8, 0, 1] {
-            for sz in [-1_i8, 0, 1] {
-                if sx == 0 && sy == 0 && sz == 0 {
-                    continue;
-                }
-                let sign = Vec3Sign {
-                    x: sx,
-                    y: sy,
-                    z: sz,
-                };
-                out.push(ResizeHandle {
-                    local_pos: vec3(half.x * sx as f32, half.y * sy as f32, half.z * sz as f32),
-                    kind: ResizeHandleKind::BoxDir(sign),
-                });
-            }
-        }
+    for sx in [-1, 1] {
+        out.push(ResizeHandle {
+            local_pos: vec3(h.x * sx as f32, 0.0, 0.0),
+            kind: ResizeHandleKind::BoxDir(Vec3Sign { x: sx, y: 0, z: 0 }),
+        });
+    }
+    for sy in [-1, 1] {
+        out.push(ResizeHandle {
+            local_pos: vec3(0.0, h.y * sy as f32, 0.0),
+            kind: ResizeHandleKind::BoxDir(Vec3Sign { x: 0, y: sy, z: 0 }),
+        });
+    }
+    for sz in [-1, 1] {
+        out.push(ResizeHandle {
+            local_pos: vec3(0.0, 0.0, h.z * sz as f32),
+            kind: ResizeHandleKind::BoxDir(Vec3Sign { x: 0, y: 0, z: sz }),
+        });
     }
     out
 }
@@ -469,22 +451,18 @@ fn cylinder_handles(fig: &CadFigure) -> Vec<ResizeHandle> {
 
 fn resize_handles(fig: &CadFigure) -> Vec<ResizeHandle> {
     match fig.kind {
-        CadPrimitiveKind::Square | CadPrimitiveKind::Mesh => box_handles(fig),
         CadPrimitiveKind::Cylinder => cylinder_handles(fig),
+        CadPrimitiveKind::Square
+        | CadPrimitiveKind::Sphere
+        | CadPrimitiveKind::Wedge
+        | CadPrimitiveKind::Mesh => box_handles(fig),
     }
-}
-
-fn handle_world_positions(fig: &CadFigure) -> Vec<Vec3> {
-    resize_handles(fig)
-        .into_iter()
-        .map(|h| local_to_world(fig, h.local_pos))
-        .collect()
 }
 
 fn axis_world_positions(fig: &CadFigure) -> [Vec3; 3] {
     let (x, y, z) = figure_basis(fig);
-    let arm = fig.size.max_element() * 0.65 + 12.0;
-    [fig.pos + x * arm, fig.pos + y * arm, fig.pos + z * arm]
+    let len = fig.size.max_element().max(18.0) * 0.7;
+    [fig.pos + x * len, fig.pos + y * len, fig.pos + z * len]
 }
 
 fn project_world_to_screen(camera: &Camera3D, point: Vec3) -> Option<Vec2> {
@@ -507,16 +485,12 @@ fn pick_closest_index(
 ) -> Option<usize> {
     let mut best: Option<(f32, usize)> = None;
     for (i, p) in points.iter().enumerate() {
-        let Some(s) = project_world_to_screen(camera, *p) else {
+        let Some(screen) = project_world_to_screen(camera, *p) else {
             continue;
         };
-        let d = s.distance(mouse);
-        if d > max_px {
-            continue;
-        }
-        match best {
-            Some((best_d, _)) if d >= best_d => {}
-            _ => best = Some((d, i)),
+        let dist = screen.distance(mouse);
+        if dist <= max_px && best.is_none_or(|(best_dist, _)| dist < best_dist) {
+            best = Some((dist, i));
         }
     }
     best.map(|(_, i)| i)
@@ -536,13 +510,60 @@ fn mouse_world_ray(camera: &Camera3D, mouse: Vec2) -> (Vec3, Vec3) {
     (camera.position, dir)
 }
 
-fn ray_box_t(origin: Vec3, dir: Vec3, half: Vec3) -> Option<f32> {
+fn ray_triangle_t(origin: Vec3, dir: Vec3, a: Vec3, b: Vec3, c: Vec3) -> Option<f32> {
+    let eps = 0.00001;
+    let edge1 = b - a;
+    let edge2 = c - a;
+    let h = dir.cross(edge2);
+    let det = edge1.dot(h);
+    if det.abs() < eps {
+        return None;
+    }
+    let inv_det = 1.0 / det;
+    let s = origin - a;
+    let u = inv_det * s.dot(h);
+    if !(0.0..=1.0).contains(&u) {
+        return None;
+    }
+    let q = s.cross(edge1);
+    let v = inv_det * dir.dot(q);
+    if v < 0.0 || u + v > 1.0 {
+        return None;
+    }
+    let t = inv_det * edge2.dot(q);
+    (t > eps).then_some(t)
+}
+
+fn ray_mesh_t(origin: Vec3, dir: Vec3, mesh: &CadMeshData) -> Option<f32> {
+    let mut best: Option<f32> = None;
+    for tri in &mesh.triangles {
+        let Some(a) = mesh.vertices.get(tri[0]) else {
+            continue;
+        };
+        let Some(b) = mesh.vertices.get(tri[1]) else {
+            continue;
+        };
+        let Some(c) = mesh.vertices.get(tri[2]) else {
+            continue;
+        };
+        if let Some(t) = ray_triangle_t(origin, dir, *a, *b, *c) {
+            if best.is_none_or(|best_t| t < best_t) {
+                best = Some(t);
+            }
+        }
+    }
+    best
+}
+
+fn ray_aabb_t(origin: Vec3, dir: Vec3, center: Vec3, size: Vec3) -> Option<f32> {
+    let half = size * 0.5 + Vec3::splat(1.5);
+    let local = origin - center;
     let mut t_min = f32::NEG_INFINITY;
     let mut t_max = f32::INFINITY;
     for (o, d, h) in [
-        (origin.x, dir.x, half.x),
-        (origin.y, dir.y, half.y),
-        (origin.z, dir.z, half.z),
+        (local.x, dir.x, half.x),
+        (local.y, dir.y, half.y),
+        (local.z, dir.z, half.z),
     ] {
         if d.abs() < 0.00001 {
             if o < -h || o > h {
@@ -561,91 +582,86 @@ fn ray_box_t(origin: Vec3, dir: Vec3, half: Vec3) -> Option<f32> {
             return None;
         }
     }
-    if t_max < 0.0 {
-        None
-    } else {
-        Some(t_min.max(0.0))
-    }
-}
-
-fn ray_cylinder_t(origin: Vec3, dir: Vec3, size: Vec3) -> Option<f32> {
-    let rx = (size.x * 0.5).max(0.001);
-    let rz = (size.z * 0.5).max(0.001);
-    let hy = size.y * 0.5;
-    let mut best: Option<f32> = None;
-
-    let a = (dir.x * dir.x) / (rx * rx) + (dir.z * dir.z) / (rz * rz);
-    let b = 2.0 * ((origin.x * dir.x) / (rx * rx) + (origin.z * dir.z) / (rz * rz));
-    let c = (origin.x * origin.x) / (rx * rx) + (origin.z * origin.z) / (rz * rz) - 1.0;
-    let disc = b * b - 4.0 * a * c;
-    if a.abs() > 0.00001 && disc >= 0.0 {
-        let root = disc.sqrt();
-        for t in [(-b - root) / (2.0 * a), (-b + root) / (2.0 * a)] {
-            let y = origin.y + dir.y * t;
-            if t >= 0.0 && y >= -hy && y <= hy {
-                best = Some(best.map_or(t, |old| old.min(t)));
-            }
-        }
-    }
-
-    if dir.y.abs() > 0.00001 {
-        for y in [-hy, hy] {
-            let t = (y - origin.y) / dir.y;
-            let x = origin.x + dir.x * t;
-            let z = origin.z + dir.z * t;
-            if t >= 0.0 && (x / rx).powi(2) + (z / rz).powi(2) <= 1.0 {
-                best = Some(best.map_or(t, |old| old.min(t)));
-            }
-        }
-    }
-
-    best
-}
-
-fn ray_mesh_t(origin: Vec3, dir: Vec3, mesh: &CadMeshData) -> Option<f32> {
-    let mut best: Option<f32> = None;
-    for tri in &mesh.triangles {
-        let Some((a, b, c)) = triangle_points(mesh, *tri) else {
-            continue;
-        };
-        if let Some(t) = ray_triangle_t(origin, dir, a, b, c) {
-            best = Some(best.map_or(t, |old| old.min(t)));
-        }
-    }
-    best
-}
-
-fn ray_leaf_t(fig: &CadFigure, ray_origin: Vec3, ray_dir: Vec3) -> Option<f32> {
-    let local_origin = world_to_local(fig, ray_origin);
-    let local_dir = figure_quat(fig).conjugate() * ray_dir;
-    match fig.kind {
-        CadPrimitiveKind::Square => ray_box_t(local_origin, local_dir, fig.size * 0.5),
-        CadPrimitiveKind::Cylinder => ray_cylinder_t(local_origin, local_dir, fig.size),
-        CadPrimitiveKind::Mesh => fig
-            .mesh
-            .as_ref()
-            .and_then(|mesh| ray_mesh_t(local_origin, local_dir, mesh)),
-    }
-}
-
-fn ray_figure_t(fig: &CadFigure, ray_origin: Vec3, ray_dir: Vec3) -> Option<f32> {
-    if fig.parts.is_empty() {
-        return ray_leaf_t(fig, ray_origin, ray_dir);
-    }
-    figure_leaf_world_figures(fig)
-        .iter()
-        .filter_map(|leaf| ray_leaf_t(leaf, ray_origin, ray_dir))
-        .min_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+    (t_max >= 0.0).then_some(t_min.max(0.0))
 }
 
 fn pick_figure_by_body(camera: &Camera3D, mouse: Vec2, figures: &[CadFigure]) -> Option<usize> {
     let (origin, dir) = mouse_world_ray(camera, mouse);
-    figures
+    let mut best: Option<(f32, usize)> = None;
+    for (i, fig) in figures.iter().enumerate() {
+        let hit = ray_mesh_t(origin, dir, &fig.mesh)
+            .or_else(|| ray_aabb_t(origin, dir, fig.pos, fig.size));
+        if let Some(t) = hit {
+            if best.is_none_or(|(best_t, _)| t < best_t) {
+                best = Some((t, i));
+            }
+        }
+    }
+    best.map(|(_, i)| i)
+}
+
+fn same_vertex(a: Vec3, b: Vec3) -> bool {
+    a.distance_squared(b) <= 0.0001
+}
+
+fn unique_vertex_indices(mesh: &CadMeshData) -> Vec<usize> {
+    let mut out: Vec<usize> = Vec::new();
+    for (i, v) in mesh.vertices.iter().enumerate() {
+        if !out.iter().any(|idx| same_vertex(mesh.vertices[*idx], *v)) {
+            out.push(i);
+        }
+    }
+    out
+}
+
+fn pick_vertex(camera: &Camera3D, mouse: Vec2, fig: &CadFigure) -> Option<usize> {
+    let points: Vec<Vec3> = unique_vertex_indices(&fig.mesh)
+        .into_iter()
+        .filter_map(|idx| fig.mesh.vertices.get(idx).copied())
+        .collect();
+    pick_closest_index(camera, mouse, &points, 16.0).and_then(|hit| {
+        let point = points.get(hit)?;
+        fig.mesh
+            .vertices
+            .iter()
+            .position(|v| same_vertex(*v, *point))
+    })
+}
+
+fn add_vertex_selection(
+    state: &mut CadState,
+    figure_idx: usize,
+    vertex_idx: usize,
+    additive: bool,
+) {
+    if state.selected != Some(figure_idx) || !additive {
+        state.selected_vertices.clear();
+    }
+    state.selected = Some(figure_idx);
+    if !state.selected_vertices.contains(&vertex_idx) {
+        state.selected_vertices.push(vertex_idx);
+    }
+}
+
+fn apply_vertex_delta(fig: &mut CadFigure, selected_vertices: &[usize], delta: Vec3) {
+    if selected_vertices.is_empty() || delta.length_squared() == 0.0 {
+        return;
+    }
+    let anchors: Vec<Vec3> = selected_vertices
         .iter()
-        .enumerate()
-        .filter_map(|(i, fig)| ray_figure_t(fig, origin, dir).map(|t| (i, t)))
-        .min_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-        .map(|(i, _)| i)
+        .filter_map(|idx| fig.mesh.vertices.get(*idx).copied())
+        .collect();
+    for vertex in &mut fig.mesh.vertices {
+        if anchors.iter().any(|anchor| same_vertex(*vertex, *anchor)) {
+            *vertex += delta;
+        }
+    }
+    fig.kind = CadPrimitiveKind::Mesh;
+    fig.brep = None;
+    if let Some((pos, size)) = mesh_bounds(&fig.mesh) {
+        fig.pos = pos;
+        fig.size = size;
+    }
 }
 
 fn apply_move_tool(fig: &mut CadFigure, dt: f32) {
@@ -672,119 +688,12 @@ fn apply_move_tool(fig: &mut CadFigure, dt: f32) {
     if is_key_down(KeyCode::E) {
         fig.pos.y -= speed * dt;
     }
+    fig.rebuild();
 }
 
-fn apply_box_handle_local_delta(fig: &mut CadFigure, h: Vec3, local_delta: Vec3) {
-    let min_size = 8.0;
-    let old_size = fig.size;
-    let old_min = -old_size * 0.5;
-
-    let mut min_v = -fig.size * 0.5;
-    let mut max_v = fig.size * 0.5;
-
-    let apply_axis = |h_axis: f32, delta_axis: f32, min_axis: &mut f32, max_axis: &mut f32| {
-        if h_axis > 0.0 {
-            *max_axis += delta_axis;
-            if *max_axis - *min_axis < min_size {
-                *max_axis = *min_axis + min_size;
-            }
-        } else if h_axis < 0.0 {
-            *min_axis += delta_axis;
-            if *max_axis - *min_axis < min_size {
-                *min_axis = *max_axis - min_size;
-            }
-        }
-    };
-
-    apply_axis(h.x, local_delta.x, &mut min_v.x, &mut max_v.x);
-    apply_axis(h.y, local_delta.y, &mut min_v.y, &mut max_v.y);
-    apply_axis(h.z, local_delta.z, &mut min_v.z, &mut max_v.z);
-
-    let new_size = max_v - min_v;
-    let center_shift_local = (max_v + min_v) * 0.5;
-    if !fig.parts.is_empty() {
-        let sx = if old_size.x.abs() > 0.001 {
-            new_size.x / old_size.x
-        } else {
-            1.0
-        };
-        let sy = if old_size.y.abs() > 0.001 {
-            new_size.y / old_size.y
-        } else {
-            1.0
-        };
-        let sz = if old_size.z.abs() > 0.001 {
-            new_size.z / old_size.z
-        } else {
-            1.0
-        };
-        for part in &mut fig.parts {
-            part.pos = vec3(
-                (part.pos.x - old_min.x) * sx - new_size.x * 0.5,
-                (part.pos.y - old_min.y) * sy - new_size.y * 0.5,
-                (part.pos.z - old_min.z) * sz - new_size.z * 0.5,
-            );
-            part.size = vec3(
-                (part.size.x * sx.abs()).max(0.1),
-                (part.size.y * sy.abs()).max(0.1),
-                (part.size.z * sz.abs()).max(0.1),
-            );
-        }
-    }
-    let (x, y, z) = figure_basis(fig);
-    fig.pos += x * center_shift_local.x + y * center_shift_local.y + z * center_shift_local.z;
-    fig.size = new_size;
-}
-
-fn apply_cylinder_height(fig: &mut CadFigure, top: bool, local_delta: f32) {
-    let min_h = 8.0;
-    let mut min_y = -fig.size.y * 0.5;
-    let mut max_y = fig.size.y * 0.5;
-    if top {
-        max_y += local_delta;
-        if max_y - min_y < min_h {
-            max_y = min_y + min_h;
-        }
-    } else {
-        min_y += local_delta;
-        if max_y - min_y < min_h {
-            min_y = max_y - min_h;
-        }
-    }
-    let shift_local = (max_y + min_y) * 0.5;
-    let (_, y_axis, _) = figure_basis(fig);
-    fig.pos += y_axis * shift_local;
-    fig.size.y = max_y - min_y;
-}
-
-fn apply_cylinder_radial(fig: &mut CadFigure, dir_sign: Vec3Sign, local_delta: Vec3) {
-    let min_r = 4.0;
-    let dir = dir_sign.as_vec3().normalize_or_zero();
-    let mut radius = (fig.size.x + fig.size.z) * 0.25;
-    let delta = local_delta.dot(dir) * 0.5;
-    let new_radius = (radius + delta).max(min_r);
-    let center_shift_local = dir * (new_radius - radius);
-    let (x, y, z) = figure_basis(fig);
-    fig.pos += x * center_shift_local.x + y * center_shift_local.y + z * center_shift_local.z;
-    radius = new_radius;
-    fig.size.x = radius * 2.0;
-    fig.size.z = radius * 2.0;
-}
-
-fn apply_resize_with_handle(fig: &mut CadFigure, handle: ResizeHandleKind, local_delta: Vec3) {
-    match handle {
-        ResizeHandleKind::BoxDir(sign) => {
-            apply_box_handle_local_delta(fig, sign.as_vec3(), local_delta)
-        }
-        ResizeHandleKind::CylinderTop => apply_cylinder_height(fig, true, local_delta.y),
-        ResizeHandleKind::CylinderBottom => apply_cylinder_height(fig, false, local_delta.y),
-        ResizeHandleKind::CylinderRadial(sign) => apply_cylinder_radial(fig, sign, local_delta),
-    }
-}
-
-fn resize_keyboard_delta(dt: f32) -> Vec3 {
+fn nudge_delta(dt: f32) -> Vec3 {
     let speed = if is_key_down(KeyCode::LeftShift) || is_key_down(KeyCode::RightShift) {
-        24.0
+        28.0
     } else {
         14.0
     };
@@ -795,427 +704,104 @@ fn resize_keyboard_delta(dt: f32) -> Vec3 {
     if is_key_down(KeyCode::Right) {
         out.x += speed * dt;
     }
-    if is_key_down(KeyCode::Q) {
-        out.y += speed * dt;
-    }
-    if is_key_down(KeyCode::E) {
-        out.y -= speed * dt;
-    }
     if is_key_down(KeyCode::Up) {
         out.z -= speed * dt;
     }
     if is_key_down(KeyCode::Down) {
         out.z += speed * dt;
     }
+    if is_key_down(KeyCode::Q) {
+        out.y += speed * dt;
+    }
+    if is_key_down(KeyCode::E) {
+        out.y -= speed * dt;
+    }
     out
 }
 
-fn figure_extent_along_world_normal(fig: &CadFigure, normal: Vec3) -> f32 {
-    let (x, y, z) = figure_basis(fig);
-    0.5 * (fig.size.x * normal.dot(x).abs()
-        + fig.size.y * normal.dot(y).abs()
-        + fig.size.z * normal.dot(z).abs())
+fn apply_resize_with_handle(fig: &mut CadFigure, handle: ResizeHandleKind, local_delta: Vec3) {
+    let min_size = 8.0;
+    match handle {
+        ResizeHandleKind::BoxDir(sign) => {
+            let dir = sign.as_vec3();
+            let mut size = fig.size;
+            let delta = local_delta.dot(dir) * 0.5;
+            if dir.x != 0.0 {
+                size.x = (size.x + delta).max(min_size);
+            }
+            if dir.y != 0.0 {
+                size.y = (size.y + delta).max(min_size);
+            }
+            if dir.z != 0.0 {
+                size.z = (size.z + delta).max(min_size);
+            }
+            let shift = dir * ((size - fig.size) * 0.5);
+            let (x, y, z) = figure_basis(fig);
+            fig.pos += x * shift.x + y * shift.y + z * shift.z;
+            fig.size = size;
+        }
+        ResizeHandleKind::CylinderTop => {
+            let old = fig.size.y;
+            fig.size.y = (fig.size.y + local_delta.y).max(min_size);
+            fig.pos += figure_quat(fig) * Vec3::Y * ((fig.size.y - old) * 0.5);
+        }
+        ResizeHandleKind::CylinderBottom => {
+            let old = fig.size.y;
+            fig.size.y = (fig.size.y - local_delta.y).max(min_size);
+            fig.pos -= figure_quat(fig) * Vec3::Y * ((fig.size.y - old) * 0.5);
+        }
+        ResizeHandleKind::CylinderRadial(sign) => {
+            let dir = sign.as_vec3().normalize_or_zero();
+            let delta = local_delta.dot(dir) * 0.5;
+            let old_r = (fig.size.x + fig.size.z) * 0.25;
+            let new_r = (old_r + delta).max(4.0);
+            let shift = dir * (new_r - old_r);
+            let (x, y, z) = figure_basis(fig);
+            fig.pos += x * shift.x + y * shift.y + z * shift.z;
+            fig.size.x = new_r * 2.0;
+            fig.size.z = new_r * 2.0;
+        }
+    }
+    fig.rebuild();
 }
 
-fn align_face_normal(target: &CadFigure, face_idx: usize) -> Vec3 {
-    let (x, y, z) = figure_basis(target);
-    match face_idx % 6 {
-        0 => x,
-        1 => -x,
-        2 => y,
-        3 => -y,
-        4 => z,
-        _ => -z,
-    }
+fn rotate_selected(fig: &mut CadFigure, axis_i: usize, amount: f32) {
+    let q = figure_quat(fig);
+    let axis = match axis_i % 3 {
+        0 => Vec3::X,
+        1 => Vec3::Y,
+        _ => Vec3::Z,
+    };
+    let world_axis = (q * axis).normalize_or_zero();
+    let new_q = (Quat::from_axis_angle(world_axis, amount) * q).normalize();
+    let (rx, ry, rz) = new_q.to_euler(EulerRot::XYZ);
+    fig.rot = vec3(rx, ry, rz);
+    fig.rebuild();
 }
 
 fn apply_align(
     figures: &mut [CadFigure],
-    source_idx: usize,
-    target_idx: usize,
+    source: usize,
+    target: usize,
     mode: AlignMode,
-    face_idx: usize,
+    face: usize,
 ) {
-    if source_idx >= figures.len() || target_idx >= figures.len() || source_idx == target_idx {
+    if source >= figures.len() || target >= figures.len() || source == target {
         return;
     }
-    let target = figures[target_idx].clone();
-    let source = &mut figures[source_idx];
-    match mode {
-        AlignMode::Center => {
-            source.pos = target.pos;
-        }
-        AlignMode::Face => {
-            let normal = align_face_normal(&target, face_idx).normalize_or_zero();
-            let target_extent = figure_extent_along_world_normal(&target, normal);
-            let source_extent = figure_extent_along_world_normal(source, normal);
-            source.pos = target.pos + normal * (target_extent + source_extent);
-        }
-    }
-}
-
-fn world_to_local(fig: &CadFigure, world: Vec3) -> Vec3 {
-    let q = figure_quat(fig);
-    q.conjugate() * (world - fig.pos)
-}
-
-fn push_mesh_triangle(mesh: &mut CadMeshData, a: Vec3, b: Vec3, c: Vec3) {
-    let base = mesh.vertices.len();
-    mesh.vertices.extend_from_slice(&[a, b, c]);
-    mesh.triangles.push([base, base + 1, base + 2]);
-}
-
-fn push_mesh_quad(mesh: &mut CadMeshData, a: Vec3, b: Vec3, c: Vec3, d: Vec3) {
-    push_mesh_triangle(mesh, a, b, c);
-    push_mesh_triangle(mesh, a, c, d);
-}
-
-fn add_grid_face(mesh: &mut CadMeshData, corner: Vec3, u: Vec3, v: Vec3, steps: usize) {
-    let steps = steps.max(1);
-    for i in 0..steps {
-        for j in 0..steps {
-            let u0 = i as f32 / steps as f32;
-            let u1 = (i + 1) as f32 / steps as f32;
-            let v0 = j as f32 / steps as f32;
-            let v1 = (j + 1) as f32 / steps as f32;
-            let a = corner + u * u0 + v * v0;
-            let b = corner + u * u1 + v * v0;
-            let c = corner + u * u1 + v * v1;
-            let d = corner + u * u0 + v * v1;
-            push_mesh_quad(mesh, a, b, c, d);
-        }
-    }
-}
-
-fn box_mesh_local(size: Vec3, steps: usize) -> CadMeshData {
-    let mut mesh = CadMeshData::new();
-    let hx = size.x * 0.5;
-    let hy = size.y * 0.5;
-    let hz = size.z * 0.5;
-    add_grid_face(
-        &mut mesh,
-        vec3(hx, -hy, -hz),
-        vec3(0.0, 0.0, size.z),
-        vec3(0.0, size.y, 0.0),
-        steps,
-    );
-    add_grid_face(
-        &mut mesh,
-        vec3(-hx, -hy, hz),
-        vec3(0.0, 0.0, -size.z),
-        vec3(0.0, size.y, 0.0),
-        steps,
-    );
-    add_grid_face(
-        &mut mesh,
-        vec3(-hx, hy, -hz),
-        vec3(size.x, 0.0, 0.0),
-        vec3(0.0, 0.0, size.z),
-        steps,
-    );
-    add_grid_face(
-        &mut mesh,
-        vec3(-hx, -hy, hz),
-        vec3(size.x, 0.0, 0.0),
-        vec3(0.0, 0.0, -size.z),
-        steps,
-    );
-    add_grid_face(
-        &mut mesh,
-        vec3(-hx, -hy, hz),
-        vec3(size.x, 0.0, 0.0),
-        vec3(0.0, size.y, 0.0),
-        steps,
-    );
-    add_grid_face(
-        &mut mesh,
-        vec3(hx, -hy, -hz),
-        vec3(-size.x, 0.0, 0.0),
-        vec3(0.0, size.y, 0.0),
-        steps,
-    );
-    mesh
-}
-
-fn cylinder_mesh_local(size: Vec3, sides: usize, y_steps: usize) -> CadMeshData {
-    let mut mesh = CadMeshData::new();
-    let sides = sides.max(12);
-    let y_steps = y_steps.max(1);
-    let rx = size.x * 0.5;
-    let rz = size.z * 0.5;
-    let hy = size.y * 0.5;
-
-    for yi in 0..y_steps {
-        let y0 = -hy + size.y * yi as f32 / y_steps as f32;
-        let y1 = -hy + size.y * (yi + 1) as f32 / y_steps as f32;
-        for i in 0..sides {
-            let a0 = i as f32 / sides as f32 * std::f32::consts::TAU;
-            let a1 = (i + 1) as f32 / sides as f32 * std::f32::consts::TAU;
-            let p00 = vec3(a0.sin() * rx, y0, a0.cos() * rz);
-            let p10 = vec3(a1.sin() * rx, y0, a1.cos() * rz);
-            let p11 = vec3(a1.sin() * rx, y1, a1.cos() * rz);
-            let p01 = vec3(a0.sin() * rx, y1, a0.cos() * rz);
-            push_mesh_quad(&mut mesh, p00, p10, p11, p01);
-        }
-    }
-
-    let bottom = vec3(0.0, -hy, 0.0);
-    let top = vec3(0.0, hy, 0.0);
-    for i in 0..sides {
-        let a0 = i as f32 / sides as f32 * std::f32::consts::TAU;
-        let a1 = (i + 1) as f32 / sides as f32 * std::f32::consts::TAU;
-        let b0 = vec3(a0.sin() * rx, -hy, a0.cos() * rz);
-        let b1 = vec3(a1.sin() * rx, -hy, a1.cos() * rz);
-        let t0 = vec3(a0.sin() * rx, hy, a0.cos() * rz);
-        let t1 = vec3(a1.sin() * rx, hy, a1.cos() * rz);
-        push_mesh_triangle(&mut mesh, bottom, b1, b0);
-        push_mesh_triangle(&mut mesh, top, t0, t1);
-    }
-    mesh
-}
-
-fn local_mesh_for_figure(fig: &CadFigure, csg: bool) -> Option<CadMeshData> {
-    match fig.kind {
-        CadPrimitiveKind::Square => Some(box_mesh_local(fig.size, if csg { 24 } else { 1 })),
-        CadPrimitiveKind::Cylinder => Some(cylinder_mesh_local(
-            fig.size,
-            if csg { 48 } else { 32 },
-            if csg { 12 } else { 1 },
-        )),
-        CadPrimitiveKind::Mesh => fig.mesh.clone(),
-    }
-}
-
-fn world_mesh_for_leaf(fig: &CadFigure, csg: bool) -> Option<CadMeshData> {
-    let mut mesh = local_mesh_for_figure(fig, csg)?;
-    for v in &mut mesh.vertices {
-        *v = local_to_world(fig, *v);
-    }
-    Some(mesh)
-}
-
-fn figure_world_meshes(fig: &CadFigure, csg: bool) -> Vec<CadMeshData> {
-    figure_leaf_world_figures(fig)
-        .iter()
-        .filter_map(|leaf| world_mesh_for_leaf(leaf, csg))
-        .collect()
-}
-
-fn triangle_points(mesh: &CadMeshData, tri: [usize; 3]) -> Option<(Vec3, Vec3, Vec3)> {
-    Some((
-        *mesh.vertices.get(tri[0])?,
-        *mesh.vertices.get(tri[1])?,
-        *mesh.vertices.get(tri[2])?,
-    ))
-}
-
-fn triangle_centroid(a: Vec3, b: Vec3, c: Vec3) -> Vec3 {
-    (a + b + c) / 3.0
-}
-
-fn append_world_triangle(out: &mut CadMeshData, a: Vec3, b: Vec3, c: Vec3, flip: bool) {
-    if flip {
-        push_mesh_triangle(out, c, b, a);
-    } else {
-        push_mesh_triangle(out, a, b, c);
-    }
-}
-
-fn figure_from_world_mesh(world_mesh: CadMeshData) -> Option<CadFigure> {
-    if world_mesh.vertices.is_empty() || world_mesh.triangles.is_empty() {
-        return None;
-    }
-
-    let mut min_v = vec3(f32::INFINITY, f32::INFINITY, f32::INFINITY);
-    let mut max_v = vec3(f32::NEG_INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY);
-    for v in &world_mesh.vertices {
-        min_v = min_v.min(*v);
-        max_v = max_v.max(*v);
-    }
-
-    let center = (min_v + max_v) * 0.5;
-    let mut local_mesh = world_mesh;
-    for v in &mut local_mesh.vertices {
-        *v -= center;
-    }
-
-    let mut fig = CadFigure::new(
-        CadPrimitiveKind::Mesh,
-        center,
-        (max_v - min_v).max(vec3(0.1, 0.1, 0.1)),
-        Vec3::ZERO,
-    );
-    fig.mesh = Some(local_mesh);
-    Some(fig)
-}
-
-fn ray_triangle_t(origin: Vec3, dir: Vec3, a: Vec3, b: Vec3, c: Vec3) -> Option<f32> {
-    let edge1 = b - a;
-    let edge2 = c - a;
-    let h = dir.cross(edge2);
-    let det = edge1.dot(h);
-    if det.abs() < 0.00001 {
-        return None;
-    }
-    let inv_det = 1.0 / det;
-    let s = origin - a;
-    let u = inv_det * s.dot(h);
-    if !(0.0..=1.0).contains(&u) {
-        return None;
-    }
-    let q = s.cross(edge1);
-    let v = inv_det * dir.dot(q);
-    if v < 0.0 || u + v > 1.0 {
-        return None;
-    }
-    let t = inv_det * edge2.dot(q);
-    if t > 0.0001 {
-        Some(t)
-    } else {
-        None
-    }
-}
-
-fn point_inside_mesh(mesh: &CadMeshData, local_point: Vec3) -> bool {
-    let dir = vec3(1.0, 0.137, 0.061).normalize();
-    let mut hits = Vec::new();
-    for tri in &mesh.triangles {
-        let Some((a, b, c)) = triangle_points(mesh, *tri) else {
-            continue;
-        };
-        if let Some(t) = ray_triangle_t(local_point, dir, a, b, c) {
-            hits.push(t);
-        }
-    }
-    hits.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    hits.dedup_by(|a, b| (*a - *b).abs() < 0.001);
-    hits.len() % 2 == 1
-}
-
-fn point_inside_leaf(fig: &CadFigure, world_point: Vec3) -> bool {
-    let p = world_to_local(fig, world_point);
-    match fig.kind {
-        CadPrimitiveKind::Square => {
-            let h = fig.size * 0.5 + vec3(0.001, 0.001, 0.001);
-            p.x.abs() <= h.x && p.y.abs() <= h.y && p.z.abs() <= h.z
-        }
-        CadPrimitiveKind::Cylinder => {
-            let hy = fig.size.y * 0.5 + 0.001;
-            let rx = (fig.size.x * 0.5).max(0.001);
-            let rz = (fig.size.z * 0.5).max(0.001);
-            p.y.abs() <= hy && (p.x / rx).powi(2) + (p.z / rz).powi(2) <= 1.001
-        }
-        CadPrimitiveKind::Mesh => fig
-            .mesh
-            .as_ref()
-            .is_some_and(|mesh| point_inside_mesh(mesh, p)),
-    }
-}
-
-fn point_inside_figure(fig: &CadFigure, world_point: Vec3) -> bool {
-    if fig.parts.is_empty() {
-        return point_inside_leaf(fig, world_point);
-    }
-    figure_leaf_world_figures(fig)
-        .iter()
-        .any(|leaf| point_inside_leaf(leaf, world_point))
-}
-
-fn point_strict_inside_leaf(fig: &CadFigure, world_point: Vec3, margin: f32) -> bool {
-    let p = world_to_local(fig, world_point);
-    match fig.kind {
-        CadPrimitiveKind::Square => {
-            let h = fig.size * 0.5 - vec3(margin, margin, margin);
-            h.x > 0.0
-                && h.y > 0.0
-                && h.z > 0.0
-                && p.x.abs() < h.x
-                && p.y.abs() < h.y
-                && p.z.abs() < h.z
-        }
-        CadPrimitiveKind::Cylinder => {
-            let hy = fig.size.y * 0.5 - margin;
-            let rx = (fig.size.x * 0.5 - margin).max(0.001);
-            let rz = (fig.size.z * 0.5 - margin).max(0.001);
-            hy > 0.0 && p.y.abs() < hy && (p.x / rx).powi(2) + (p.z / rz).powi(2) < 1.0
-        }
-        CadPrimitiveKind::Mesh => point_inside_leaf(fig, world_point),
-    }
-}
-
-fn point_strict_inside_figure(fig: &CadFigure, world_point: Vec3, margin: f32) -> bool {
-    if fig.parts.is_empty() {
-        return point_strict_inside_leaf(fig, world_point, margin);
-    }
-    figure_leaf_world_figures(fig)
-        .iter()
-        .any(|leaf| point_strict_inside_leaf(leaf, world_point, margin))
-}
-
-fn csg_join_mesh(base: &CadFigure, tool: &CadFigure) -> Option<CadMeshData> {
-    let mut out = CadMeshData::new();
-    for mesh in figure_world_meshes(base, true) {
-        for tri in &mesh.triangles {
-            let Some((a, b, c)) = triangle_points(&mesh, *tri) else {
-                continue;
-            };
-            if !point_inside_figure(tool, triangle_centroid(a, b, c)) {
-                append_world_triangle(&mut out, a, b, c, false);
+    let target_fig = figures[target].clone();
+    if let Some(source_fig) = figures.get_mut(source) {
+        match mode {
+            AlignMode::Center => source_fig.pos = target_fig.pos,
+            AlignMode::Face => {
+                let normals = [Vec3::X, -Vec3::X, Vec3::Y, -Vec3::Y, Vec3::Z, -Vec3::Z];
+                let n = figure_quat(&target_fig) * normals[face % normals.len()];
+                source_fig.pos = target_fig.pos
+                    + n * ((target_fig.size.dot(n.abs()) + source_fig.size.dot(n.abs())) * 0.5);
             }
         }
+        source_fig.rebuild();
     }
-    for mesh in figure_world_meshes(tool, true) {
-        for tri in &mesh.triangles {
-            let Some((a, b, c)) = triangle_points(&mesh, *tri) else {
-                continue;
-            };
-            if !point_inside_figure(base, triangle_centroid(a, b, c)) {
-                append_world_triangle(&mut out, a, b, c, false);
-            }
-        }
-    }
-    if out.triangles.is_empty() {
-        None
-    } else {
-        Some(out)
-    }
-}
-
-fn csg_subtract_mesh(base: &CadFigure, tool: &CadFigure) -> Option<CadMeshData> {
-    let mut out = CadMeshData::new();
-    for mesh in figure_world_meshes(base, true) {
-        for tri in &mesh.triangles {
-            let Some((a, b, c)) = triangle_points(&mesh, *tri) else {
-                continue;
-            };
-            if !point_inside_figure(tool, triangle_centroid(a, b, c)) {
-                append_world_triangle(&mut out, a, b, c, false);
-            }
-        }
-    }
-    for mesh in figure_world_meshes(tool, true) {
-        for tri in &mesh.triangles {
-            let Some((a, b, c)) = triangle_points(&mesh, *tri) else {
-                continue;
-            };
-            if point_strict_inside_figure(base, triangle_centroid(a, b, c), 0.05) {
-                append_world_triangle(&mut out, a, b, c, true);
-            }
-        }
-    }
-    if out.triangles.is_empty() {
-        None
-    } else {
-        Some(out)
-    }
-}
-
-fn apply_join(base: CadFigure, tool: CadFigure) -> Option<CadFigure> {
-    csg_join_mesh(&base, &tool).and_then(figure_from_world_mesh)
-}
-
-fn apply_subtract(base: CadFigure, tool: CadFigure) -> Option<CadFigure> {
-    csg_subtract_mesh(&base, &tool).and_then(figure_from_world_mesh)
 }
 
 fn replace_pair_with_result(
@@ -1239,52 +825,38 @@ fn replace_pair_with_result(
     }
 }
 
+fn apply_boolean(
+    base: &CadFigure,
+    tool: &CadFigure,
+    op: OGBooleanOperation,
+) -> Result<CadFigure, String> {
+    let lhs = base
+        .brep
+        .as_ref()
+        .ok_or_else(|| "Source has no OpenGeometry BRep".to_string())?;
+    let rhs = tool
+        .brep
+        .as_ref()
+        .ok_or_else(|| "Target has no OpenGeometry BRep".to_string())?;
+    let out = match op {
+        OGBooleanOperation::Union => boolean_union(lhs, rhs, OGBooleanOptions::default()),
+        OGBooleanOperation::Subtraction => {
+            boolean_subtraction(lhs, rhs, OGBooleanOptions::default())
+        }
+        OGBooleanOperation::Intersection => unreachable!(),
+    }
+    .map_err(|err| format!("OpenGeometry boolean failed: {}", err))?;
+    Ok(CadFigure::from_brep(CadPrimitiveKind::Mesh, out.brep))
+}
+
 fn switch_tool(state: &mut CadState, tool: CadTool) {
     state.tool = tool;
-    state.dragging_axis = false;
-    state.dragging_handle = false;
     state.pending_source = None;
     state.pair_phase = PairPhase::PickSource;
 }
 
 fn is_pair_tool(tool: CadTool) -> bool {
     matches!(tool, CadTool::Align | CadTool::Join | CadTool::Subtract)
-}
-
-fn rotation_drag_amount(
-    camera: &Camera3D,
-    fig: &CadFigure,
-    axis_i: usize,
-    mouse_delta: Vec2,
-) -> f32 {
-    let axes = axis_world_positions(fig);
-    let Some(center_s) = project_world_to_screen(camera, fig.pos) else {
-        return (mouse_delta.x - mouse_delta.y) * 0.0085;
-    };
-    let Some(tip_s) = project_world_to_screen(camera, axes[axis_i % 3]) else {
-        return (mouse_delta.x - mouse_delta.y) * 0.0085;
-    };
-    let arm = tip_s - center_s;
-    if arm.length_squared() < 1.0 {
-        return (mouse_delta.x - mouse_delta.y) * 0.0085;
-    }
-    let radial = arm.normalize();
-    let tangent = vec2(-radial.y, radial.x);
-    mouse_delta.dot(tangent) * 0.012
-}
-
-fn apply_local_axis_rotation(fig: &mut CadFigure, axis_i: usize, angle: f32) {
-    let q = figure_quat(fig);
-    let local_axis = match axis_i % 3 {
-        0 => Vec3::X,
-        1 => Vec3::Y,
-        _ => Vec3::Z,
-    };
-    let world_axis = (q * local_axis).normalize_or_zero();
-    let dq = Quat::from_axis_angle(world_axis, angle);
-    let new_q = (dq * q).normalize();
-    let (rx, ry, rz) = new_q.to_euler(EulerRot::XYZ);
-    fig.rot = vec3(rx, ry, rz);
 }
 
 fn pair_selection_click(state: &mut CadState, picked_figure: usize) {
@@ -1313,28 +885,36 @@ fn pair_selection_click(state: &mut CadState, picked_figure: usize) {
                         state.align_face,
                     );
                     state.selected = Some(source_idx);
+                    state.status = "Aligned".to_string();
                 }
-                CadTool::Join => {
-                    let a = state.figures[source_idx].clone();
-                    let b = state.figures[picked_figure].clone();
-                    let result = apply_join(a, b);
-                    state.selected = replace_pair_with_result(
-                        &mut state.figures,
-                        source_idx,
-                        picked_figure,
-                        result,
+                CadTool::Join | CadTool::Subtract => {
+                    let op = if state.tool == CadTool::Join {
+                        OGBooleanOperation::Union
+                    } else {
+                        OGBooleanOperation::Subtraction
+                    };
+                    let result = apply_boolean(
+                        &state.figures[source_idx],
+                        &state.figures[picked_figure],
+                        op,
                     );
-                }
-                CadTool::Subtract => {
-                    let a = state.figures[source_idx].clone();
-                    let b = state.figures[picked_figure].clone();
-                    let result = apply_subtract(a, b);
-                    state.selected = replace_pair_with_result(
-                        &mut state.figures,
-                        source_idx,
-                        picked_figure,
-                        result,
-                    );
+                    match result {
+                        Ok(fig) => {
+                            state.selected = replace_pair_with_result(
+                                &mut state.figures,
+                                source_idx,
+                                picked_figure,
+                                Some(fig),
+                            );
+                            state.status = if state.tool == CadTool::Join {
+                                "Joined with OpenGeometry"
+                            } else {
+                                "Subtracted with OpenGeometry"
+                            }
+                            .to_string();
+                        }
+                        Err(err) => state.status = err,
+                    }
                 }
                 _ => {}
             }
@@ -1344,85 +924,43 @@ fn pair_selection_click(state: &mut CadState, picked_figure: usize) {
     }
 }
 
-fn align_face_label(i: usize) -> &'static str {
-    match i % 6 {
-        0 => "+X",
-        1 => "-X",
-        2 => "+Y",
-        3 => "-Y",
-        4 => "+Z",
-        _ => "-Z",
-    }
-}
-
-fn export_obj(figures: &[CadFigure], path: &str) -> Result<(), String> {
-    let mut out = String::from("# GridGame CAD OBJ\n");
-    let mut vertex_offset = 1usize;
-
-    for (fig_i, fig) in figures.iter().enumerate() {
-        out.push_str(&format!("o figure_{}\n", fig_i + 1));
-        for mesh in figure_world_meshes(fig, false) {
-            for v in &mesh.vertices {
-                out.push_str(&format!("v {:.6} {:.6} {:.6}\n", v.x, v.y, v.z));
-            }
-            for tri in &mesh.triangles {
-                out.push_str(&format!(
-                    "f {} {} {}\n",
-                    tri[0] + vertex_offset,
-                    tri[1] + vertex_offset,
-                    tri[2] + vertex_offset
-                ));
-            }
-            vertex_offset += mesh.vertices.len();
+fn export_obj(figures: &[CadFigure], path: &Path) -> Result<(), String> {
+    let mut out = String::from("# GridGame OpenGeometry CAD OBJ\n");
+    let mut offset = 1usize;
+    for fig in figures {
+        for v in &fig.mesh.vertices {
+            out.push_str(&format!("v {} {} {}\n", v.x, v.y, v.z));
         }
+        for tri in &fig.mesh.triangles {
+            out.push_str(&format!(
+                "f {} {} {}\n",
+                tri[0] + offset,
+                tri[1] + offset,
+                tri[2] + offset
+            ));
+        }
+        offset += fig.mesh.vertices.len();
     }
-
-    fs::write(path, out).map_err(|err| format!("Export failed: {}", err))
+    fs::write(path, out).map_err(|err| format!("OBJ export failed: {}", err))
 }
 
-fn parse_obj_index(raw: &str, vertex_count: usize) -> Option<usize> {
-    let first = raw.split('/').next()?;
-    let idx = first.parse::<isize>().ok()?;
-    if idx > 0 {
-        Some((idx as usize).saturating_sub(1))
-    } else if idx < 0 {
-        Some((vertex_count as isize + idx) as usize)
-    } else {
-        None
-    }
-}
-
-fn import_obj(path: &str) -> Result<CadFigure, String> {
-    let text = fs::read_to_string(path).map_err(|err| format!("Import failed: {}", err))?;
+fn import_obj(path: &Path) -> Result<CadFigure, String> {
+    let text = fs::read_to_string(path).map_err(|err| format!("OBJ import failed: {}", err))?;
     let mut vertices = Vec::new();
     let mut triangles = Vec::new();
-
     for line in text.lines() {
-        let clean = line.trim();
-        if clean.is_empty() || clean.starts_with('#') {
-            continue;
-        }
-        let mut parts = clean.split_whitespace();
+        let mut parts = line.split_whitespace();
         match parts.next() {
             Some("v") => {
-                let x = parts
-                    .next()
-                    .and_then(|v| v.parse::<f32>().ok())
-                    .unwrap_or(0.0);
-                let y = parts
-                    .next()
-                    .and_then(|v| v.parse::<f32>().ok())
-                    .unwrap_or(0.0);
-                let z = parts
-                    .next()
-                    .and_then(|v| v.parse::<f32>().ok())
-                    .unwrap_or(0.0);
+                let x: f32 = parts.next().unwrap_or("0").parse().unwrap_or(0.0);
+                let y: f32 = parts.next().unwrap_or("0").parse().unwrap_or(0.0);
+                let z: f32 = parts.next().unwrap_or("0").parse().unwrap_or(0.0);
                 vertices.push(vec3(x, y, z));
             }
             Some("f") => {
                 let face: Vec<usize> = parts
-                    .filter_map(|p| parse_obj_index(p, vertices.len()))
-                    .filter(|idx| *idx < vertices.len())
+                    .filter_map(|p| p.split('/').next()?.parse::<usize>().ok())
+                    .filter_map(|i| i.checked_sub(1))
                     .collect();
                 if face.len() >= 3 {
                     for i in 1..face.len() - 1 {
@@ -1433,12 +971,283 @@ fn import_obj(path: &str) -> Result<CadFigure, String> {
             _ => {}
         }
     }
+    if vertices.is_empty() || triangles.is_empty() {
+        Err("OBJ import failed: no mesh data".to_string())
+    } else {
+        Ok(CadFigure::from_mesh(CadMeshData {
+            vertices,
+            triangles,
+        }))
+    }
+}
 
-    figure_from_world_mesh(CadMeshData {
+fn import_stl(path: &Path) -> Result<CadFigure, String> {
+    let file = File::open(path).map_err(|err| format!("STL import failed: {}", err))?;
+    let mut reader = BufReader::new(file);
+    let stl = stl_io::read_stl(&mut reader).map_err(|err| format!("STL import failed: {}", err))?;
+    let vertices = stl
+        .vertices
+        .iter()
+        .map(|v| vec3(v[0], v[1], v[2]))
+        .collect();
+    let triangles = stl
+        .faces
+        .iter()
+        .map(|tri| [tri.vertices[0], tri.vertices[1], tri.vertices[2]])
+        .collect();
+    Ok(CadFigure::from_mesh(CadMeshData {
         vertices,
         triangles,
-    })
-    .ok_or_else(|| "Import failed: OBJ has no mesh faces".to_string())
+    }))
+}
+
+fn export_mesh_stl(figures: &[CadFigure], path: &Path) -> Result<(), String> {
+    let mut triangles = Vec::new();
+    for fig in figures {
+        for tri in &fig.mesh.triangles {
+            let Some(a) = fig.mesh.vertices.get(tri[0]) else {
+                continue;
+            };
+            let Some(b) = fig.mesh.vertices.get(tri[1]) else {
+                continue;
+            };
+            let Some(c) = fig.mesh.vertices.get(tri[2]) else {
+                continue;
+            };
+            triangles.push(stl_io::Triangle {
+                normal: stl_io::Normal::new([0.0, 0.0, 0.0]),
+                vertices: [
+                    stl_io::Vertex::new([a.x, a.y, a.z]),
+                    stl_io::Vertex::new([b.x, b.y, b.z]),
+                    stl_io::Vertex::new([c.x, c.y, c.z]),
+                ],
+            });
+        }
+    }
+    let mut file = File::create(path).map_err(|err| format!("STL export failed: {}", err))?;
+    stl_io::write_stl(&mut file, triangles.iter())
+        .map_err(|err| format!("STL export failed: {}", err))
+}
+
+fn export_stl(figures: &[CadFigure], path: &Path) -> Result<(), String> {
+    let breps: Vec<&Brep> = figures.iter().filter_map(|fig| fig.brep.as_ref()).collect();
+    if breps.len() == figures.len() {
+        return export_breps_to_stl_file(
+            breps,
+            path.to_string_lossy().as_ref(),
+            &StlExportConfig::default(),
+        )
+        .map(|_| ())
+        .map_err(|err| format!("STL export failed: {}", err));
+    }
+    export_mesh_stl(figures, path)
+}
+
+fn export_with_dialog(figures: &[CadFigure]) -> Result<String, String> {
+    let Some(path) = FileDialog::new()
+        .add_filter("OBJ", &["obj"])
+        .add_filter("STL", &["stl"])
+        .set_file_name("cad_scene.obj")
+        .save_file()
+    else {
+        return Ok("Export canceled".to_string());
+    };
+    match path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| ext.to_ascii_lowercase())
+    {
+        Some(ext) if ext == "obj" => {
+            export_obj(figures, &path).map(|_| format!("Exported {}", path.display()))
+        }
+        Some(ext) if ext == "stl" => {
+            export_stl(figures, &path).map(|_| format!("Exported {}", path.display()))
+        }
+        _ => Err("Export failed: choose .obj or .stl".to_string()),
+    }
+}
+
+fn import_with_dialog() -> Result<(CadFigure, String), String> {
+    let Some(path) = FileDialog::new()
+        .add_filter("CAD mesh", &["obj", "stl"])
+        .pick_file()
+    else {
+        return Err("Import canceled".to_string());
+    };
+    let fig = match path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| ext.to_ascii_lowercase())
+    {
+        Some(ext) if ext == "obj" => import_obj(&path)?,
+        Some(ext) if ext == "stl" => import_stl(&path)?,
+        _ => return Err("Import failed: choose .obj or .stl".to_string()),
+    };
+    Ok((fig, format!("Imported {}", path.display())))
+}
+
+fn add_shape(state: &mut CadState, shape: AddShapeKind) {
+    let idx = state.figures.len() as f32;
+    let pos = vec3(
+        (idx % 4.0) * 24.0 - 36.0,
+        20.0,
+        (idx / 4.0).floor() * 24.0 - 24.0,
+    );
+    let (kind, size) = match shape {
+        AddShapeKind::Square => (CadPrimitiveKind::Square, vec3(36.0, 36.0, 36.0)),
+        AddShapeKind::Cylinder => (CadPrimitiveKind::Cylinder, vec3(30.0, 36.0, 30.0)),
+        AddShapeKind::Sphere => (CadPrimitiveKind::Sphere, vec3(34.0, 34.0, 34.0)),
+        AddShapeKind::Wedge => (CadPrimitiveKind::Wedge, vec3(38.0, 34.0, 34.0)),
+    };
+    state.figures.push(CadFigure::new(kind, pos, size));
+    state.selected = Some(state.figures.len().saturating_sub(1));
+    state.selected_vertices.clear();
+}
+
+fn draw_tools_panel(ctx: &FrameContext, state: &mut CadState, colors: &RuntimeColors) {
+    let panel = Rect::new(18.0, 54.0, 190.0, 430.0);
+    draw_rectangle(panel.x, panel.y, panel.w, panel.h, colors.tooltip_bg);
+    draw_rectangle_lines(
+        panel.x,
+        panel.y,
+        panel.w,
+        panel.h,
+        1.0,
+        colors.tooltip_border,
+    );
+    draw_text(
+        "CAD Tools",
+        panel.x + 10.0,
+        panel.y + 24.0,
+        ctx.font_sm,
+        colors.text_primary,
+    );
+    let mut y = panel.y + 36.0;
+    let bw = panel.w - 20.0;
+    let bh = 26.0;
+    let (add_clicked, _) = ui_button(
+        Rect::new(panel.x + 10.0, y, bw, bh),
+        "Add",
+        ctx.mouse,
+        ctx.font_sm,
+        ctx.button_colors,
+    );
+    if add_clicked {
+        state.add_menu_open = !state.add_menu_open;
+    }
+    y += 30.0;
+    if state.add_menu_open {
+        for (label, shape) in [
+            ("Square", AddShapeKind::Square),
+            ("Cylinder", AddShapeKind::Cylinder),
+            ("Sphere", AddShapeKind::Sphere),
+            ("Wedge", AddShapeKind::Wedge),
+        ] {
+            let (clicked, _) = ui_button(
+                Rect::new(panel.x + 24.0, y, bw - 14.0, bh),
+                label,
+                ctx.mouse,
+                ctx.font_sm,
+                ctx.button_colors,
+            );
+            if clicked {
+                add_shape(state, shape);
+                state.add_menu_open = false;
+            }
+            y += 30.0;
+        }
+        y += 4.0;
+    }
+
+    for (label, tool) in [
+        ("Move Figure", CadTool::Move),
+        ("Resize Vertices", CadTool::Resize),
+        ("Rotate Figure", CadTool::Rotate),
+        ("Align", CadTool::Align),
+        ("Join", CadTool::Join),
+        ("Subtract", CadTool::Subtract),
+    ] {
+        let (clicked, _) = ui_button(
+            Rect::new(panel.x + 10.0, y, bw, bh),
+            label,
+            ctx.mouse,
+            ctx.font_sm,
+            ctx.button_colors,
+        );
+        if clicked {
+            switch_tool(state, tool);
+        }
+        y += if matches!(tool, CadTool::Subtract) {
+            34.0
+        } else {
+            30.0
+        };
+    }
+
+    let (export_clicked, _) = ui_button(
+        Rect::new(panel.x + 10.0, y, bw, bh),
+        "Export",
+        ctx.mouse,
+        ctx.font_sm,
+        ctx.button_colors,
+    );
+    if export_clicked {
+        state.status = match export_with_dialog(&state.figures) {
+            Ok(message) => message,
+            Err(err) => err,
+        };
+    }
+    y += 30.0;
+    let (import_clicked, _) = ui_button(
+        Rect::new(panel.x + 10.0, y, bw, bh),
+        "Import",
+        ctx.mouse,
+        ctx.font_sm,
+        ctx.button_colors,
+    );
+    if import_clicked {
+        state.status = match import_with_dialog() {
+            Ok((fig, message)) => {
+                state.figures.push(fig);
+                state.selected = Some(state.figures.len().saturating_sub(1));
+                state.selected_vertices.clear();
+                message
+            }
+            Err(err) => err,
+        };
+    }
+    y += 34.0;
+
+    if state.tool == CadTool::Align {
+        let label = match state.align_mode {
+            AlignMode::Center => "Align Mode: Center",
+            AlignMode::Face => "Align Mode: Face",
+        };
+        let (toggle, _) = ui_button(
+            Rect::new(panel.x + 10.0, y, bw, bh),
+            label,
+            ctx.mouse,
+            ctx.font_sm,
+            ctx.button_colors,
+        );
+        if toggle {
+            state.align_mode = match state.align_mode {
+                AlignMode::Center => AlignMode::Face,
+                AlignMode::Face => AlignMode::Center,
+            };
+        }
+        y += 30.0;
+        let (face, _) = ui_button(
+            Rect::new(panel.x + 10.0, y, bw, bh),
+            &format!("Face {}", state.align_face + 1),
+            ctx.mouse,
+            ctx.font_sm,
+            ctx.button_colors,
+        );
+        if face {
+            state.align_face = (state.align_face + 1) % 6;
+        }
+    }
 }
 
 pub fn run(
@@ -1448,326 +1257,107 @@ pub fn run(
     last_mouse: &mut Vec2,
     colors: &RuntimeColors,
 ) {
+    let dt = get_frame_time();
+    let camera = cad_camera(state);
+
     if is_key_pressed(KeyCode::Escape) {
         *scene = Scene::MainMenu;
         return;
     }
 
-    let camera = cad_camera(state);
-    let panel = Rect::new(screen_width() - 290.0, 24.0, 266.0, 640.0);
-    let ui_capturing = panel.contains(ctx.mouse);
-
     if is_mouse_button_down(MouseButton::Right) {
         let delta = ctx.mouse - *last_mouse;
-        state.yaw -= delta.x * 0.006;
-        state.pitch = (state.pitch - delta.y * 0.0045).clamp(-1.2, 1.2);
+        state.yaw -= delta.x * 0.008;
+        state.pitch = (state.pitch + delta.y * 0.006).clamp(-1.2, 1.2);
     }
-    state.distance = (state.distance - mouse_wheel().1 * 8.0).clamp(60.0, 420.0);
-    *last_mouse = ctx.mouse;
-
-    if is_mouse_button_pressed(MouseButton::Left) && !ui_capturing {
-        state.dragging_handle = false;
-        state.dragging_axis = false;
-
-        if let Some(sel) = state.selected {
-            if let Some(fig) = state.figures.get(sel) {
-                match state.tool {
-                    CadTool::Resize => {
-                        let handles = handle_world_positions(fig);
-                        if let Some(handle_i) =
-                            pick_closest_index(&camera, ctx.mouse, &handles, 14.0)
-                        {
-                            state.selected_resize_handle = handle_i;
-                            state.dragging_handle = true;
-                            state.drag_last_mouse = ctx.mouse;
-                        }
-                    }
-                    CadTool::Rotate => {
-                        let axes = axis_world_positions(fig);
-                        if let Some(axis_i) = pick_closest_index(&camera, ctx.mouse, &axes, 18.0) {
-                            state.selected_rotate_axis = axis_i;
-                            state.dragging_axis = true;
-                            state.drag_last_mouse = ctx.mouse;
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        }
-
-        if !state.dragging_handle && !state.dragging_axis {
-            if let Some(picked) = pick_figure_by_body(&camera, ctx.mouse, &state.figures) {
-                if is_pair_tool(state.tool) {
-                    pair_selection_click(state, picked);
-                } else {
-                    state.selected = Some(picked);
-                }
-            } else {
-                let centers: Vec<Vec3> = state.figures.iter().map(|f| f.pos).collect();
-                if let Some(picked) = pick_closest_index(&camera, ctx.mouse, &centers, 28.0) {
-                    if is_pair_tool(state.tool) {
-                        pair_selection_click(state, picked);
-                    } else {
-                        state.selected = Some(picked);
-                    }
-                }
-            }
-        }
-    }
-    if is_mouse_button_released(MouseButton::Left) {
-        state.dragging_handle = false;
-        state.dragging_axis = false;
-    }
-
-    draw_rectangle(
-        panel.x,
-        panel.y,
-        panel.w,
-        panel.h,
-        Color::from_rgba(21, 28, 36, 220),
-    );
-    draw_rectangle_lines(panel.x, panel.y, panel.w, panel.h, 1.5, colors.panel_border);
-    draw_text(
-        "CAD Tools",
-        panel.x + 10.0,
-        panel.y + 24.0,
-        ctx.font_sm,
-        colors.text_primary,
-    );
-
-    let mut y = panel.y + 36.0;
-    let bw = panel.w - 20.0;
-    let bh = 26.0;
-    let (add_square, _) = ui_button(
-        Rect::new(panel.x + 10.0, y, bw, bh),
-        "Add Square",
-        ctx.mouse,
-        ctx.font_sm,
-        ctx.button_colors,
-    );
-    y += 30.0;
-    let (add_cylinder, _) = ui_button(
-        Rect::new(panel.x + 10.0, y, bw, bh),
-        "Add Cylinder",
-        ctx.mouse,
-        ctx.font_sm,
-        ctx.button_colors,
-    );
-    y += 34.0;
-    let (tool_move, _) = ui_button(
-        Rect::new(panel.x + 10.0, y, bw, bh),
-        "Move Figure",
-        ctx.mouse,
-        ctx.font_sm,
-        ctx.button_colors,
-    );
-    y += 30.0;
-    let (tool_resize, _) = ui_button(
-        Rect::new(panel.x + 10.0, y, bw, bh),
-        "Resize Figure",
-        ctx.mouse,
-        ctx.font_sm,
-        ctx.button_colors,
-    );
-    y += 30.0;
-    let (tool_rotate, _) = ui_button(
-        Rect::new(panel.x + 10.0, y, bw, bh),
-        "Rotate Figure",
-        ctx.mouse,
-        ctx.font_sm,
-        ctx.button_colors,
-    );
-    y += 30.0;
-    let (tool_align, _) = ui_button(
-        Rect::new(panel.x + 10.0, y, bw, bh),
-        "Align",
-        ctx.mouse,
-        ctx.font_sm,
-        ctx.button_colors,
-    );
-    y += 30.0;
-    let (tool_join, _) = ui_button(
-        Rect::new(panel.x + 10.0, y, bw, bh),
-        "Join",
-        ctx.mouse,
-        ctx.font_sm,
-        ctx.button_colors,
-    );
-    y += 30.0;
-    let (tool_subtract, _) = ui_button(
-        Rect::new(panel.x + 10.0, y, bw, bh),
-        "Subtract",
-        ctx.mouse,
-        ctx.font_sm,
-        ctx.button_colors,
-    );
-    y += 34.0;
-    let (export_obj_clicked, _) = ui_button(
-        Rect::new(panel.x + 10.0, y, bw, bh),
-        "Export OBJ",
-        ctx.mouse,
-        ctx.font_sm,
-        ctx.button_colors,
-    );
-    y += 30.0;
-    let (import_obj_clicked, _) = ui_button(
-        Rect::new(panel.x + 10.0, y, bw, bh),
-        "Import OBJ",
-        ctx.mouse,
-        ctx.font_sm,
-        ctx.button_colors,
-    );
-    y += 34.0;
-
-    if state.tool == CadTool::Align {
-        let align_mode_label = match state.align_mode {
-            AlignMode::Center => "Align Mode: Center",
-            AlignMode::Face => "Align Mode: Face",
-        };
-        let (toggle_mode, _) = ui_button(
-            Rect::new(panel.x + 10.0, y, bw, bh),
-            align_mode_label,
-            ctx.mouse,
-            ctx.font_sm,
-            ctx.button_colors,
-        );
-        y += 30.0;
-        if toggle_mode {
-            state.align_mode = match state.align_mode {
-                AlignMode::Center => AlignMode::Face,
-                AlignMode::Face => AlignMode::Center,
-            };
-        }
-        if state.align_mode == AlignMode::Face {
-            let face_label = format!("Target Face: {}", align_face_label(state.align_face));
-            let (next_face, _) = ui_button(
-                Rect::new(panel.x + 10.0, y, bw, bh),
-                &face_label,
-                ctx.mouse,
-                ctx.font_sm,
-                ctx.button_colors,
-            );
-            if next_face {
-                state.align_face = (state.align_face + 1) % 6;
-            }
-        }
-    }
-
-    if add_square {
-        let idx = state.figures.len() as f32;
-        state.figures.push(CadFigure::new(
-            CadPrimitiveKind::Square,
-            vec3(
-                (idx % 4.0) * 22.0 - 33.0,
-                20.0,
-                (idx / 4.0).floor() * 22.0 - 22.0,
-            ),
-            vec3(36.0, 36.0, 36.0),
-            vec3(0.0, 0.0, 0.0),
-        ));
-        state.selected = Some(state.figures.len().saturating_sub(1));
-    }
-    if add_cylinder {
-        let idx = state.figures.len() as f32;
-        state.figures.push(CadFigure::new(
-            CadPrimitiveKind::Cylinder,
-            vec3(
-                (idx % 4.0) * 22.0 - 33.0,
-                20.0,
-                (idx / 4.0).floor() * 22.0 - 22.0,
-            ),
-            vec3(30.0, 36.0, 30.0),
-            vec3(0.0, 0.0, 0.0),
-        ));
-        state.selected = Some(state.figures.len().saturating_sub(1));
-    }
-
-    if state.figures.is_empty() {
-        state.selected = None;
-        state.pending_source = None;
-        state.pair_phase = PairPhase::PickSource;
-    } else if state.selected.is_none() {
-        state.selected = Some(0);
-    }
-
-    if tool_move {
-        switch_tool(state, CadTool::Move);
-    }
-    if tool_resize {
-        switch_tool(state, CadTool::Resize);
-    }
-    if tool_rotate {
-        switch_tool(state, CadTool::Rotate);
-    }
-    if tool_align {
-        switch_tool(state, CadTool::Align);
-    }
-    if tool_join {
-        switch_tool(state, CadTool::Join);
-    }
-    if tool_subtract {
-        switch_tool(state, CadTool::Subtract);
-    }
-    if export_obj_clicked {
-        state.obj_status = match export_obj(&state.figures, CAD_OBJ_PATH) {
-            Ok(()) => format!("Exported {}", CAD_OBJ_PATH),
-            Err(err) => err,
-        };
-    }
-    if import_obj_clicked {
-        match import_obj(CAD_OBJ_PATH) {
-            Ok(fig) => {
-                state.figures.push(fig);
-                state.selected = Some(state.figures.len().saturating_sub(1));
-                state.obj_status = format!("Imported {}", CAD_OBJ_PATH);
-            }
-            Err(err) => state.obj_status = err,
-        }
+    let wheel = mouse_wheel().1;
+    if wheel.abs() > 0.0 {
+        state.distance = (state.distance - wheel * 8.0).clamp(40.0, 460.0);
     }
 
     if let Some(i) = state.selected {
         if let Some(fig) = state.figures.get_mut(i) {
-            let dt = get_frame_time();
             match state.tool {
                 CadTool::Move => apply_move_tool(fig, dt),
                 CadTool::Resize => {
-                    let handles = resize_handles(fig);
-                    if !handles.is_empty() {
-                        let sel = state.selected_resize_handle % handles.len();
-                        state.selected_resize_handle = sel;
-                        if state.dragging_handle && is_mouse_button_down(MouseButton::Left) {
-                            let mouse_delta = ctx.mouse - state.drag_last_mouse;
-                            state.drag_last_mouse = ctx.mouse;
-                            let cam_fwd = (camera.target - camera.position).normalize_or_zero();
-                            let cam_right = cam_fwd.cross(camera.up).normalize_or_zero();
-                            let cam_up = camera.up.normalize_or_zero();
-                            let world_move = cam_right * (mouse_delta.x * 0.12)
-                                + cam_up * (-mouse_delta.y * 0.12);
-                            let (x, y, z) = figure_basis(fig);
-                            let local_delta =
-                                vec3(world_move.dot(x), world_move.dot(y), world_move.dot(z));
-                            apply_resize_with_handle(fig, handles[sel].kind, local_delta);
+                    let delta = nudge_delta(dt);
+                    if !state.selected_vertices.is_empty() {
+                        apply_vertex_delta(fig, &state.selected_vertices, delta);
+                    } else {
+                        let handles = resize_handles(fig);
+                        if is_key_pressed(KeyCode::Tab) {
+                            state.selected_resize_handle =
+                                (state.selected_resize_handle + 1) % handles.len();
                         }
-                        let key_delta = resize_keyboard_delta(dt);
-                        if key_delta.length_squared() > 0.0 {
-                            apply_resize_with_handle(fig, handles[sel].kind, key_delta);
+                        if delta.length_squared() > 0.0 {
+                            let local_delta = figure_quat(fig).conjugate() * delta;
+                            let handle = handles[state.selected_resize_handle % handles.len()].kind;
+                            apply_resize_with_handle(fig, handle, local_delta);
                         }
                     }
                 }
                 CadTool::Rotate => {
-                    if state.dragging_axis && is_mouse_button_down(MouseButton::Left) {
-                        let mouse_delta = ctx.mouse - state.drag_last_mouse;
-                        state.drag_last_mouse = ctx.mouse;
-                        let amount = rotation_drag_amount(
-                            &camera,
-                            fig,
-                            state.selected_rotate_axis,
-                            mouse_delta,
-                        );
-                        apply_local_axis_rotation(fig, state.selected_rotate_axis, amount);
+                    if is_key_pressed(KeyCode::Tab) {
+                        state.selected_rotate_axis = (state.selected_rotate_axis + 1) % 3;
+                    }
+                    let amount = (if is_key_down(KeyCode::Left) {
+                        -1.0
+                    } else {
+                        0.0
+                    } + if is_key_down(KeyCode::Right) {
+                        1.0
+                    } else {
+                        0.0
+                    } + if is_key_down(KeyCode::Q) { -1.0 } else { 0.0 }
+                        + if is_key_down(KeyCode::E) { 1.0 } else { 0.0 })
+                        * dt;
+                    if amount != 0.0 {
+                        rotate_selected(fig, state.selected_rotate_axis, amount);
                     }
                 }
                 CadTool::Align | CadTool::Join | CadTool::Subtract => {}
+            }
+        }
+    }
+
+    if is_mouse_button_pressed(MouseButton::Left) && ctx.mouse.x > 220.0 {
+        if let Some(i) = state.selected {
+            if state.tool == CadTool::Resize {
+                if let Some(fig) = state.figures.get(i) {
+                    if let Some(vertex_idx) = pick_vertex(&camera, ctx.mouse, fig) {
+                        let additive =
+                            is_key_down(KeyCode::LeftShift) || is_key_down(KeyCode::RightShift);
+                        add_vertex_selection(state, i, vertex_idx, additive);
+                    } else {
+                        let points: Vec<Vec3> = resize_handles(fig)
+                            .iter()
+                            .map(|h| local_to_world(fig, h.local_pos))
+                            .collect();
+                        if let Some(handle) = pick_closest_index(&camera, ctx.mouse, &points, 14.0)
+                        {
+                            state.selected_resize_handle = handle;
+                            state.selected_vertices.clear();
+                        }
+                    }
+                }
+            } else if state.tool == CadTool::Rotate {
+                if let Some(fig) = state.figures.get(i) {
+                    if let Some(axis) =
+                        pick_closest_index(&camera, ctx.mouse, &axis_world_positions(fig), 16.0)
+                    {
+                        state.selected_rotate_axis = axis;
+                    }
+                }
+            }
+        }
+        if let Some(picked) = pick_figure_by_body(&camera, ctx.mouse, &state.figures) {
+            if is_pair_tool(state.tool) {
+                pair_selection_click(state, picked);
+            } else {
+                if state.selected != Some(picked) {
+                    state.selected_vertices.clear();
+                }
+                state.selected = Some(picked);
             }
         }
     }
@@ -1795,66 +1385,42 @@ pub fn run(
     for (i, fig) in state.figures.iter().enumerate() {
         draw_figure(fig, state.selected == Some(i));
     }
-
     if let Some(i) = state.selected {
         if let Some(fig) = state.figures.get(i) {
             if state.tool == CadTool::Resize {
-                let handles = resize_handles(fig);
-                let sel = if handles.is_empty() {
-                    0
-                } else {
-                    state.selected_resize_handle % handles.len()
-                };
-                for (h_i, h) in handles.iter().enumerate() {
-                    let pos = local_to_world(fig, h.local_pos);
-                    let color = if h_i == sel {
+                for vertex_idx in unique_vertex_indices(&fig.mesh) {
+                    let Some(pos) = fig.mesh.vertices.get(vertex_idx) else {
+                        continue;
+                    };
+                    let selected = state.selected_vertices.iter().any(|idx| {
+                        fig.mesh
+                            .vertices
+                            .get(*idx)
+                            .is_some_and(|anchor| same_vertex(*anchor, *pos))
+                    });
+                    let color = if selected {
                         colors.hover
                     } else {
                         Color::from_rgba(215, 230, 240, 255)
                     };
-                    draw_cube(pos, vec3(3.2, 3.2, 3.2), None, color);
-                    draw_cube_wires(pos, vec3(3.2, 3.2, 3.2), colors.text_primary);
+                    draw_cube(*pos, vec3(2.8, 2.8, 2.8), None, color);
                 }
             } else if state.tool == CadTool::Rotate {
-                let (x, y, z) = figure_basis(fig);
-                let axis_len = fig.size.max_element() * 0.8 + 14.0;
-                let axis_data = [
-                    (x, Color::from_rgba(255, 120, 120, 255)),
-                    (y, Color::from_rgba(120, 255, 120, 255)),
-                    (z, Color::from_rgba(120, 170, 255, 255)),
-                ];
-                for (axis_i, (dir, col)) in axis_data.iter().enumerate() {
-                    let tip = fig.pos + *dir * axis_len;
-                    draw_line_3d(fig.pos, tip, *col);
-                    let marker_color = if axis_i == state.selected_rotate_axis {
+                let axis = axis_world_positions(fig);
+                for (i, tip) in axis.iter().enumerate() {
+                    let color = if i == state.selected_rotate_axis {
                         colors.hover
                     } else {
-                        *col
+                        Color::from_rgba(220, 225, 235, 255)
                     };
-                    draw_cube(tip, vec3(3.6, 3.6, 3.6), None, marker_color);
-                    draw_cube_wires(tip, vec3(3.6, 3.6, 3.6), colors.text_primary);
+                    draw_line_3d(fig.pos, *tip, color);
+                    draw_sphere(*tip, 3.0, None, color);
                 }
             }
         }
     }
     set_default_camera();
 
-    let tool_label = match state.tool {
-        CadTool::Move => "Move",
-        CadTool::Resize => "Resize",
-        CadTool::Rotate => "Rotate",
-        CadTool::Align => "Align",
-        CadTool::Join => "Join",
-        CadTool::Subtract => "Subtract",
-    };
-    let selected_label = state
-        .selected
-        .map(|i| format!("{}", i + 1))
-        .unwrap_or_else(|| "none".to_string());
-    let pending_label = state
-        .pending_source
-        .map(|i| format!("{}", i + 1))
-        .unwrap_or_else(|| "none".to_string());
     draw_text(
         "CAD Prototype",
         24.0,
@@ -1862,55 +1428,36 @@ pub fn run(
         ctx.font_md,
         colors.text_primary,
     );
-    draw_text(
-        &format!(
-            "Figures: {} | Selected: {}",
-            state.figures.len(),
-            selected_label
-        ),
-        24.0,
-        62.0,
-        ctx.font_sm,
-        colors.text_secondary,
-    );
-    draw_text(
-        &format!(
-            "Tool: {} | Handle: {} | Axis: {}",
-            tool_label,
-            state.selected_resize_handle + 1,
-            state.selected_rotate_axis + 1
-        ),
-        24.0,
-        84.0,
-        ctx.font_sm,
-        colors.text_secondary,
-    );
-    if is_pair_tool(state.tool) {
-        let phase = match state.pair_phase {
-            PairPhase::PickSource => "Pick Source",
-            PairPhase::PickTarget => "Pick Target",
-        };
-        draw_text(
-            &format!("Pair: {} | Pending: {}", phase, pending_label),
-            24.0,
-            106.0,
-            ctx.font_sm,
-            colors.text_secondary,
-        );
+    draw_tools_panel(ctx, state, colors);
+    let tool = match state.tool {
+        CadTool::Move => "Move",
+        CadTool::Resize => "Resize",
+        CadTool::Rotate => "Rotate",
+        CadTool::Align => "Align",
+        CadTool::Join => "Join",
+        CadTool::Subtract => "Subtract",
+    };
+    let phase = if is_pair_tool(state.tool) {
+        match state.pair_phase {
+            PairPhase::PickSource => "pick source",
+            PairPhase::PickTarget => "pick target",
+        }
     } else {
-        draw_text(
-            "LMB select/drag gizmo | resize handles local | rotate local axes",
-            24.0,
-            106.0,
-            ctx.font_sm,
-            colors.text_secondary,
-        );
-    }
+        "body click selects"
+    };
     draw_text(
-        &state.obj_status,
-        24.0,
-        128.0,
+        &format!("Tool: {} | {}", tool, phase),
+        230.0,
+        34.0,
         ctx.font_sm,
         colors.text_secondary,
     );
+    draw_text(
+        &state.status,
+        230.0,
+        58.0,
+        ctx.font_sm,
+        colors.text_secondary,
+    );
+    *last_mouse = ctx.mouse;
 }

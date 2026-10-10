@@ -79,7 +79,6 @@ async fn main() {
             }
         }
         let mouse = vec2(mouse_position().0, mouse_position().1);
-        let screen_center = vec2(screen_width() * 0.5, screen_height() * 0.5);
         let colors_rt = colors.runtime();
         clear_background(colors_rt.background);
         let text_scale = config.text_scale;
@@ -96,7 +95,6 @@ async fn main() {
 
         let ctx = FrameContext {
             mouse,
-            screen_center,
             font_sm,
             font_md,
             font_lg,

@@ -1,24 +1,22 @@
-# `src/scenes/build_template.rs` - Step-by-Step Explanation
+# `src/scenes/build_template.rs` - Current Behavior
 
-## 1) File Goal
-`build_template.rs` implements a 2D scene for building internal building templates:
-- Place machine blocks (belts, inserters, assemblers, etc.).
-- Prototype production layouts without affecting the planet.
+## Goal
+3D base-interior editor scene for machine layout, logistics tuning, and quick sandbox tests.
 
-## 2) Current State
-- Independent hex map (`MapOutline::Hexagon`).
-- Tool panel to select a block type or delete.
-- Rotation with `R`.
-- Simple window on right click for a placed block.
+## Controls
+- Camera: `RMB` look, `WASD` move, `Shift` sprint, `Space/Ctrl` vertical.
+- Build: select panel item, `LMB` place, `R` rotate.
+- Delete: select `Delete`, `LMB` occupied hex.
+- Block detail: `RMB` on block.
+- Pick modes: `Enter` finish, `Esc` cancel.
 
-## 3) High-Level `run(...)` Flow
-1. Camera handling (zoom + drag).
-2. Select the hex under the mouse.
-3. Tool panel: choose a block type or delete.
-4. Left click to place/delete.
-5. Right click to open the block window.
-6. Render: grid, placed blocks, preview, and hover highlight.
+## Runtime Systems In Scene
+- Hex floor + occupancy highlight.
+- Conveyor, mechanic arm, assembler, container visuals.
+- Belt item interpolation and stop-at-end behavior.
+- Forklift body centered on movement path, carried payload offset to fork arms.
+- First-person collision against occupied block hexes and forklift hexes.
 
-## 4) Roadmap
-- **Future:** some buildings placed on the planet will be able to open this scene for internal customization.
-- This scene will become a per-building internal layout editor (not just a sandbox).
+## Notes
+- Interior simulation tick runs each frame via planet state active-base context.
+- Scene exits to `Planet` on `Esc` when no selection/pick mode active.

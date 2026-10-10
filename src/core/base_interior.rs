@@ -1,5 +1,5 @@
+use crate::core::common::{Axial, MachineBlock, MachineBlockType, axial_neighbors};
 use serde::{Deserialize, Serialize};
-use crate::core::common::{axial_neighbors, Axial, MachineBlock, MachineBlockType};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum InteriorPartKind {
@@ -1086,6 +1086,7 @@ mod tests {
             }],
             forklifts: Vec::new(),
             logistics_requests: Vec::new(),
+            camera: default_interior_camera(),
         };
 
         tick_base_interior(&mut interior, 0.1);
@@ -1171,6 +1172,7 @@ mod tests {
             }],
             forklifts: Vec::new(),
             logistics_requests: Vec::new(),
+            camera: default_interior_camera(),
         };
 
         tick_base_interior(&mut interior, 0.1);

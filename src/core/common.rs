@@ -168,8 +168,7 @@ pub struct Unit {
     pub waiting_for_supply: bool,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[derive(Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum AutoSupplyRole {
     #[default]
     Base,
@@ -189,7 +188,6 @@ pub enum Scene {
 #[derive(Clone, Copy, Debug)]
 pub struct FrameContext {
     pub mouse: Vec2,
-    pub screen_center: Vec2,
     pub font_sm: f32,
     pub font_md: f32,
     pub font_lg: f32,
@@ -338,37 +336,192 @@ pub struct AppColors {
 impl Default for AppColors {
     fn default() -> Self {
         Self {
-            background: ColorRgba { r: 18, g: 22, b: 26, a: 255 },
-            grid: ColorRgba { r: 70, g: 78, b: 86, a: 255 },
-            hover: ColorRgba { r: 255, g: 210, b: 90, a: 255 },
-            text_primary: ColorRgba { r: 220, g: 220, b: 220, a: 255 },
-            text_secondary: ColorRgba { r: 190, g: 200, b: 210, a: 255 },
-            button_base: ColorRgba { r: 50, g: 62, b: 75, a: 255 },
-            button_hover: ColorRgba { r: 70, g: 85, b: 100, a: 255 },
-            button_border: ColorRgba { r: 110, g: 130, b: 150, a: 255 },
-            button_text: ColorRgba { r: 220, g: 230, b: 240, a: 255 },
-            panel_bg: ColorRgba { r: 28, g: 34, b: 40, a: 230 },
-            panel_border: ColorRgba { r: 80, g: 90, b: 100, a: 255 },
-            tooltip_bg: ColorRgba { r: 30, g: 36, b: 44, a: 240 },
-            tooltip_border: ColorRgba { r: 100, g: 120, b: 140, a: 255 },
-            route_line: ColorRgba { r: 120, g: 140, b: 160, a: 200 },
-            port_in: ColorRgba { r: 80, g: 160, b: 220, a: 255 },
-            port_out: ColorRgba { r: 220, g: 170, b: 90, a: 255 },
-            block_housing: ColorRgba { r: 120, g: 200, b: 120, a: 255 },
-            block_factory: ColorRgba { r: 220, g: 140, b: 80, a: 255 },
-            block_base: ColorRgba { r: 150, g: 170, b: 220, a: 255 },
-            block_builder: ColorRgba { r: 130, g: 200, b: 210, a: 255 },
-            block_mine: ColorRgba { r: 110, g: 150, b: 200, a: 255 },
-            block_warehouse: ColorRgba { r: 210, g: 190, b: 90, a: 255 },
-            block_logistics: ColorRgba { r: 120, g: 140, b: 160, a: 255 },
-            block_route: ColorRgba { r: 90, g: 100, b: 115, a: 255 },
-            tile_iron: ColorRgba { r: 120, g: 95, b: 85, a: 255 },
-            tile_copper: ColorRgba { r: 150, g: 95, b: 70, a: 255 },
-            tile_gold: ColorRgba { r: 190, g: 150, b: 70, a: 255 },
-            tile_zinc: ColorRgba { r: 135, g: 140, b: 150, a: 255 },
-            tile_lead: ColorRgba { r: 95, g: 95, b: 115, a: 255 },
-            tile_aluminum: ColorRgba { r: 175, g: 185, b: 200, a: 255 },
-            tile_water: ColorRgba { r: 60, g: 110, b: 160, a: 255 },
+            background: ColorRgba {
+                r: 18,
+                g: 22,
+                b: 26,
+                a: 255,
+            },
+            grid: ColorRgba {
+                r: 70,
+                g: 78,
+                b: 86,
+                a: 255,
+            },
+            hover: ColorRgba {
+                r: 255,
+                g: 210,
+                b: 90,
+                a: 255,
+            },
+            text_primary: ColorRgba {
+                r: 220,
+                g: 220,
+                b: 220,
+                a: 255,
+            },
+            text_secondary: ColorRgba {
+                r: 190,
+                g: 200,
+                b: 210,
+                a: 255,
+            },
+            button_base: ColorRgba {
+                r: 50,
+                g: 62,
+                b: 75,
+                a: 255,
+            },
+            button_hover: ColorRgba {
+                r: 70,
+                g: 85,
+                b: 100,
+                a: 255,
+            },
+            button_border: ColorRgba {
+                r: 110,
+                g: 130,
+                b: 150,
+                a: 255,
+            },
+            button_text: ColorRgba {
+                r: 220,
+                g: 230,
+                b: 240,
+                a: 255,
+            },
+            panel_bg: ColorRgba {
+                r: 28,
+                g: 34,
+                b: 40,
+                a: 230,
+            },
+            panel_border: ColorRgba {
+                r: 80,
+                g: 90,
+                b: 100,
+                a: 255,
+            },
+            tooltip_bg: ColorRgba {
+                r: 30,
+                g: 36,
+                b: 44,
+                a: 240,
+            },
+            tooltip_border: ColorRgba {
+                r: 100,
+                g: 120,
+                b: 140,
+                a: 255,
+            },
+            route_line: ColorRgba {
+                r: 120,
+                g: 140,
+                b: 160,
+                a: 200,
+            },
+            port_in: ColorRgba {
+                r: 80,
+                g: 160,
+                b: 220,
+                a: 255,
+            },
+            port_out: ColorRgba {
+                r: 220,
+                g: 170,
+                b: 90,
+                a: 255,
+            },
+            block_housing: ColorRgba {
+                r: 120,
+                g: 200,
+                b: 120,
+                a: 255,
+            },
+            block_factory: ColorRgba {
+                r: 220,
+                g: 140,
+                b: 80,
+                a: 255,
+            },
+            block_base: ColorRgba {
+                r: 150,
+                g: 170,
+                b: 220,
+                a: 255,
+            },
+            block_builder: ColorRgba {
+                r: 130,
+                g: 200,
+                b: 210,
+                a: 255,
+            },
+            block_mine: ColorRgba {
+                r: 110,
+                g: 150,
+                b: 200,
+                a: 255,
+            },
+            block_warehouse: ColorRgba {
+                r: 210,
+                g: 190,
+                b: 90,
+                a: 255,
+            },
+            block_logistics: ColorRgba {
+                r: 120,
+                g: 140,
+                b: 160,
+                a: 255,
+            },
+            block_route: ColorRgba {
+                r: 90,
+                g: 100,
+                b: 115,
+                a: 255,
+            },
+            tile_iron: ColorRgba {
+                r: 120,
+                g: 95,
+                b: 85,
+                a: 255,
+            },
+            tile_copper: ColorRgba {
+                r: 150,
+                g: 95,
+                b: 70,
+                a: 255,
+            },
+            tile_gold: ColorRgba {
+                r: 190,
+                g: 150,
+                b: 70,
+                a: 255,
+            },
+            tile_zinc: ColorRgba {
+                r: 135,
+                g: 140,
+                b: 150,
+                a: 255,
+            },
+            tile_lead: ColorRgba {
+                r: 95,
+                g: 95,
+                b: 115,
+                a: 255,
+            },
+            tile_aluminum: ColorRgba {
+                r: 175,
+                g: 185,
+                b: 200,
+                a: 255,
+            },
+            tile_water: ColorRgba {
+                r: 60,
+                g: 110,
+                b: 160,
+                a: 255,
+            },
         }
     }
 }
@@ -421,15 +574,13 @@ struct MapData {
     units: Vec<Unit>,
 }
 
-#[derive(Serialize, Deserialize)]
-#[derive(Default)]
+#[derive(Serialize, Deserialize, Default)]
 pub struct ConfigData {
     #[serde(default)]
     pub config: AppConfig,
     #[serde(default)]
     pub colors: AppColors,
 }
-
 
 // Convert axial hex coords to pixel space.
 pub fn hex_to_pixel(hex: Axial, size: f32, origin: Vec2) -> Vec2 {
@@ -569,7 +720,6 @@ pub fn load_config(path: &str) -> ConfigData {
     ConfigData::default()
 }
 
-
 // Pick a tile type using weighted probabilities and center bias.
 pub fn tile_kind_weighted(dist: i32, radius: i32, config: &AppConfig) -> TileType {
     let center_bias = 1.0 - (dist as f32 / radius as f32).clamp(0.0, 1.0);
@@ -662,13 +812,7 @@ pub fn generate_tiles(radius: i32, config: &AppConfig) -> HashMap<Axial, TileDat
                 continue;
             }
             let amount = tile_amount(kind, dist, radius);
-            tiles.insert(
-                current,
-                TileData {
-                    kind,
-                    amount,
-                },
-            );
+            tiles.insert(current, TileData { kind, amount });
             placed += 1;
             let neighbors = axial_neighbors(current);
             for neighbor in neighbors {

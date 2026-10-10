@@ -1,10 +1,7 @@
 use macroquad::prelude::*;
 use serde::{Deserialize, Serialize};
 
-use crate::core::{
-    draw_hex_filled, draw_hex_outline, AppColors, Axial, ColorRgba,
-    RuntimeColors,
-};
+use crate::core::{AppColors, Axial, ColorRgba, RuntimeColors, draw_hex_filled, draw_hex_outline};
 
 #[derive(Clone, Copy, Debug)]
 pub struct UiButtonColors {
@@ -55,7 +52,12 @@ pub const WINDOW_TITLE_HEIGHT: f32 = 28.0;
 
 // Title bar rectangle for a window.
 pub fn window_title_rect(state: &WindowState) -> Rect {
-    Rect::new(state.rect.x, state.rect.y, state.rect.w, WINDOW_TITLE_HEIGHT)
+    Rect::new(
+        state.rect.x,
+        state.rect.y,
+        state.rect.w,
+        WINDOW_TITLE_HEIGHT,
+    )
 }
 
 // Close button rectangle for a window.
@@ -103,7 +105,14 @@ pub fn ui_checkbox(
     let hover = rect.contains(mouse);
     let fill = if hover { colors.hover } else { colors.base };
     draw_rectangle(box_rect.x, box_rect.y, box_rect.w, box_rect.h, fill);
-    draw_rectangle_lines(box_rect.x, box_rect.y, box_rect.w, box_rect.h, 1.5, colors.border);
+    draw_rectangle_lines(
+        box_rect.x,
+        box_rect.y,
+        box_rect.w,
+        box_rect.h,
+        1.5,
+        colors.border,
+    );
     if checked {
         draw_line(
             box_rect.x + 4.0,
@@ -334,7 +343,13 @@ pub fn draw_game_panel(
 ) -> PanelResult {
     let mut toggled = false;
 
-    draw_rectangle(panel_pos.x, panel_pos.y, panel_size.x, panel_size.y, colors.panel_bg);
+    draw_rectangle(
+        panel_pos.x,
+        panel_pos.y,
+        panel_size.x,
+        panel_size.y,
+        colors.panel_bg,
+    );
     draw_rectangle_lines(
         panel_pos.x,
         panel_pos.y,
@@ -344,10 +359,25 @@ pub fn draw_game_panel(
         colors.panel_border,
     );
 
-    let toggle_rect = Rect::new(panel_pos.x + panel_size.x - 32.0, panel_pos.y + 6.0, 26.0, 24.0);
+    let toggle_rect = Rect::new(
+        panel_pos.x + panel_size.x - 32.0,
+        panel_pos.y + 6.0,
+        26.0,
+        24.0,
+    );
     let toggle_hovered = toggle_rect.contains(mouse);
-    let toggle_color = if toggle_hovered { colors.button_hover } else { colors.button_base };
-    draw_rectangle(toggle_rect.x, toggle_rect.y, toggle_rect.w, toggle_rect.h, toggle_color);
+    let toggle_color = if toggle_hovered {
+        colors.button_hover
+    } else {
+        colors.button_base
+    };
+    draw_rectangle(
+        toggle_rect.x,
+        toggle_rect.y,
+        toggle_rect.w,
+        toggle_rect.h,
+        toggle_color,
+    );
     draw_rectangle_lines(
         toggle_rect.x,
         toggle_rect.y,
@@ -407,7 +437,11 @@ pub fn draw_build_panel<T: Copy + PartialEq>(
             }
             let selected_now = selected == *option;
 
-            let base_color = if selected_now { colors.button_hover } else { colors.button_base };
+            let base_color = if selected_now {
+                colors.button_hover
+            } else {
+                colors.button_base
+            };
             draw_rectangle(rect.x, rect.y, rect.w, rect.h, base_color);
             draw_rectangle_lines(
                 rect.x,
@@ -484,7 +518,13 @@ pub fn draw_window(
     if !state.open {
         return false;
     }
-    draw_rectangle(state.rect.x, state.rect.y, state.rect.w, state.rect.h, style.bg);
+    draw_rectangle(
+        state.rect.x,
+        state.rect.y,
+        state.rect.w,
+        state.rect.h,
+        style.bg,
+    );
     draw_rectangle_lines(
         state.rect.x,
         state.rect.y,
@@ -518,7 +558,12 @@ pub fn draw_window(
         close_rect.h,
         style.border,
     );
-    draw_text("x", close_rect.x + 5.0, close_rect.y + 14.0, font_title, style.title);
+    draw_text(
+        "x",
+        close_rect.x + 5.0,
+        close_rect.y + 14.0,
+        font_title,
+        style.title,
+    );
     close_rect.contains(mouse) && is_mouse_button_pressed(MouseButton::Left)
 }
-

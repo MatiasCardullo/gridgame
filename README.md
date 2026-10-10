@@ -1,45 +1,77 @@
 # GridGame
 
-Hex-grid strategy game built with Rust and Macroquad. Build structures, extract resources, and move logistics units along routes.
+GridGame is a Rust and Macroquad hex-grid colony prototype. Current gameplay centers on generating a planet, placing buildings, mining resources, and supplying construction with logistics units.
 
-**Requirements**
-1. Rust and Cargo installed.
+## Requirements
 
-**Run**
-1. `cargo run`
+- Rust and Cargo
 
-**Development**
-1. `cargo check` for fast type checks.
-2. `cargo build` for a debug build.
-3. `cargo test` to run tests.
-4. `scripts/check.ps1` to run the standard check script.
+## Run
 
-**Controls**
-1. Left click: open a block window.
-2. Right click: place a block or start demolish (when "Demolish" is selected).
-3. Mouse wheel: zoom.
-4. Middle mouse (drag): pan camera.
-5. Arrow keys: rotate planet camera.
-6. `R`: rotate placement.
-7. `Esc`: back to menu (saves the game).
-8. Planet scene: `1` no tool, `2` base, `3` mine, right click places building, `Delete` removes building.
-9. Planet scene map export: `M` saves hovered zone PNG, `Shift+M` saves all zone PNGs to `planet_data/zone_maps/`.
+```text
+cargo run
+```
 
-**Notes**
-1. Mines can expand their attached zones from the block window.
-2. Logistics and Builder units are created from their block windows and can be listed with "Unit list".
-3. Base auto-supply units prioritize non-Route construction and can source from Base or Warehouses.
-4. Builder auto-supply units prioritize Route construction, move faster, and travel only along Routes.
+Build and test:
 
-**Planet Scene Data**
-1. Terrain parameters and sector values are saved in `planet_data/planet_noise.json`.
-2. The 2D heightmap texture is regenerated from that JSON when needed (no separate texture cache files).
-3. Planet grid cache: `planet_data/planet_sim_grid.bin` (single grid used for hover + simulation).
-5. Per-cell resource snapshot (depletable state): `planet_data/planet_resources.bin`.
-6. Planet buildings snapshot: `planet_data/planet_buildings.json`.
-7. Optional runtime artifacts:
-8. `planet_data/planet_perf.log` for perf/hitch logging.
-9. `planet_data/planet_mesh_points.csv` only when mesh-point export is enabled.
+```text
+cargo build
+cargo test
+```
 
-**Roadmap Notes**
-1. `build_template.rs` is the current 2D sandbox for future machine/build layout work.
+## Current implementation
+
+- Main menu and runtime configuration screen.
+- Procedurally generated spherical planet with cached mesh and simulation grid.
+- Depletable per-cell resources: iron, copper, gold, zinc, lead, aluminum, and water.
+- Planet buildings: Base, Builder, Housing, Factory, Mine, Warehouse, Refuel, Logistics, and Route.
+- Persistent planet state for terrain parameters, resources, buildings, and units under `planet_data/`.
+- Logistics and Builder units with cargo, depots, routes, construction supply, and role-specific auto-supply.
+- Base interior scene with a 3D camera, conveyors, mechanic arms, pallets, crates, chests, assemblers, furnaces, and forklifts.
+- Build-template sandbox for testing interior machine layouts and first-person movement.
+
+## Controls
+
+### Planet
+
+- Left click: select or place building.
+- Right click: place selected building or confirm demolition.
+- Mouse wheel: zoom.
+- Middle mouse drag: orbit planet camera.
+- Arrow keys: orbit planet camera.
+- `1`: clear building tool.
+- `2`-`9`: select Base, Builder, Housing, Factory, Mine, Warehouse, Refuel, or Logistics.
+- `0`: select Route.
+- `Delete`: select demolition.
+- `P`: export test hex map PNG.
+- `Escape`: return to menu and save state.
+
+### Base interior
+
+- Left click: place or delete machine block.
+- Right click drag: move 3D camera.
+- `WASD`: move camera.
+- `Space` / `Ctrl`: move camera vertically.
+- `R`: rotate selected block.
+- `Escape`: return to planet.
+
+## Runtime data
+
+The game creates `planet_data/` as needed:
+
+- `planet_noise.json`: terrain parameters and sector values.
+- `planet_sim_grid.bin`: cached simulation grid.
+- `planet_resources.bin`: resource snapshot.
+- `planet_buildings.json`: building and base-interior snapshot.
+- `planet_units.json`: unit snapshot.
+- `zone_maps/`: exported map images.
+- `planet_perf.log`: optional performance log.
+- `planet_mesh_points.csv`: optional mesh-point export.
+
+## Project layout
+
+- `src/main.rs`: application loop and scene routing.
+- `src/scenes/`: main menu, configuration, planet, and build-template scenes.
+- `src/core/`: shared grid, planet, unit, interior, persistence, and UI systems.
+- `config.json`: persisted runtime settings.
+- `roadmap.md`: implementation status and next milestones.

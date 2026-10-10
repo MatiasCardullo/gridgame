@@ -200,12 +200,7 @@ pub fn build_geodesic_sphere(
 }
 
 // Relaxes vertex positions along the sphere to reduce edge length variance.
-pub fn relax_sphere(
-    vertices: &mut [Vec3],
-    faces: &[[usize; 3]],
-    iterations: usize,
-    strength: f32,
-) {
+pub fn relax_sphere(vertices: &mut [Vec3], faces: &[[usize; 3]], iterations: usize, strength: f32) {
     let neighbors = build_vertex_neighbors(faces, vertices.len());
     let strength = strength.clamp(0.0, 1.0);
 
@@ -254,11 +249,7 @@ pub fn build_vertex_neighbors(faces: &[[usize; 3]], vertex_count: usize) -> Vec<
 pub fn build_face_neighbors(faces: &[[usize; 3]]) -> Vec<Vec<usize>> {
     let mut edge_map: HashMap<(usize, usize), Vec<usize>> = HashMap::new();
     for (face_index, face) in faces.iter().enumerate() {
-        let edges = [
-            (face[0], face[1]),
-            (face[1], face[2]),
-            (face[2], face[0]),
-        ];
+        let edges = [(face[0], face[1]), (face[1], face[2]), (face[2], face[0])];
         for (a, b) in edges {
             let key = if a < b { (a, b) } else { (b, a) };
             edge_map.entry(key).or_default().push(face_index);
@@ -286,10 +277,7 @@ pub fn build_face_neighbors(faces: &[[usize; 3]]) -> Vec<Vec<usize>> {
         .collect()
 }
 
-pub fn load_hex_grid_cache(
-    path: &str,
-    freq: i32,
-) -> Option<(Vec<Vec3>, Vec<[u32; 3]>)> {
+pub fn load_hex_grid_cache(path: &str, freq: i32) -> Option<(Vec<Vec3>, Vec<[u32; 3]>)> {
     let file = File::open(path).ok()?;
     let mut reader = BufReader::new(file);
     let mut magic = [0u8; 4];

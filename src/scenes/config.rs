@@ -1,13 +1,13 @@
 use macroquad::prelude::*;
 
-use crate::core::{
-    generate_tiles, save_config, AppColors, AppConfig, Axial, ConfigData, FrameContext, Scene,
-    TileData,
-};
+use crate::TRI_LENGHT;
 use crate::core::ui::{
     adjust_color_channel, color_target_list, color_target_mut, color_target_name, ui_button,
 };
-use crate::TRI_LENGHT;
+use crate::core::{
+    AppColors, AppConfig, Axial, ConfigData, FrameContext, Scene, TileData, generate_tiles,
+    save_config,
+};
 use std::collections::HashMap;
 
 // Render and handle input for the config scene.
@@ -86,7 +86,11 @@ pub fn run(
     }
     y += row_gap;
 
-    let (dec, inc) = draw_stepper("Grosor de lineas", &format!("{:.2}", config.line_thickness), y);
+    let (dec, inc) = draw_stepper(
+        "Grosor de lineas",
+        &format!("{:.2}", config.line_thickness),
+        y,
+    );
     if dec {
         changed = true;
         config.line_thickness = (config.line_thickness - 0.25).max(0.5);
@@ -147,7 +151,11 @@ pub fn run(
     }
     y += row_gap;
 
-    let (dec, inc) = draw_stepper("Chance vecinos", &format!("{:.2}", config.tile_neighbor_chance), y);
+    let (dec, inc) = draw_stepper(
+        "Chance vecinos",
+        &format!("{:.2}", config.tile_neighbor_chance),
+        y,
+    );
     if dec {
         changed = true;
         config.tile_neighbor_chance = (config.tile_neighbor_chance - 0.05).max(0.05);
@@ -158,7 +166,11 @@ pub fn run(
     }
     y += row_gap;
 
-    let (dec, inc) = draw_stepper("Bonus centro", &format!("{:.2}", config.tile_center_bonus), y);
+    let (dec, inc) = draw_stepper(
+        "Bonus centro",
+        &format!("{:.2}", config.tile_center_bonus),
+        y,
+    );
     if dec {
         changed = true;
         config.tile_center_bonus = (config.tile_center_bonus - 0.05).max(0.0);
@@ -224,7 +236,11 @@ pub fn run(
     }
     y += row_gap;
 
-    let (dec, inc) = draw_stepper("Peso Aluminum", &format!("{:.2}", config.weight_aluminum), y);
+    let (dec, inc) = draw_stepper(
+        "Peso Aluminum",
+        &format!("{:.2}", config.weight_aluminum),
+        y,
+    );
     if dec {
         changed = true;
         config.weight_aluminum = (config.weight_aluminum - 0.05).max(0.0);
@@ -247,7 +263,13 @@ pub fn run(
     y += row_gap;
 
     let rect_regen = Rect::new(label_x, y - 16.0, 240.0, 38.0);
-    let (regen, _) = ui_button(rect_regen, "Regenerar tiles", ctx.mouse, ctx.font_md, ctx.button_colors);
+    let (regen, _) = ui_button(
+        rect_regen,
+        "Regenerar tiles",
+        ctx.mouse,
+        ctx.font_md,
+        ctx.button_colors,
+    );
     if regen {
         *tiles = generate_tiles(TRI_LENGHT, config);
         *dirty = true;
@@ -313,7 +335,13 @@ pub fn run(
             changed = true;
             adjust_color_channel(color, idx, 8);
         }
-        draw_text(&format!("{}", value), value_x, row_y, ctx.font_md, text_secondary);
+        draw_text(
+            &format!("{}", value),
+            value_x,
+            row_y,
+            ctx.font_md,
+            text_secondary,
+        );
     }
 
     if changed {
@@ -327,7 +355,13 @@ pub fn run(
     }
 
     let rect_back = Rect::new(100.0, screen_height() - 80.0, 180.0, 48.0);
-    let (back, _) = ui_button(rect_back, "Volver", ctx.mouse, ctx.font_md, ctx.button_colors);
+    let (back, _) = ui_button(
+        rect_back,
+        "Volver",
+        ctx.mouse,
+        ctx.font_md,
+        ctx.button_colors,
+    );
     if back {
         *scene = Scene::MainMenu;
     }

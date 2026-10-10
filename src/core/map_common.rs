@@ -1,11 +1,9 @@
+use crate::HEX_RADIUS;
 use crate::core::ui::{
     WINDOW_TITLE_HEIGHT, WindowState, WindowStyle, draw_window, ui_button, window_close_rect,
     window_title_rect,
 };
-use crate::core::{
-    AppConfig, Axial, FrameContext, RuntimeColors, hex_distance, hex_to_pixel, pixel_to_hex,
-};
-use crate::{HEX_RADIUS, HEX_SIZE};
+use crate::core::{AppConfig, Axial, FrameContext, RuntimeColors, hex_distance};
 use macroquad::prelude::*;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -31,15 +29,6 @@ pub fn in_bounds(hex: Axial, outline: MapOutline) -> bool {
     match outline {
         MapOutline::Hexagon => hex_distance(hex, Axial { q: 0, r: 0 }) <= HEX_RADIUS,
     }
-}
-
-pub fn hover_hex_from_mouse(ctx: &FrameContext, cam_offset: Vec2, cam_zoom: f32) -> Axial {
-    let world_mouse = (ctx.mouse - ctx.screen_center - cam_offset) / cam_zoom;
-    pixel_to_hex(world_mouse, HEX_SIZE, Vec2::ZERO)
-}
-
-pub fn hex_screen_center(ctx: &FrameContext, cam_offset: Vec2, cam_zoom: f32, hex: Axial) -> Vec2 {
-    ctx.screen_center + cam_offset + hex_to_pixel(hex, HEX_SIZE, Vec2::ZERO) * cam_zoom
 }
 
 pub fn draw_common_hud(
@@ -203,42 +192,6 @@ pub fn popup_rect_near_mouse(mouse: Vec2, win_w: f32, win_h: f32) -> Rect {
         y = screen_height() - win_h - 8.0;
     }
     Rect::new(x.max(8.0), y.max(8.0), win_w, win_h)
-}
-
-pub fn handle_cursor_zoom(
-    ctx: &FrameContext,
-    cam_offset: &mut Vec2,
-    cam_zoom: &mut f32,
-    zoom_speed: f32,
-) {
-    let wheel = mouse_wheel().1;
-    if wheel.abs() > 0.01 {
-        let factor = 1.0 + wheel * zoom_speed * 0.05;
-        let new_zoom = (*cam_zoom * factor).clamp(0.3, 3.0);
-        let world_pos = (ctx.mouse - ctx.screen_center - *cam_offset) / *cam_zoom;
-        *cam_zoom = new_zoom;
-        *cam_offset = ctx.mouse - ctx.screen_center - world_pos * *cam_zoom;
-    }
-}
-
-pub fn handle_camera_drag(
-    ctx: &FrameContext,
-    cam_offset: &mut Vec2,
-    dragging: &mut bool,
-    last_mouse: &mut Vec2,
-) {
-    if is_mouse_button_pressed(MouseButton::Middle) {
-        *dragging = true;
-        *last_mouse = ctx.mouse;
-    }
-    if is_mouse_button_down(MouseButton::Middle) && *dragging {
-        let delta = ctx.mouse - *last_mouse;
-        *cam_offset += delta;
-        *last_mouse = ctx.mouse;
-    }
-    if is_mouse_button_released(MouseButton::Middle) {
-        *dragging = false;
-    }
 }
 
 pub fn handle_window_drag(window: &mut WindowState, mouse: Vec2) {

@@ -12,6 +12,7 @@
 
 ## Runtime Systems In Scene
 - Hex floor + occupancy highlight.
+- Segmented mechanic-arm model with articulated links and a claw.
 - Conveyor, mechanic arm, assembler, container visuals.
 - Belt item interpolation and stop-at-end behavior.
 - Forklift body centered on movement path, carried payload offset to fork arms.

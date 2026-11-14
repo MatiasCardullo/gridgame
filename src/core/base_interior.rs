@@ -85,6 +85,7 @@ pub enum MechanicArmActionStage {
     Idle,
     Pickup,
     Deliver,
+    Retract,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -104,6 +105,8 @@ pub struct MechanicArmState {
     pub filters: Vec<InteriorPartKind>,
     #[serde(default)]
     pub action_stage: MechanicArmActionStage,
+    #[serde(default)]
+    pub action_origin: Option<Axial>,
     #[serde(default)]
     pub action_target: Option<Axial>,
     #[serde(default)]
@@ -307,6 +310,7 @@ impl BaseInteriorState {
                         input_hexes: Vec::new(),
                         filters: Vec::new(),
                         action_stage: MechanicArmActionStage::Idle,
+                        action_origin: None,
                         action_target: None,
                         action_progress: 0.0,
                     });
@@ -729,6 +733,7 @@ fn select_stack_part_for_arm(
 fn pickup_for_arm(
     interior: &mut BaseInteriorState,
     arm_hex: Axial,
+    excluded_hex: Option<Axial>,
 ) -> Option<(Axial, InteriorPartKind)> {
     let arm = interior.mechanic_arm(arm_hex)?.clone();
     if arm.output_hexes.is_empty() {
@@ -741,6 +746,9 @@ fn pickup_for_arm(
     let demanded = arm_output_demands(interior, &arm);
     let demand_is_strict = !demanded.is_empty();
     for candidate in candidates {
+        if Some(candidate) == excluded_hex {
+            continue;
+        }
         let selected_from_container = interior
             .containers
             .iter()
@@ -915,27 +923,62 @@ fn tick_mechanic_arms(interior: &mut BaseInteriorState, dt: f32) {
                 }
                 arm.action_progress = 0.0;
                 match arm.action_stage {
-                    // Pickup is already reserved; completing the animation just returns the claw home.
+                    // Keep the source as the transfer origin so delivery starts at the input.
                     MechanicArmActionStage::Pickup => {
-                        arm.action_stage = MechanicArmActionStage::Idle;
-                        arm.action_target = None;
-                        arm.cooldown = 0.08;
+                        let source_hex = arm.action_target;
+                        let held = arm.held;
+                        let _ = arm;
+                        let output_hex =
+                            held.and_then(|kind| delivery_target_for_arm(interior, arm_hex, kind));
+                        if let Some(arm) = interior.mechanic_arms.get_mut(index) {
+                            if let Some(output_hex) = output_hex {
+                                arm.action_stage = MechanicArmActionStage::Deliver;
+                                arm.action_origin = source_hex;
+                                arm.action_target = Some(output_hex);
+                            } else {
+                                arm.action_stage = MechanicArmActionStage::Retract;
+                            }
+                            arm.action_progress = 0.0;
+                        }
+                        continue;
                     }
                     MechanicArmActionStage::Deliver => {
                         let target = arm.action_target;
                         let held = arm.held;
-                        arm.action_stage = MechanicArmActionStage::Idle;
-                        arm.action_target = None;
                         let _ = arm;
-                        if let (Some(target_hex), Some(held_kind)) = (target, held) {
-                            if complete_delivery_to_target(interior, target_hex, held_kind) {
-                                if let Some(arm) = interior.mechanic_arms.get_mut(index) {
+                        let delivered = match (target, held) {
+                            (Some(target_hex), Some(held_kind)) => {
+                                complete_delivery_to_target(interior, target_hex, held_kind)
+                            }
+                            _ => false,
+                        };
+                        let next_pickup = if delivered {
+                            pickup_for_arm(interior, arm_hex, target)
+                        } else {
+                            None
+                        };
+                        if let Some(arm) = interior.mechanic_arms.get_mut(index) {
+                            if let Some((source_hex, kind)) = next_pickup {
+                                arm.action_stage = MechanicArmActionStage::Pickup;
+                                arm.action_origin = target;
+                                arm.action_target = Some(source_hex);
+                                arm.held = Some(kind);
+                            } else {
+                                arm.action_stage = MechanicArmActionStage::Retract;
+                                arm.action_origin = None;
+                                if delivered {
                                     arm.held = None;
-                                    arm.cooldown = 0.12;
                                 }
                             }
+                            arm.action_progress = 0.0;
                         }
                         continue;
+                    }
+                    MechanicArmActionStage::Retract => {
+                        arm.action_stage = MechanicArmActionStage::Idle;
+                        arm.action_origin = None;
+                        arm.action_target = None;
+                        arm.cooldown = 0.12;
                     }
                     MechanicArmActionStage::Idle => {}
                 }
@@ -947,10 +990,11 @@ fn tick_mechanic_arms(interior: &mut BaseInteriorState, dt: f32) {
         }
         let held = interior.mechanic_arms[index].held;
         if held.is_none() {
-            if let Some((source_hex, kind)) = pickup_for_arm(interior, arm_hex) {
+            if let Some((source_hex, kind)) = pickup_for_arm(interior, arm_hex, None) {
                 if let Some(arm) = interior.mechanic_arms.get_mut(index) {
                     arm.held = Some(kind);
                     arm.action_stage = MechanicArmActionStage::Pickup;
+                    arm.action_origin = None;
                     arm.action_target = Some(source_hex);
                     arm.action_progress = 0.0;
                 }
@@ -960,6 +1004,7 @@ fn tick_mechanic_arms(interior: &mut BaseInteriorState, dt: f32) {
         if let Some(target_hex) = delivery_target_for_arm(interior, arm_hex, held.unwrap()) {
             if let Some(arm) = interior.mechanic_arms.get_mut(index) {
                 arm.action_stage = MechanicArmActionStage::Deliver;
+                arm.action_origin = None;
                 arm.action_target = Some(target_hex);
                 arm.action_progress = 0.0;
             }
@@ -1075,6 +1120,7 @@ mod tests {
                 input_hexes: vec![Axial { q: -1, r: 0 }],
                 filters: Vec::new(),
                 action_stage: MechanicArmActionStage::Idle,
+                action_origin: None,
                 action_target: None,
                 action_progress: 0.0,
             }],
@@ -1102,6 +1148,72 @@ mod tests {
                 .map(|stack| stack.amount),
             Some(1)
         );
+    }
+
+    #[test]
+    fn mechanic_arm_transfers_directly_from_input_to_output() {
+        let source_hex = Axial { q: -1, r: 0 };
+        let output_hex = Axial { q: 1, r: 0 };
+        let mut interior = BaseInteriorState {
+            blocks: vec![
+                InteriorBlockRecord {
+                    hex: Axial { q: 0, r: 0 },
+                    block: MachineBlock {
+                        kind: MachineBlockType::MechanicArm,
+                        rotation: 0,
+                    },
+                },
+                InteriorBlockRecord {
+                    hex: source_hex,
+                    block: MachineBlock {
+                        kind: MachineBlockType::Crate,
+                        rotation: 0,
+                    },
+                },
+                InteriorBlockRecord {
+                    hex: output_hex,
+                    block: MachineBlock {
+                        kind: MachineBlockType::Assembler,
+                        rotation: 0,
+                    },
+                },
+            ],
+            containers: vec![InteriorContainerRecord {
+                hex: source_hex,
+                items: Vec::new(),
+            }],
+            belt_items: Vec::new(),
+            mechanic_arms: vec![MechanicArmState {
+                hex: Axial { q: 0, r: 0 },
+                held: Some(InteriorPartKind::ChassisFrame),
+                cooldown: 0.0,
+                output_hexes: vec![output_hex],
+                input_mode: MechanicArmInputMode::ExplicitInputs,
+                input_hexes: vec![source_hex],
+                filters: Vec::new(),
+                action_stage: MechanicArmActionStage::Pickup,
+                action_origin: None,
+                action_target: Some(source_hex),
+                action_progress: 0.9,
+            }],
+            assembly_nodes: vec![AssemblyNodeState {
+                hex: output_hex,
+                selected_recipe: AssemblerRecipeId::BuilderTender,
+                inserted: Vec::new(),
+                completed_outputs: Vec::new(),
+            }],
+            forklifts: Vec::new(),
+            logistics_requests: Vec::new(),
+            camera: default_interior_camera(),
+        };
+
+        tick_base_interior(&mut interior, 0.1);
+
+        let arm = &interior.mechanic_arms[0];
+        assert_eq!(arm.action_stage, MechanicArmActionStage::Deliver);
+        assert_eq!(arm.action_origin, Some(source_hex));
+        assert_eq!(arm.action_target, Some(output_hex));
+        assert_eq!(arm.held, Some(InteriorPartKind::ChassisFrame));
     }
 
     #[test]
@@ -1158,6 +1270,7 @@ mod tests {
                 input_hexes: vec![Axial { q: -1, r: 0 }],
                 filters: Vec::new(),
                 action_stage: MechanicArmActionStage::Idle,
+                action_origin: None,
                 action_target: None,
                 action_progress: 0.0,
             }],
@@ -1181,6 +1294,151 @@ mod tests {
             Some(InteriorPartKind::BuilderTenderKit)
         );
         assert!(interior.assembly_nodes[0].completed_outputs.is_empty());
+    }
+
+    #[test]
+    fn mechanic_arm_retracts_after_delivering_part() {
+        let target_hex = Axial { q: 1, r: 0 };
+        let mut interior = BaseInteriorState {
+            blocks: vec![
+                InteriorBlockRecord {
+                    hex: Axial { q: 0, r: 0 },
+                    block: MachineBlock {
+                        kind: MachineBlockType::MechanicArm,
+                        rotation: 0,
+                    },
+                },
+                InteriorBlockRecord {
+                    hex: target_hex,
+                    block: MachineBlock {
+                        kind: MachineBlockType::Crate,
+                        rotation: 0,
+                    },
+                },
+            ],
+            containers: vec![InteriorContainerRecord {
+                hex: target_hex,
+                items: Vec::new(),
+            }],
+            belt_items: Vec::new(),
+            mechanic_arms: vec![MechanicArmState {
+                hex: Axial { q: 0, r: 0 },
+                held: Some(InteriorPartKind::ChassisFrame),
+                cooldown: 0.0,
+                output_hexes: vec![target_hex],
+                input_mode: MechanicArmInputMode::AnyNeighbor,
+                input_hexes: Vec::new(),
+                filters: Vec::new(),
+                action_stage: MechanicArmActionStage::Deliver,
+                action_origin: None,
+                action_target: Some(target_hex),
+                action_progress: 0.9,
+            }],
+            assembly_nodes: Vec::new(),
+            forklifts: Vec::new(),
+            logistics_requests: Vec::new(),
+            camera: default_interior_camera(),
+        };
+
+        tick_base_interior(&mut interior, 0.1);
+        assert_eq!(
+            interior.mechanic_arms[0].action_stage,
+            MechanicArmActionStage::Retract
+        );
+        assert_eq!(interior.mechanic_arms[0].action_target, Some(target_hex));
+        assert_eq!(interior.mechanic_arms[0].held, None);
+        assert_eq!(
+            interior.containers[0].items,
+            vec![InteriorPartStack {
+                kind: InteriorPartKind::ChassisFrame,
+                amount: 1,
+            }]
+        );
+
+        tick_base_interior(&mut interior, 0.56);
+        assert_eq!(
+            interior.mechanic_arms[0].action_stage,
+            MechanicArmActionStage::Idle
+        );
+        assert_eq!(interior.mechanic_arms[0].action_target, None);
+    }
+
+    #[test]
+    fn mechanic_arm_moves_to_next_ready_input_after_delivery() {
+        let input_hex = Axial { q: -1, r: 0 };
+        let output_hex = Axial { q: 1, r: 0 };
+        let mut interior = BaseInteriorState {
+            blocks: vec![
+                InteriorBlockRecord {
+                    hex: Axial { q: 0, r: 0 },
+                    block: MachineBlock {
+                        kind: MachineBlockType::MechanicArm,
+                        rotation: 0,
+                    },
+                },
+                InteriorBlockRecord {
+                    hex: input_hex,
+                    block: MachineBlock {
+                        kind: MachineBlockType::Crate,
+                        rotation: 0,
+                    },
+                },
+                InteriorBlockRecord {
+                    hex: output_hex,
+                    block: MachineBlock {
+                        kind: MachineBlockType::Crate,
+                        rotation: 0,
+                    },
+                },
+            ],
+            containers: vec![
+                InteriorContainerRecord {
+                    hex: input_hex,
+                    items: vec![InteriorPartStack {
+                        kind: InteriorPartKind::WheelAssembly,
+                        amount: 1,
+                    }],
+                },
+                InteriorContainerRecord {
+                    hex: output_hex,
+                    items: Vec::new(),
+                },
+            ],
+            belt_items: Vec::new(),
+            mechanic_arms: vec![MechanicArmState {
+                hex: Axial { q: 0, r: 0 },
+                held: Some(InteriorPartKind::ChassisFrame),
+                cooldown: 0.0,
+                output_hexes: vec![output_hex],
+                input_mode: MechanicArmInputMode::ExplicitInputs,
+                input_hexes: vec![input_hex],
+                filters: Vec::new(),
+                action_stage: MechanicArmActionStage::Deliver,
+                action_origin: Some(input_hex),
+                action_target: Some(output_hex),
+                action_progress: 0.9,
+            }],
+            assembly_nodes: Vec::new(),
+            forklifts: Vec::new(),
+            logistics_requests: Vec::new(),
+            camera: default_interior_camera(),
+        };
+
+        tick_base_interior(&mut interior, 0.1);
+
+        let arm = &interior.mechanic_arms[0];
+        assert_eq!(arm.action_stage, MechanicArmActionStage::Pickup);
+        assert_eq!(arm.action_origin, Some(output_hex));
+        assert_eq!(arm.action_target, Some(input_hex));
+        assert_eq!(arm.held, Some(InteriorPartKind::WheelAssembly));
+        assert_eq!(interior.containers[0].items, Vec::new());
+        assert_eq!(
+            interior.containers[1].items,
+            vec![InteriorPartStack {
+                kind: InteriorPartKind::ChassisFrame,
+                amount: 1,
+            }]
+        );
     }
 
     #[test]

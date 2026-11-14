@@ -1,6 +1,6 @@
 use macroquad::prelude::*;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::fs::File;
 use std::io::{BufWriter, Write};
@@ -9,12 +9,20 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::time::{Instant, SystemTime};
 
+use crate::core::api::{
+    ApiArmInputMode, ApiAssemblerRecipe, ApiBuildingKind, ApiCommand, ApiInteriorBlockKind,
+    ApiInteriorPartKind, ApiMechanicArmConfig, ApiReply, ApiUnitNodes, ApiUnitPreset,
+};
+use crate::core::base_interior::{
+    AssemblerRecipeId, InteriorPartKind, MechanicArmInputMode, all_interior_filter_parts,
+};
 use crate::core::debug::{
     PLANET_DEBUG_UI_ENABLED_DEFAULT, SAVE_MESH_POINTS_RUNTIME, draw_planet_controls,
     format_log_timestamp, planet_perf_log,
 };
-use crate::core::map_common::{build_panel_layout, handle_window_drag, is_ui_capturing};
-use crate::core::{tick_base_interior, BaseInteriorState};
+use crate::core::map_common::{
+    MapOutline, build_panel_layout, handle_window_drag, in_bounds, is_ui_capturing,
+};
 use crate::core::planet_grid::{
     HexGrid, align_vertices_to_poles, build_faces, build_frequency_geodesic, build_geodesic_sphere,
     build_hex_grid_from_data, build_vertex_neighbors, icosahedron_edges, icosahedron_vertices,
@@ -41,7 +49,8 @@ use crate::core::ui::{
     WINDOW_TITLE_HEIGHT, WindowState, WindowStyle, draw_build_panel, draw_window, ui_button,
     ui_checkbox,
 };
-use crate::core::{Axial, FrameContext, Scene};
+use crate::core::{Axial, FrameContext, MachineBlock, MachineBlockType, Scene, axial_neighbors};
+use crate::core::{BaseInteriorState, tick_base_interior};
 
 const PLANET_DATA_DIR: &str = "planet_data";
 const MESH_POINTS_PATH: &str = "planet_data/planet_mesh_points.csv";
@@ -462,6 +471,118 @@ impl PlanetBuildingKind {
     }
 }
 
+fn resource_name(kind: PlanetResourceKind) -> &'static str {
+    match kind {
+        PlanetResourceKind::Iron => "iron",
+        PlanetResourceKind::Copper => "copper",
+        PlanetResourceKind::Gold => "gold",
+        PlanetResourceKind::Lead => "lead",
+        PlanetResourceKind::Zinc => "zinc",
+        PlanetResourceKind::Aluminum => "aluminum",
+        PlanetResourceKind::Lithium => "lithium",
+        PlanetResourceKind::Phosphate => "phosphate",
+        PlanetResourceKind::Stone => "stone",
+        PlanetResourceKind::FreshWater => "fresh_water",
+        PlanetResourceKind::Salt => "salt",
+    }
+}
+
+fn unit_preset_name(preset: PlanetUnitPresetId) -> &'static str {
+    match preset {
+        PlanetUnitPresetId::Hauler => "hauler",
+        PlanetUnitPresetId::BuilderSupply => "builder_supply",
+        PlanetUnitPresetId::Shuttle => "shuttle",
+    }
+}
+
+fn interior_block_name(kind: MachineBlockType) -> &'static str {
+    match kind {
+        MachineBlockType::ConveyorBelt => "conveyor_belt",
+        MachineBlockType::MechanicArm => "mechanic_arm",
+        MachineBlockType::Chest => "chest",
+        MachineBlockType::Assembler => "assembler",
+        MachineBlockType::Furnace => "furnace",
+        MachineBlockType::Pallet => "pallet",
+        MachineBlockType::Crate => "crate",
+    }
+}
+
+fn interior_part_name(kind: InteriorPartKind) -> &'static str {
+    match kind {
+        InteriorPartKind::ChassisFrame => "chassis_frame",
+        InteriorPartKind::WheelAssembly => "wheel_assembly",
+        InteriorPartKind::EngineCore => "engine_core",
+        InteriorPartKind::ControlModule => "control_module",
+        InteriorPartKind::ForkCarriage => "fork_carriage",
+        InteriorPartKind::MastSegment => "mast_segment",
+        InteriorPartKind::HydraulicSet => "hydraulic_set",
+        InteriorPartKind::SensorPack => "sensor_pack",
+        InteriorPartKind::FastenerBundle => "fastener_bundle",
+        InteriorPartKind::BuilderTenderKit => "builder_tender_kit",
+        InteriorPartKind::CargoHaulerKit => "cargo_hauler_kit",
+        InteriorPartKind::SiteShuttleKit => "site_shuttle_kit",
+    }
+}
+
+fn assembler_recipe_name(recipe: AssemblerRecipeId) -> &'static str {
+    match recipe {
+        AssemblerRecipeId::BuilderTender => "builder_tender",
+        AssemblerRecipeId::CargoHauler => "cargo_hauler",
+        AssemblerRecipeId::SiteShuttle => "site_shuttle",
+    }
+}
+
+fn arm_input_mode_name(mode: MechanicArmInputMode) -> &'static str {
+    match mode {
+        MechanicArmInputMode::AnyNeighbor => "any_neighbor",
+        MechanicArmInputMode::ExplicitInputs => "explicit_inputs",
+    }
+}
+
+fn api_block_kind(kind: ApiInteriorBlockKind) -> MachineBlockType {
+    match kind {
+        ApiInteriorBlockKind::ConveyorBelt => MachineBlockType::ConveyorBelt,
+        ApiInteriorBlockKind::MechanicArm => MachineBlockType::MechanicArm,
+        ApiInteriorBlockKind::Chest => MachineBlockType::Chest,
+        ApiInteriorBlockKind::Assembler => MachineBlockType::Assembler,
+        ApiInteriorBlockKind::Furnace => MachineBlockType::Furnace,
+        ApiInteriorBlockKind::Pallet => MachineBlockType::Pallet,
+        ApiInteriorBlockKind::Crate => MachineBlockType::Crate,
+    }
+}
+
+fn api_part_kind(kind: ApiInteriorPartKind) -> InteriorPartKind {
+    match kind {
+        ApiInteriorPartKind::ChassisFrame => InteriorPartKind::ChassisFrame,
+        ApiInteriorPartKind::WheelAssembly => InteriorPartKind::WheelAssembly,
+        ApiInteriorPartKind::EngineCore => InteriorPartKind::EngineCore,
+        ApiInteriorPartKind::ControlModule => InteriorPartKind::ControlModule,
+        ApiInteriorPartKind::ForkCarriage => InteriorPartKind::ForkCarriage,
+        ApiInteriorPartKind::MastSegment => InteriorPartKind::MastSegment,
+        ApiInteriorPartKind::HydraulicSet => InteriorPartKind::HydraulicSet,
+        ApiInteriorPartKind::SensorPack => InteriorPartKind::SensorPack,
+        ApiInteriorPartKind::FastenerBundle => InteriorPartKind::FastenerBundle,
+        ApiInteriorPartKind::BuilderTenderKit => InteriorPartKind::BuilderTenderKit,
+        ApiInteriorPartKind::CargoHaulerKit => InteriorPartKind::CargoHaulerKit,
+        ApiInteriorPartKind::SiteShuttleKit => InteriorPartKind::SiteShuttleKit,
+    }
+}
+
+fn api_recipe(recipe: ApiAssemblerRecipe) -> AssemblerRecipeId {
+    match recipe {
+        ApiAssemblerRecipe::BuilderTender => AssemblerRecipeId::BuilderTender,
+        ApiAssemblerRecipe::CargoHauler => AssemblerRecipeId::CargoHauler,
+        ApiAssemblerRecipe::SiteShuttle => AssemblerRecipeId::SiteShuttle,
+    }
+}
+
+fn api_arm_input_mode(mode: ApiArmInputMode) -> MechanicArmInputMode {
+    match mode {
+        ApiArmInputMode::AnyNeighbor => MechanicArmInputMode::AnyNeighbor,
+        ApiArmInputMode::ExplicitInputs => MechanicArmInputMode::ExplicitInputs,
+    }
+}
+
 fn building_storage_capacity(kind: PlanetBuildingKind) -> u32 {
     match kind {
         PlanetBuildingKind::Base => 1_600,
@@ -663,6 +784,41 @@ struct PlanetBuildingState {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum UnitSpawnError {
+    UnsupportedDefinition,
+    MissingBuilderTenderKit,
+}
+
+fn create_planet_unit(
+    buildings: &mut HashMap<u32, PlanetBuildingState>,
+    units: &mut Vec<PlanetUnit>,
+    definition_id: PlanetUnitDefinitionId,
+    depot: u32,
+    nodes: PlanetUnitNodeConfig,
+) -> Result<(usize, bool), UnitSpawnError> {
+    let unit = unit_for_definition(definition_id, depot, nodes)
+        .ok_or(UnitSpawnError::UnsupportedDefinition)?;
+    let kit_consumed = if definition_id == PlanetUnitDefinitionId::BuilderTender {
+        let consumed = buildings.values_mut().find_map(|building| {
+            building
+                .interior
+                .as_mut()
+                .filter(|interior| interior.builder_tender_kits() > 0)
+                .map(BaseInteriorState::consume_builder_tender_kit)
+        });
+        if consumed != Some(true) {
+            return Err(UnitSpawnError::MissingBuilderTenderKit);
+        }
+        true
+    } else {
+        false
+    };
+    let unit_index = units.len();
+    units.push(unit);
+    Ok((unit_index, kit_consumed))
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum InteriorPickMode {
     ArmOutputs(Axial),
     ArmInputs(Axial),
@@ -723,6 +879,18 @@ impl PlanetBuildingAccess for PlanetBuildingState {
 
     fn auto_units_enabled(&self) -> bool {
         self.auto_units_enabled
+    }
+
+    fn has_builder_tender_kit(&self) -> bool {
+        self.interior
+            .as_ref()
+            .is_some_and(|interior| interior.builder_tender_kits() > 0)
+    }
+
+    fn consume_builder_tender_kit(&mut self) -> bool {
+        self.interior
+            .as_mut()
+            .is_some_and(BaseInteriorState::consume_builder_tender_kit)
     }
 }
 
@@ -1140,6 +1308,758 @@ pub struct PlanetState {
 }
 
 impl PlanetState {
+    pub fn save_gameplay_state(&mut self) {
+        if let Some(sim_world) = self.sim_world.as_mut() {
+            sim_world.save_if_dirty(PLANET_RESOURCES_PATH);
+        }
+        self.save_buildings_if_dirty(PLANET_BUILDINGS_PATH);
+        self.save_units_if_dirty(PLANET_UNITS_PATH);
+    }
+
+    pub fn handle_api_command(&mut self, command: ApiCommand) -> ApiReply {
+        match command {
+            ApiCommand::EnterPlanet => ApiReply::json(
+                200,
+                serde_json::json!({ "scene": "planet", "planet_ready": true }),
+            ),
+            ApiCommand::Status => ApiReply::json(
+                200,
+                serde_json::json!({
+                    "planet_ready": self.sim_world.is_some() && self.sim_grid.is_some(),
+                    "cell_count": self.sim_world.as_ref().map(|world| world.cells.len()),
+                    "building_count": self.buildings.len(),
+                    "unit_count": self.units.len(),
+                }),
+            ),
+            ApiCommand::Cells { offset, limit } => {
+                let Some(world) = self.sim_world.as_ref() else {
+                    return ApiReply::error(
+                        503,
+                        "planet_not_ready",
+                        "planet simulation is still loading",
+                    );
+                };
+                let end = offset.saturating_add(limit).min(world.cells.len());
+                let cells = if offset >= world.cells.len() {
+                    Vec::new()
+                } else {
+                    (offset..end)
+                        .map(|index| {
+                            let cell = &world.cells[index];
+                            let position = self
+                                .sim_grid
+                                .as_ref()
+                                .and_then(|grid| grid.face_centers.get(index))
+                                .map(|point| serde_json::json!([point.x, point.y, point.z]));
+                            let neighbors = self
+                                .sim_neighbors
+                                .as_ref()
+                                .and_then(|neighbors| neighbors.get(index))
+                                .cloned()
+                                .unwrap_or_default();
+                            serde_json::json!({
+                                "cell_index": index,
+                                "neighbors": neighbors,
+                                "position": position,
+                                "surface": surface_label(cell.surface),
+                                "height": cell.height,
+                                "slope": cell.slope,
+                                "buildable": cell.buildable,
+                                "building": self.buildings.get(&(index as u32))
+                                    .map(|building| building.kind.label().to_lowercase()),
+                                "deposits": cell.deposits.iter().map(|deposit| {
+                                    serde_json::json!({
+                                        "kind": resource_name(deposit.kind),
+                                        "initial_amount": deposit.initial_amount,
+                                        "remaining_amount": deposit.remaining_amount,
+                                        "grade_permille": deposit.grade_permille,
+                                    })
+                                }).collect::<Vec<_>>(),
+                            })
+                        })
+                        .collect::<Vec<_>>()
+                };
+                ApiReply::json(
+                    200,
+                    serde_json::json!({
+                        "offset": offset,
+                        "limit": limit,
+                        "total": world.cells.len(),
+                        "cells": cells,
+                    }),
+                )
+            }
+            ApiCommand::Buildings => {
+                if self.sim_world.is_none() {
+                    return ApiReply::error(
+                        503,
+                        "planet_not_ready",
+                        "planet simulation is still loading",
+                    );
+                }
+                let mut indices = self.buildings.keys().copied().collect::<Vec<_>>();
+                indices.sort_unstable();
+                let buildings = indices
+                    .into_iter()
+                    .filter_map(|cell_index| {
+                        let building = self.buildings.get(&cell_index)?;
+                        let mut storage = building
+                            .storage
+                            .iter()
+                            .map(|(kind, amount)| (resource_name(*kind), amount))
+                            .collect::<Vec<_>>();
+                        storage.sort_by_key(|(kind, _)| *kind);
+                        Some(serde_json::json!({
+                            "cell_index": cell_index,
+                            "kind": building.kind.label().to_lowercase(),
+                            "build_progress": building.build_progress,
+                            "build_time": building.build_time,
+                            "build_paid": building.build_paid,
+                            "storage": storage.into_iter().map(|(kind, amount)| {
+                                serde_json::json!({ "kind": kind, "amount": amount })
+                            }).collect::<Vec<_>>(),
+                        }))
+                    })
+                    .collect::<Vec<_>>();
+                ApiReply::json(200, serde_json::json!({ "buildings": buildings }))
+            }
+            ApiCommand::Units => {
+                if self.sim_world.is_none() {
+                    return ApiReply::error(
+                        503,
+                        "planet_not_ready",
+                        "planet simulation is still loading",
+                    );
+                }
+                let units = self
+                    .units
+                    .iter()
+                    .enumerate()
+                    .map(|(unit_index, unit)| {
+                        serde_json::json!({
+                            "unit_index": unit_index,
+                            "preset": unit_preset_name(unit.preset_id),
+                            "definition": format!("{:?}", unit.definition_id).to_lowercase(),
+                            "depot": unit.depot,
+                            "current_cell": unit.current_cell(),
+                            "nodes": {
+                                "pickup": unit.nodes.pickup,
+                                "dropoff": unit.nodes.dropoff,
+                                "refuel": unit.nodes.refuel,
+                                "construction": unit.nodes.construction,
+                                "wait": unit.nodes.wait,
+                            },
+                            "current_action": unit.current_action.as_ref().map(|action| format!("{action:?}")),
+                            "current_target": unit.current_target,
+                            "fuel": unit.fuel,
+                            "fuel_capacity": unit.fuel_capacity,
+                            "cargo": unit.cargo.iter().map(|stack| {
+                                serde_json::json!({
+                                    "kind": resource_kind_from_id(stack.resource_id).map(resource_name),
+                                    "amount": stack.amount,
+                                })
+                            }).collect::<Vec<_>>(),
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                ApiReply::json(200, serde_json::json!({ "units": units }))
+            }
+            ApiCommand::PlaceBuilding { cell, kind } => {
+                let Some(world) = self.sim_world.as_ref() else {
+                    return ApiReply::error(
+                        503,
+                        "planet_not_ready",
+                        "planet simulation is still loading",
+                    );
+                };
+                if world.cells.get(cell as usize).is_none() {
+                    return ApiReply::error(
+                        404,
+                        "cell_not_found",
+                        "cell index is outside the planet grid",
+                    );
+                }
+                let kind = match kind {
+                    ApiBuildingKind::Base => PlanetBuildingKind::Base,
+                    ApiBuildingKind::Builder => PlanetBuildingKind::Builder,
+                    ApiBuildingKind::Housing => PlanetBuildingKind::Housing,
+                    ApiBuildingKind::Factory => PlanetBuildingKind::Factory,
+                    ApiBuildingKind::Mine => PlanetBuildingKind::Mine,
+                    ApiBuildingKind::Warehouse => PlanetBuildingKind::Warehouse,
+                    ApiBuildingKind::Refuel => PlanetBuildingKind::Refuel,
+                    ApiBuildingKind::Logistics => PlanetBuildingKind::Logistics,
+                    ApiBuildingKind::Route => PlanetBuildingKind::Route,
+                };
+                if !self.place_building(cell, kind) {
+                    return ApiReply::error(
+                        409,
+                        "building_not_allowed",
+                        "cell is occupied, not buildable, or has no deposit for a mine",
+                    );
+                }
+                ApiReply::json(
+                    201,
+                    serde_json::json!({
+                        "cell_index": cell,
+                        "kind": kind.label().to_lowercase(),
+                    }),
+                )
+            }
+            ApiCommand::RemoveBuilding { cell } => {
+                if self.sim_world.is_none() {
+                    return ApiReply::error(
+                        503,
+                        "planet_not_ready",
+                        "planet simulation is still loading",
+                    );
+                }
+                if !self.remove_building(cell) {
+                    return ApiReply::error(
+                        404,
+                        "building_not_found",
+                        "no building exists at that cell",
+                    );
+                }
+                ApiReply::json(
+                    200,
+                    serde_json::json!({ "removed": true, "cell_index": cell }),
+                )
+            }
+            ApiCommand::SpawnUnit {
+                depot,
+                preset,
+                nodes,
+            } => self.spawn_api_unit(depot, preset, nodes),
+            ApiCommand::GetBaseInterior { base_cell } => self.api_base_interior_snapshot(base_cell),
+            ApiCommand::PlaceInteriorBlock {
+                base_cell,
+                hex,
+                kind,
+                rotation,
+            } => self.api_place_interior_block(base_cell, hex, kind, rotation),
+            ApiCommand::RotateInteriorBlock {
+                base_cell,
+                hex,
+                rotation,
+            } => self.api_rotate_interior_block(base_cell, hex, rotation),
+            ApiCommand::RemoveInteriorBlock { base_cell, hex } => {
+                self.api_remove_interior_block(base_cell, hex)
+            }
+            ApiCommand::SetAssemblerRecipe {
+                base_cell,
+                hex,
+                recipe,
+            } => self.api_set_assembler_recipe(base_cell, hex, recipe),
+            ApiCommand::ConfigureMechanicArm {
+                base_cell,
+                hex,
+                config,
+            } => self.api_configure_mechanic_arm(base_cell, hex, config),
+        }
+    }
+
+    fn api_base_interior(&self, base_cell: u32) -> Result<&BaseInteriorState, ApiReply> {
+        let Some(building) = self.buildings.get(&base_cell) else {
+            return Err(ApiReply::error(
+                404,
+                "building_not_found",
+                "no building exists at base_cell",
+            ));
+        };
+        if building.kind != PlanetBuildingKind::Base {
+            return Err(ApiReply::error(
+                409,
+                "not_a_base",
+                "base_cell does not contain a base",
+            ));
+        }
+        building.interior.as_ref().ok_or_else(|| {
+            ApiReply::error(
+                500,
+                "base_interior_unavailable",
+                "the base has no interior state",
+            )
+        })
+    }
+
+    fn api_base_interior_mut(
+        &mut self,
+        base_cell: u32,
+    ) -> Result<&mut BaseInteriorState, ApiReply> {
+        let Some(building) = self.buildings.get_mut(&base_cell) else {
+            return Err(ApiReply::error(
+                404,
+                "building_not_found",
+                "no building exists at base_cell",
+            ));
+        };
+        if building.kind != PlanetBuildingKind::Base {
+            return Err(ApiReply::error(
+                409,
+                "not_a_base",
+                "base_cell does not contain a base",
+            ));
+        }
+        building.interior.as_mut().ok_or_else(|| {
+            ApiReply::error(
+                500,
+                "base_interior_unavailable",
+                "the base has no interior state",
+            )
+        })
+    }
+
+    fn api_base_interior_snapshot(&self, base_cell: u32) -> ApiReply {
+        let interior = match self.api_base_interior(base_cell) {
+            Ok(interior) => interior,
+            Err(reply) => return reply,
+        };
+        let mut blocks: Vec<_> = interior.blocks.iter().collect();
+        blocks.sort_by_key(|record| (record.hex.q, record.hex.r));
+        let mut containers: Vec<_> = interior.containers.iter().collect();
+        containers.sort_by_key(|record| (record.hex.q, record.hex.r));
+        let mut arms: Vec<_> = interior.mechanic_arms.iter().collect();
+        arms.sort_by_key(|arm| (arm.hex.q, arm.hex.r));
+        let mut assemblers: Vec<_> = interior.assembly_nodes.iter().collect();
+        assemblers.sort_by_key(|node| (node.hex.q, node.hex.r));
+        let mut forklifts: Vec<_> = interior.forklifts.iter().collect();
+        forklifts.sort_by_key(|forklift| forklift.id);
+
+        ApiReply::json(
+            200,
+            serde_json::json!({
+                "base_cell": base_cell,
+                "blocks": blocks.iter().map(|record| serde_json::json!({
+                    "hex": record.hex,
+                    "kind": interior_block_name(record.block.kind),
+                    "rotation": record.block.rotation,
+                })).collect::<Vec<_>>(),
+                "containers": containers.iter().map(|container| serde_json::json!({
+                    "hex": container.hex,
+                    "items": container.items.iter().map(|stack| serde_json::json!({
+                        "kind": interior_part_name(stack.kind),
+                        "amount": stack.amount,
+                    })).collect::<Vec<_>>(),
+                })).collect::<Vec<_>>(),
+                "belt_items": interior.belt_items.iter().map(|item| serde_json::json!({
+                    "hex": item.hex,
+                    "kind": interior_part_name(item.kind),
+                    "progress": item.progress,
+                })).collect::<Vec<_>>(),
+                "mechanic_arms": arms.iter().map(|arm| serde_json::json!({
+                    "hex": arm.hex,
+                    "held": arm.held.map(interior_part_name),
+                    "input_mode": arm_input_mode_name(arm.input_mode),
+                    "input_hexes": arm.input_hexes,
+                    "output_hexes": arm.output_hexes,
+                    "filters": arm.filters.iter().copied().map(interior_part_name).collect::<Vec<_>>(),
+                    "action_stage": format!("{:?}", arm.action_stage).to_lowercase(),
+                    "action_origin": arm.action_origin,
+                    "action_target": arm.action_target,
+                    "action_progress": arm.action_progress,
+                })).collect::<Vec<_>>(),
+                "assemblers": assemblers.iter().map(|node| serde_json::json!({
+                    "hex": node.hex,
+                    "recipe": assembler_recipe_name(node.selected_recipe),
+                    "inserted": node.inserted.iter().copied().map(interior_part_name).collect::<Vec<_>>(),
+                    "completed_outputs": node.completed_outputs.iter().map(|stack| serde_json::json!({
+                        "kind": interior_part_name(stack.kind),
+                        "amount": stack.amount,
+                    })).collect::<Vec<_>>(),
+                })).collect::<Vec<_>>(),
+                "forklifts": forklifts.iter().map(|forklift| serde_json::json!({
+                    "id": forklift.id,
+                    "hex": forklift.hex,
+                    "home": forklift.home,
+                    "target": forklift.target,
+                    "carried": forklift.carried.map(interior_part_name),
+                    "request_target": forklift.request_target,
+                    "source_hex": forklift.source_hex,
+                    "carried_block": forklift.carried_block.map(interior_block_name),
+                    "carried_items": forklift.carried_items.iter().map(|stack| serde_json::json!({
+                        "kind": interior_part_name(stack.kind),
+                        "amount": stack.amount,
+                    })).collect::<Vec<_>>(),
+                    "route": forklift.route,
+                    "route_index": forklift.route_index,
+                })).collect::<Vec<_>>(),
+                "logistics_requests": interior.logistics_requests.iter().map(|request| serde_json::json!({
+                    "requester_hex": request.requester_hex,
+                    "target_hex": request.target_hex,
+                    "required_filter": request.required_filter.map(interior_part_name),
+                    "assigned_forklift": request.assigned_forklift,
+                })).collect::<Vec<_>>(),
+                "builder_tender_kits": interior.builder_tender_kits(),
+            }),
+        )
+    }
+
+    fn api_place_interior_block(
+        &mut self,
+        base_cell: u32,
+        hex: Axial,
+        kind: ApiInteriorBlockKind,
+        rotation: u8,
+    ) -> ApiReply {
+        if !in_bounds(hex, MapOutline::Hexagon) {
+            return ApiReply::error(
+                400,
+                "interior_out_of_bounds",
+                "hex is outside the base interior",
+            );
+        }
+        if rotation >= 6 {
+            return ApiReply::error(400, "invalid_rotation", "rotation must be between 0 and 5");
+        }
+        let interior = match self.api_base_interior_mut(base_cell) {
+            Ok(interior) => interior,
+            Err(reply) => return reply,
+        };
+        if interior.block_at(hex).is_some() {
+            return ApiReply::error(
+                409,
+                "interior_block_occupied",
+                "another block already occupies hex",
+            );
+        }
+        let block_kind = api_block_kind(kind);
+        interior.upsert_block(
+            hex,
+            MachineBlock {
+                kind: block_kind,
+                rotation,
+            },
+        );
+        self.buildings_dirty = true;
+        ApiReply::json(
+            201,
+            serde_json::json!({
+                "placed": true,
+                "base_cell": base_cell,
+                "hex": hex,
+                "kind": interior_block_name(block_kind),
+                "rotation": rotation,
+            }),
+        )
+    }
+
+    fn api_rotate_interior_block(&mut self, base_cell: u32, hex: Axial, rotation: u8) -> ApiReply {
+        if !in_bounds(hex, MapOutline::Hexagon) {
+            return ApiReply::error(
+                400,
+                "interior_out_of_bounds",
+                "hex is outside the base interior",
+            );
+        }
+        if rotation >= 6 {
+            return ApiReply::error(400, "invalid_rotation", "rotation must be between 0 and 5");
+        }
+        let interior = match self.api_base_interior_mut(base_cell) {
+            Ok(interior) => interior,
+            Err(reply) => return reply,
+        };
+        let Some(block) = interior.block_at_mut(hex) else {
+            return ApiReply::error(404, "interior_block_not_found", "no block exists at hex");
+        };
+        block.rotation = rotation;
+        let kind = block.kind;
+        self.buildings_dirty = true;
+        ApiReply::json(
+            200,
+            serde_json::json!({
+                "rotated": true,
+                "base_cell": base_cell,
+                "hex": hex,
+                "kind": interior_block_name(kind),
+                "rotation": rotation,
+            }),
+        )
+    }
+
+    fn api_remove_interior_block(&mut self, base_cell: u32, hex: Axial) -> ApiReply {
+        if !in_bounds(hex, MapOutline::Hexagon) {
+            return ApiReply::error(
+                400,
+                "interior_out_of_bounds",
+                "hex is outside the base interior",
+            );
+        }
+        let interior = match self.api_base_interior_mut(base_cell) {
+            Ok(interior) => interior,
+            Err(reply) => return reply,
+        };
+        if interior.block_at(hex).is_none() {
+            return ApiReply::error(404, "interior_block_not_found", "no block exists at hex");
+        }
+        interior.remove_block(hex);
+        self.buildings_dirty = true;
+        ApiReply::json(
+            200,
+            serde_json::json!({
+                "removed": true,
+                "base_cell": base_cell,
+                "hex": hex,
+            }),
+        )
+    }
+
+    fn api_set_assembler_recipe(
+        &mut self,
+        base_cell: u32,
+        hex: Axial,
+        recipe: ApiAssemblerRecipe,
+    ) -> ApiReply {
+        if !in_bounds(hex, MapOutline::Hexagon) {
+            return ApiReply::error(
+                400,
+                "interior_out_of_bounds",
+                "hex is outside the base interior",
+            );
+        }
+        let recipe = api_recipe(recipe);
+        let interior = match self.api_base_interior_mut(base_cell) {
+            Ok(interior) => interior,
+            Err(reply) => return reply,
+        };
+        if interior.block_at(hex).map(|block| block.kind) != Some(MachineBlockType::Assembler) {
+            return ApiReply::error(409, "not_an_assembler", "hex must contain an assembler");
+        }
+        if !interior.set_assembler_recipe(hex, recipe) {
+            return ApiReply::error(
+                409,
+                "assembler_busy",
+                "assembler recipe cannot change while it has inputs or completed output",
+            );
+        }
+        self.buildings_dirty = true;
+        ApiReply::json(
+            200,
+            serde_json::json!({
+                "configured": true,
+                "base_cell": base_cell,
+                "hex": hex,
+                "recipe": assembler_recipe_name(recipe),
+            }),
+        )
+    }
+
+    fn api_configure_mechanic_arm(
+        &mut self,
+        base_cell: u32,
+        hex: Axial,
+        config: ApiMechanicArmConfig,
+    ) -> ApiReply {
+        if !in_bounds(hex, MapOutline::Hexagon) {
+            return ApiReply::error(
+                400,
+                "interior_out_of_bounds",
+                "hex is outside the base interior",
+            );
+        }
+        let input_mode = api_arm_input_mode(config.input_mode);
+        if input_mode == MechanicArmInputMode::AnyNeighbor && !config.input_hexes.is_empty() {
+            return ApiReply::error(
+                400,
+                "invalid_arm_inputs",
+                "input_hexes must be empty when input_mode is any_neighbor",
+            );
+        }
+        let input_hexes = config.input_hexes;
+        let output_hexes = config.output_hexes;
+        let mut filters: Vec<_> = config.filters.into_iter().map(api_part_kind).collect();
+        filters.sort_by_key(|kind| interior_part_name(*kind));
+        if filters
+            .iter()
+            .any(|kind| !all_interior_filter_parts().contains(kind))
+        {
+            return ApiReply::error(
+                400,
+                "invalid_arm_filter",
+                "filters must contain component parts only",
+            );
+        }
+        if filters.iter().collect::<HashSet<_>>().len() != filters.len() {
+            return ApiReply::error(
+                400,
+                "duplicate_arm_filter",
+                "filters must not contain duplicates",
+            );
+        }
+        let interior = match self.api_base_interior_mut(base_cell) {
+            Ok(interior) => interior,
+            Err(reply) => return reply,
+        };
+        if interior.block_at(hex).map(|block| block.kind) != Some(MachineBlockType::MechanicArm) {
+            return ApiReply::error(409, "not_a_mechanic_arm", "hex must contain a mechanic arm");
+        }
+        let neighbors = axial_neighbors(hex);
+        let mut seen_inputs = HashSet::new();
+        if input_hexes.iter().any(|target| {
+            !neighbors.contains(target)
+                || interior.block_at(*target).is_none()
+                || !seen_inputs.insert(*target)
+        }) {
+            return ApiReply::error(
+                400,
+                "invalid_arm_inputs",
+                "input_hexes must be unique, adjacent occupied hexes",
+            );
+        }
+        let mut seen_outputs = HashSet::new();
+        if output_hexes.iter().any(|target| {
+            !neighbors.contains(target)
+                || interior.block_at(*target).is_none()
+                || !seen_outputs.insert(*target)
+        }) {
+            return ApiReply::error(
+                400,
+                "invalid_arm_outputs",
+                "output_hexes must be unique, adjacent occupied hexes",
+            );
+        }
+        let Some(arm) = interior.mechanic_arm_mut(hex) else {
+            return ApiReply::error(
+                500,
+                "mechanic_arm_state_missing",
+                "the mechanic arm has no runtime state",
+            );
+        };
+        arm.input_mode = input_mode;
+        arm.input_hexes = input_hexes;
+        arm.output_hexes = output_hexes;
+        arm.filters = filters;
+        let response = serde_json::json!({
+            "configured": true,
+            "base_cell": base_cell,
+            "hex": hex,
+            "input_mode": arm_input_mode_name(input_mode),
+            "input_hexes": arm.input_hexes,
+            "output_hexes": arm.output_hexes,
+            "filters": arm.filters.iter().copied().map(interior_part_name).collect::<Vec<_>>(),
+        });
+        self.buildings_dirty = true;
+        ApiReply::json(200, response)
+    }
+
+    fn spawn_api_unit(
+        &mut self,
+        depot: u32,
+        preset: ApiUnitPreset,
+        nodes: ApiUnitNodes,
+    ) -> ApiReply {
+        let Some(world) = self.sim_world.as_ref() else {
+            return ApiReply::error(
+                503,
+                "planet_not_ready",
+                "planet simulation is still loading",
+            );
+        };
+        if world.cells.get(depot as usize).is_none() {
+            return ApiReply::error(
+                404,
+                "cell_not_found",
+                "depot cell is outside the planet grid",
+            );
+        }
+        let expected_depot = match preset {
+            ApiUnitPreset::Hauler | ApiUnitPreset::Shuttle => PlanetBuildingKind::Logistics,
+            ApiUnitPreset::BuilderSupply => PlanetBuildingKind::Builder,
+        };
+        if self.buildings.get(&depot).map(|building| building.kind) != Some(expected_depot) {
+            return ApiReply::error(
+                409,
+                "invalid_depot",
+                "unit preset requires a matching Logistics or Builder depot",
+            );
+        }
+
+        let node_config = crate::core::planet_units::PlanetUnitNodeConfig {
+            pickup: nodes.pickup,
+            dropoff: nodes.dropoff,
+            refuel: nodes.refuel,
+            construction: nodes.construction,
+            wait: nodes.wait,
+        };
+        let required_nodes_valid = match preset {
+            ApiUnitPreset::Hauler | ApiUnitPreset::Shuttle => {
+                node_config.pickup.is_some() && node_config.dropoff.is_some()
+            }
+            ApiUnitPreset::BuilderSupply => {
+                node_config.pickup.is_some() && node_config.construction.is_some()
+            }
+        };
+        if !required_nodes_valid {
+            return ApiReply::error(
+                400,
+                "missing_unit_nodes",
+                "preset is missing required route nodes",
+            );
+        }
+        let referenced_nodes = [
+            node_config.pickup,
+            node_config.dropoff,
+            node_config.refuel,
+            node_config.construction,
+            node_config.wait,
+        ];
+        if referenced_nodes.into_iter().flatten().any(|cell| {
+            world.cells.get(cell as usize).is_none() || !self.buildings.contains_key(&cell)
+        }) {
+            return ApiReply::error(
+                404,
+                "invalid_unit_node",
+                "every unit node must refer to an existing planet building",
+            );
+        }
+        if let Some(refuel) = node_config.refuel {
+            if self.buildings.get(&refuel).map(|building| building.kind)
+                != Some(PlanetBuildingKind::Refuel)
+            {
+                return ApiReply::error(
+                    409,
+                    "invalid_refuel_node",
+                    "unit refuel node must refer to a Refuel building",
+                );
+            }
+        }
+        let definition_id = match preset {
+            ApiUnitPreset::Hauler => PlanetUnitDefinitionId::CargoHauler,
+            ApiUnitPreset::BuilderSupply => PlanetUnitDefinitionId::BuilderTender,
+            ApiUnitPreset::Shuttle => PlanetUnitDefinitionId::SiteShuttle,
+        };
+        let (unit_index, kit_consumed) = match create_planet_unit(
+            &mut self.buildings,
+            &mut self.units,
+            definition_id,
+            depot,
+            node_config,
+        ) {
+            Ok(result) => result,
+            Err(UnitSpawnError::MissingBuilderTenderKit) => {
+                return ApiReply::error(
+                    409,
+                    "missing_unit_kit",
+                    "no Builder Tender kit is available",
+                );
+            }
+            Err(UnitSpawnError::UnsupportedDefinition) => {
+                return ApiReply::error(
+                    409,
+                    "unsupported_unit",
+                    "unit definition cannot be spawned",
+                );
+            }
+        };
+        self.units_dirty = true;
+        if kit_consumed {
+            self.buildings_dirty = true;
+        }
+        ApiReply::json(
+            201,
+            serde_json::json!({ "unit_index": unit_index, "depot": depot }),
+        )
+    }
+
     pub fn from_build_data(data: PlanetBuildData) -> Self {
         let PlanetBuildData {
             config,
@@ -1399,18 +2319,6 @@ impl PlanetState {
             .filter_map(|building| building.interior.as_ref())
             .map(|interior| interior.builder_tender_kits())
             .sum()
-    }
-
-    pub fn consume_builder_tender_kit(&mut self) -> bool {
-        for building in self.buildings.values_mut() {
-            if let Some(interior) = building.interior.as_mut() {
-                if interior.consume_builder_tender_kit() {
-                    self.buildings_dirty = true;
-                    return true;
-                }
-            }
-        }
-        false
     }
 
     fn update_base_interiors(&mut self, dt: f32) {
@@ -3898,11 +4806,7 @@ pub fn run(
     greek_font: Option<&Font>,
 ) {
     if is_key_pressed(KeyCode::Escape) {
-        if let Some(sim_world) = state.sim_world.as_mut() {
-            sim_world.save_if_dirty(PLANET_RESOURCES_PATH);
-        }
-        state.save_buildings_if_dirty(PLANET_BUILDINGS_PATH);
-        state.save_units_if_dirty(PLANET_UNITS_PATH);
+        state.save_gameplay_state();
         *scene = Scene::MainMenu;
         return;
     }
@@ -5162,7 +6066,7 @@ pub fn run(
                                     state.auto_select_builder_nodes(cell_index);
                                     if state.available_builder_tender_kits() > 0 {
                                         if let (Some(source), Some(target)) =
-                                        (state.spawn_pickup_node, state.spawn_construction_node)
+                                            (state.spawn_pickup_node, state.spawn_construction_node)
                                         {
                                             spawn_request = Some((
                                                 cell_index,
@@ -5337,14 +6241,16 @@ pub fn run(
         }
     }
     if let Some((depot, definition_id, nodes)) = spawn_request {
-        let can_spawn = match definition_id {
-            PlanetUnitDefinitionId::BuilderTender => state.consume_builder_tender_kit(),
-            _ => true,
-        };
-        if can_spawn {
-            if let Some(unit) = unit_for_definition(definition_id, depot, nodes) {
-                state.units.push(unit);
-                state.units_dirty = true;
+        if let Ok((_, kit_consumed)) = create_planet_unit(
+            &mut state.buildings,
+            &mut state.units,
+            definition_id,
+            depot,
+            nodes,
+        ) {
+            state.units_dirty = true;
+            if kit_consumed {
+                state.buildings_dirty = true;
             }
         }
     }
@@ -5522,6 +6428,119 @@ mod tests {
             deposits,
             buildable: true,
         }
+    }
+
+    fn test_building_with_builder_kits(kits: u32) -> PlanetBuildingState {
+        let mut building = test_building();
+        building.kind = PlanetBuildingKind::Base;
+        let mut interior = BaseInteriorState::default();
+        interior.blocks.clear();
+        interior.containers.clear();
+        interior.belt_items.clear();
+        interior.mechanic_arms.clear();
+        interior.assembly_nodes.clear();
+        interior.forklifts.clear();
+        interior.logistics_requests.clear();
+        if kits > 0 {
+            interior
+                .assembly_nodes
+                .push(crate::core::base_interior::AssemblyNodeState {
+                    hex: Axial { q: 0, r: 0 },
+                    selected_recipe: AssemblerRecipeId::BuilderTender,
+                    inserted: Vec::new(),
+                    completed_outputs: vec![crate::core::base_interior::InteriorPartStack {
+                        kind: InteriorPartKind::BuilderTenderKit,
+                        amount: kits,
+                    }],
+                });
+        }
+        building.interior = Some(interior);
+        building
+    }
+
+    fn empty_unit_nodes() -> PlanetUnitNodeConfig {
+        PlanetUnitNodeConfig {
+            pickup: None,
+            dropoff: None,
+            refuel: None,
+            construction: None,
+            wait: None,
+        }
+    }
+
+    #[test]
+    fn builder_tender_spawn_rejects_missing_kit_without_adding_unit() {
+        let mut buildings = HashMap::from([(0, test_building_with_builder_kits(0))]);
+        let mut units = Vec::new();
+
+        let result = create_planet_unit(
+            &mut buildings,
+            &mut units,
+            PlanetUnitDefinitionId::BuilderTender,
+            0,
+            empty_unit_nodes(),
+        );
+
+        assert_eq!(result, Err(UnitSpawnError::MissingBuilderTenderKit));
+        assert!(units.is_empty());
+        assert_eq!(
+            buildings[&0]
+                .interior
+                .as_ref()
+                .unwrap()
+                .builder_tender_kits(),
+            0
+        );
+    }
+
+    #[test]
+    fn builder_tender_spawn_consumes_one_completed_kit() {
+        let mut buildings = HashMap::from([(0, test_building_with_builder_kits(2))]);
+        let mut units = Vec::new();
+
+        let result = create_planet_unit(
+            &mut buildings,
+            &mut units,
+            PlanetUnitDefinitionId::BuilderTender,
+            0,
+            empty_unit_nodes(),
+        );
+
+        assert_eq!(result, Ok((0, true)));
+        assert_eq!(units.len(), 1);
+        assert_eq!(
+            buildings[&0]
+                .interior
+                .as_ref()
+                .unwrap()
+                .builder_tender_kits(),
+            1
+        );
+    }
+
+    #[test]
+    fn failed_unit_definition_does_not_consume_builder_tender_kit() {
+        let mut buildings = HashMap::from([(0, test_building_with_builder_kits(1))]);
+        let mut units = Vec::new();
+
+        let result = create_planet_unit(
+            &mut buildings,
+            &mut units,
+            PlanetUnitDefinitionId::ModularExcavator,
+            0,
+            empty_unit_nodes(),
+        );
+
+        assert_eq!(result, Err(UnitSpawnError::UnsupportedDefinition));
+        assert!(units.is_empty());
+        assert_eq!(
+            buildings[&0]
+                .interior
+                .as_ref()
+                .unwrap()
+                .builder_tender_kits(),
+            1
+        );
     }
 
     #[test]

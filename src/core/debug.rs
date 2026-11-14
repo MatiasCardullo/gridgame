@@ -3,8 +3,8 @@ use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::core::ui::ui_button;
 use crate::core::FrameContext;
+use crate::core::ui::ui_button;
 use crate::scenes::planet::PlanetState;
 
 pub const PLANET_DEBUG_UI_ENABLED_DEFAULT: bool = false;
@@ -13,10 +13,7 @@ pub const SAVE_MESH_POINTS_RUNTIME: bool = false;
 
 // Formats timestamps in `[HH:MM:SS]` for debug/perf logs.
 pub fn format_log_timestamp(now: SystemTime) -> String {
-    let since_epoch = now
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
+    let since_epoch = now.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
     let secs = since_epoch % 86_400;
     let h = secs / 3600;
     let m = (secs % 3600) / 60;
@@ -41,7 +38,14 @@ pub fn planet_perf_log(line: &str) {
 pub fn draw_planet_controls(ctx: &FrameContext, state: &mut PlanetState, noise_path: &str) {
     let panel = Rect::new(18.0, 18.0, 260.0, 254.0);
     draw_rectangle(panel.x, panel.y, panel.w, panel.h, ctx.colors_rt.panel_bg);
-    draw_rectangle_lines(panel.x, panel.y, panel.w, panel.h, 1.5, ctx.colors_rt.panel_border);
+    draw_rectangle_lines(
+        panel.x,
+        panel.y,
+        panel.w,
+        panel.h,
+        1.5,
+        ctx.colors_rt.panel_border,
+    );
     draw_text(
         "Planet Terrain",
         panel.x + 12.0,
@@ -162,9 +166,21 @@ pub fn draw_planet_controls(ctx: &FrameContext, state: &mut PlanetState, noise_p
     y += step;
 
     let rect_load = Rect::new(x, y, 110.0, 26.0);
-    let (clicked_load, _) = ui_button(rect_load, "Load JSON", ctx.mouse, ctx.font_sm, ctx.button_colors);
+    let (clicked_load, _) = ui_button(
+        rect_load,
+        "Load JSON",
+        ctx.mouse,
+        ctx.font_sm,
+        ctx.button_colors,
+    );
     let rect_save = Rect::new(x + 120.0, y, 110.0, 26.0);
-    let (clicked_save, _) = ui_button(rect_save, "Save JSON", ctx.mouse, ctx.font_sm, ctx.button_colors);
+    let (clicked_save, _) = ui_button(
+        rect_save,
+        "Save JSON",
+        ctx.mouse,
+        ctx.font_sm,
+        ctx.button_colors,
+    );
 
     if changed {
         planet_perf_log("panel changed -> clear relief cache and regenerate");

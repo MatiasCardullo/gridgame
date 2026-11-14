@@ -351,9 +351,9 @@ pub fn build_frequency_geodesic(
     let mut edge_cache: HashMap<(usize, usize), Vec<usize>> = HashMap::new();
 
     let edge_indices = |a: usize,
-                            b: usize,
-                            vertices: &mut Vec<Vec3>,
-                            edge_cache: &mut HashMap<(usize, usize), Vec<usize>>|
+                        b: usize,
+                        vertices: &mut Vec<Vec3>,
+                        edge_cache: &mut HashMap<(usize, usize), Vec<usize>>|
      -> Vec<usize> {
         let key = if a < b { (a, b) } else { (b, a) };
         if let Some(indices) = edge_cache.get(&key) {

@@ -29,6 +29,14 @@ cargo test
 - Logistics and Builder units with cargo, depots, routes, construction supply, and role-specific auto-supply.
 - Base interior scene with a 3D camera, conveyors, mechanic arms, pallets, crates, chests, assemblers, furnaces, and forklifts.
 - Build-template sandbox for testing interior machine layouts and first-person movement.
+- Local REST API for observing and controlling planet buildings and logistics units.
+
+## Local REST API
+
+When GridGame starts, it serves a versioned JSON API at `http://127.0.0.1:39123/api/v1`.
+It binds only to loopback; clients on other machines cannot connect. The API has no
+authentication, so only use it on a trusted computer. See [docs/api.md](docs/api.md)
+for endpoints and request examples.
 
 ## Controls
 

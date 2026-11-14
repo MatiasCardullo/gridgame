@@ -166,27 +166,106 @@ fn draw_hex_outline(hex: Axial, y: f32, color: Color) {
     );
 }
 
-fn arm_hand_world(arm_hex: Axial, rest_rotation: u8, target: Option<Axial>, progress: f32) -> Vec3 {
-    let center = hex_world_center(arm_hex, ARM_BASE_HEIGHT);
-    let rest_dir = rotation_dir(rest_rotation);
-    let arm_len = HEX_SIZE * 0.68;
+fn arm_home_hand(arm_hex: Axial, rest_rotation: u8) -> Vec3 {
+    hex_world_center(arm_hex, ARM_BASE_HEIGHT + 8.0)
+        + rotation_dir(rest_rotation) * (HEX_SIZE * 1.65)
+}
+
+fn arm_target_hand(interior: &BaseInteriorState, target_hex: Axial) -> Vec3 {
+    let target_height = match interior.block_at(target_hex).map(|block| block.kind) {
+        Some(MachineBlockType::ConveyorBelt) => BLOCK_Y + 10.4,
+        Some(MachineBlockType::Crate | MachineBlockType::Chest | MachineBlockType::Pallet) => {
+            BLOCK_Y + 16.5
+        }
+        Some(MachineBlockType::Assembler) => BLOCK_Y + 16.0,
+        _ => BLOCK_Y + 12.0,
+    };
+    hex_world_center(target_hex, target_height)
+}
+
+fn ease_arm_motion(progress: f32) -> f32 {
+    let progress = progress.clamp(0.0, 1.0);
+    progress * progress * (3.0 - 2.0 * progress)
+}
+
+fn arm_hand_world(
+    interior: &BaseInteriorState,
+    arm_hex: Axial,
+    rest_rotation: u8,
+    action_origin: Option<Axial>,
+    target: Option<Axial>,
+    progress: f32,
+    stage: MechanicArmActionStage,
+) -> Vec3 {
+    let home = arm_home_hand(arm_hex, rest_rotation);
     let Some(target_hex) = target else {
-        return center + rest_dir * arm_len;
+        return home;
     };
-    let target_vec = hex_world_center(target_hex, ARM_BASE_HEIGHT) - center;
-    if target_vec.length_squared() <= f32::EPSILON {
-        return center;
+    let target_hand = arm_target_hand(interior, target_hex);
+    let (from, to, phase) = match stage {
+        MechanicArmActionStage::Pickup => (
+            action_origin
+                .map(|origin| arm_target_hand(interior, origin))
+                .unwrap_or(home),
+            target_hand,
+            progress,
+        ),
+        MechanicArmActionStage::Deliver => (
+            action_origin
+                .map(|origin| arm_target_hand(interior, origin))
+                .unwrap_or(home),
+            target_hand,
+            progress,
+        ),
+        MechanicArmActionStage::Retract => (target_hand, home, progress),
+        MechanicArmActionStage::Idle => return home,
+    };
+    let mut hand = from.lerp(to, ease_arm_motion(phase));
+    hand.y += (phase.clamp(0.0, 1.0) * std::f32::consts::PI).sin() * 5.0;
+    hand
+}
+
+fn draw_arm_link(start: Vec3, end: Vec3, width: f32, depth: f32, fill: Color, outline: Color) {
+    let delta = end - start;
+    let length = delta.length();
+    if length <= f32::EPSILON {
+        return;
     }
-    let target_dir = target_vec.normalize();
-    let sweep = if progress < 0.5 {
-        progress * 2.0
-    } else {
-        (1.0 - progress) * 2.0
-    };
-    let dir = rest_dir
-        .lerp(target_dir, sweep.clamp(0.0, 1.0))
-        .normalize_or_zero();
-    center + dir * arm_len
+    let axis = delta / length;
+    let mut side = axis.cross(vec3(0.0, 1.0, 0.0)).normalize_or_zero();
+    if side.length_squared() <= f32::EPSILON {
+        side = vec3(1.0, 0.0, 0.0);
+    }
+    let up = side.cross(axis).normalize_or_zero();
+    let x = axis * length;
+    let y = up * depth;
+    let z = side * width;
+    let origin = (start + end) * 0.5 - x * 0.5 - y * 0.5 - z * 0.5;
+    draw_affine_parallelepiped(origin, x, y, z, None, fill);
+    let p000 = origin;
+    let p100 = origin + x;
+    let p010 = origin + y;
+    let p110 = origin + x + y;
+    let p001 = origin + z;
+    let p101 = origin + x + z;
+    let p011 = origin + y + z;
+    let p111 = origin + x + y + z;
+    for (a, b) in [
+        (p000, p100),
+        (p000, p010),
+        (p000, p001),
+        (p100, p110),
+        (p100, p101),
+        (p010, p110),
+        (p010, p011),
+        (p001, p101),
+        (p001, p011),
+        (p110, p111),
+        (p101, p111),
+        (p011, p111),
+    ] {
+        draw_line_3d(a, b, outline);
+    }
 }
 
 fn forklift_world_center(from: Axial, to: Option<Axial>, progress: f32) -> Vec3 {
@@ -455,8 +534,8 @@ fn draw_machine_block(
         }
         MachineBlockType::MechanicArm => {
             draw_box(
-                center + vec3(0.0, 4.0, 0.0),
-                vec3(16.0, 8.0, 16.0),
+                center + vec3(0.0, 2.0, 0.0),
+                vec3(28.0, 4.0, 28.0),
                 fill,
                 outline,
                 wire_only,
@@ -611,62 +690,88 @@ fn draw_world(
     }
 
     for arm in &interior.mechanic_arms {
-        let base_center = hex_world_center(arm.hex, ARM_BASE_HEIGHT - 4.0);
-        let arm_center = hex_world_center(arm.hex, ARM_BASE_HEIGHT);
         let rest_rotation = interior
             .block_at(arm.hex)
             .map(|block| block.rotation)
             .unwrap_or(0);
+        let steel = Color::from_rgba(91, 107, 125, 255);
+        let dark_steel = Color::from_rgba(42, 52, 66, 255);
+        let accent = Color::from_rgba(239, 151, 59, 255);
         draw_box(
-            base_center,
-            vec3(10.0, 10.0, 10.0),
-            Color::from_rgba(82, 92, 106, 255),
+            hex_world_center(arm.hex, ARM_BASE_HEIGHT - 3.5),
+            vec3(18.0, 5.0, 18.0),
+            steel,
+            dark_steel,
+            false,
+        );
+        draw_box(
+            hex_world_center(arm.hex, ARM_BASE_HEIGHT + 3.0),
+            vec3(11.0, 7.0, 11.0),
+            dark_steel,
             colors.text_primary,
+            false,
+        );
+        draw_box(
+            hex_world_center(arm.hex, ARM_BASE_HEIGHT + 7.0),
+            vec3(8.0, 3.0, 8.0),
+            accent,
+            shade(accent, 0.58),
             false,
         );
         let hand = if arm.action_stage == MechanicArmActionStage::Idle {
-            arm_hand_world(arm.hex, rest_rotation, None, 0.0)
+            arm_home_hand(arm.hex, rest_rotation)
         } else {
             arm_hand_world(
+                interior,
                 arm.hex,
                 rest_rotation,
+                arm.action_origin,
                 arm.action_target,
                 arm.action_progress,
+                arm.action_stage,
             )
         };
-        draw_line_3d(arm_center, hand, colors.hover);
+        let shoulder = hex_world_center(arm.hex, ARM_BASE_HEIGHT + 8.0);
+        let elbow = shoulder.lerp(hand, 0.52) + vec3(0.0, 7.0, 0.0);
+        draw_arm_link(shoulder, elbow, 11.0, 9.0, steel, dark_steel);
+        draw_arm_link(elbow, hand, 9.0, 8.0, steel, dark_steel);
         draw_box(
-            hand,
-            vec3(4.0, 4.0, 4.0),
-            colors.hover,
-            colors.text_primary,
+            elbow,
+            vec3(12.0, 10.0, 12.0),
+            accent,
+            shade(accent, 0.55),
             false,
         );
+        draw_box(hand, vec3(10.0, 7.0, 10.0), dark_steel, steel, false);
+        let forward = vec3(hand.x - shoulder.x, 0.0, hand.z - shoulder.z).normalize_or_zero();
+        let side = vec3(-forward.z, 0.0, forward.x);
+        for offset in [-3.5_f32, 3.5] {
+            let finger_start = hand + side * offset;
+            draw_arm_link(
+                finger_start,
+                finger_start + forward * 9.0,
+                2.5,
+                2.5,
+                accent,
+                shade(accent, 0.55),
+            );
+        }
         let show_item = match arm.action_stage {
-            MechanicArmActionStage::Pickup => arm.action_progress >= 0.5,
-            MechanicArmActionStage::Deliver => true,
+            MechanicArmActionStage::Pickup => arm.action_progress >= 0.95 && arm.held.is_some(),
+            MechanicArmActionStage::Deliver | MechanicArmActionStage::Retract => arm.held.is_some(),
             MechanicArmActionStage::Idle => arm.held.is_some(),
         };
         if show_item {
             if let Some(kind) = arm.held {
                 let color = part_draw_color(kind);
                 draw_box(
-                    hand + vec3(0.0, 5.0, 0.0),
+                    hand + vec3(0.0, -5.0, 0.0) + forward * 3.0,
                     vec3(3.6, 3.6, 3.6),
                     color,
                     shade(color, 0.55),
                     false,
                 );
             }
-        } else if let Some(kind) = arm.held {
-            let color = part_draw_color(kind);
-            draw_box(
-                arm_center + vec3(0.0, 5.0, 0.0),
-                vec3(3.6, 3.6, 3.6),
-                color,
-                shade(color, 0.55),
-                false,
-            );
         }
         for output_hex in &arm.output_hexes {
             draw_line_3d(
@@ -990,9 +1095,6 @@ pub fn run(
                                     },
                                 );
                                 changed = true;
-                                if *block_type == MachineBlockType::MechanicArm {
-                                    state.begin_arm_output_pick(hover_hex);
-                                }
                             }
                         }
                         None => {
@@ -1054,20 +1156,7 @@ pub fn run(
 
     if is_key_pressed(KeyCode::Escape) {
         match state.interior_pick_mode() {
-            Some(InteriorPickMode::ArmOutputs(arm_hex)) => {
-                let mut remove_arm = false;
-                if let Some(interior) = state.active_base_interior() {
-                    remove_arm = interior
-                        .mechanic_arm(arm_hex)
-                        .map(|arm| arm.output_hexes.is_empty())
-                        .unwrap_or(false);
-                }
-                if remove_arm {
-                    if let Some(interior) = state.active_base_interior_mut() {
-                        interior.remove_block(arm_hex);
-                        state.mark_buildings_dirty();
-                    }
-                }
+            Some(InteriorPickMode::ArmOutputs(_)) => {
                 state.clear_interior_pick_mode();
             }
             Some(InteriorPickMode::ArmInputs(_)) => {
@@ -1086,19 +1175,7 @@ pub fn run(
     }
 
     if is_key_pressed(KeyCode::Enter) {
-        if let Some(InteriorPickMode::ArmOutputs(arm_hex)) = state.interior_pick_mode() {
-            let can_finish = state
-                .active_base_interior()
-                .and_then(|interior| interior.mechanic_arm(arm_hex))
-                .map(|arm| !arm.output_hexes.is_empty())
-                .unwrap_or(false);
-            if can_finish {
-                state.clear_interior_pick_mode();
-            }
-        } else if matches!(
-            state.interior_pick_mode(),
-            Some(InteriorPickMode::ArmInputs(_))
-        ) {
+        if state.interior_pick_mode().is_some() {
             state.clear_interior_pick_mode();
         }
     }

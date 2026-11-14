@@ -218,6 +218,12 @@ pub trait PlanetBuildingAccess {
     fn auto_units_enabled(&self) -> bool {
         true
     }
+    fn has_builder_tender_kit(&self) -> bool {
+        false
+    }
+    fn consume_builder_tender_kit(&mut self) -> bool {
+        false
+    }
 }
 
 pub struct UnitOps<K> {
@@ -393,6 +399,7 @@ fn next_builder_assignment<B: PlanetBuildingAccess>(
     reserved_targets: &[u32],
     neighbors: &[Vec<u32>],
     ops: &UnitOps<B::Kind>,
+    allow_direct_path: bool,
 ) -> Option<(u32, u32)> {
     let mut candidates: Vec<u32> = buildings
         .iter()
@@ -416,9 +423,9 @@ fn next_builder_assignment<B: PlanetBuildingAccess>(
         if let Some(source) = nearest_supply_with_items(buildings, target, &missing, ops) {
             if let Some(source_building) = buildings.get(&source) {
                 let depot_to_source =
-                    find_route_path_cells(depot, source, buildings, neighbors, ops);
+                    builder_path(allow_direct_path, depot, source, buildings, neighbors, ops);
                 let source_to_target =
-                    find_route_path_cells(source, target, buildings, neighbors, ops);
+                    builder_path(allow_direct_path, source, target, buildings, neighbors, ops);
                 if can_fulfill_reqs_from_building(source_building, &reqs)
                     && depot_to_source.is_some()
                     && source_to_target.is_some()
@@ -431,6 +438,21 @@ fn next_builder_assignment<B: PlanetBuildingAccess>(
     None
 }
 
+fn builder_path<B: PlanetBuildingAccess>(
+    allow_direct_path: bool,
+    start: u32,
+    end: u32,
+    buildings: &HashMap<u32, B>,
+    neighbors: &[Vec<u32>],
+    ops: &UnitOps<B::Kind>,
+) -> Option<Vec<u32>> {
+    if allow_direct_path {
+        find_direct_path_cells(start, end, neighbors)
+    } else {
+        find_route_path_cells(start, end, buildings, neighbors, ops)
+    }
+}
+
 fn builder_assignment_changed(unit: &PlanetUnit, target: u32, source: u32) -> bool {
     unit.nodes.construction != Some(target) || unit.nodes.pickup != Some(source)
 }
@@ -440,6 +462,7 @@ fn current_builder_assignment_valid<B: PlanetBuildingAccess>(
     buildings: &HashMap<u32, B>,
     neighbors: &[Vec<u32>],
     ops: &UnitOps<B::Kind>,
+    allow_direct_path: bool,
 ) -> bool {
     let Some(target) = unit.nodes.construction else {
         return false;
@@ -461,8 +484,16 @@ fn current_builder_assignment_valid<B: PlanetBuildingAccess>(
         return false;
     };
     can_fulfill_reqs_from_building(source_building, &reqs)
-        && find_route_path_cells(unit.depot, source, buildings, neighbors, ops).is_some()
-        && find_route_path_cells(source, target, buildings, neighbors, ops).is_some()
+        && builder_path(
+            allow_direct_path,
+            unit.depot,
+            source,
+            buildings,
+            neighbors,
+            ops,
+        )
+        .is_some()
+        && builder_path(allow_direct_path, source, target, buildings, neighbors, ops).is_some()
 }
 
 fn stack_amount(stacks: &[PlanetResourceStack], kind: PlanetResourceKind) -> u32 {
@@ -1109,14 +1140,27 @@ pub fn update_units_and_construction<B: PlanetBuildingAccess>(
         if !can_fulfill_reqs_from_building(source_building, &reqs) {
             continue;
         }
-        let Some((depot, _)) = buildings.iter().find(|(_, b)| {
-            (ops.is_base)(b.kind()) && !planet_is_under_construction(*b) && b.auto_units_enabled()
-        }) else {
+        let Some(depot) = buildings
+            .iter()
+            .find(|(_, b)| {
+                (ops.is_base)(b.kind())
+                    && !planet_is_under_construction(*b)
+                    && b.auto_units_enabled()
+                    && b.has_builder_tender_kit()
+            })
+            .map(|(depot, _)| *depot)
+        else {
             continue;
         };
+        let Some(base) = buildings.get_mut(&depot) else {
+            continue;
+        };
+        if !base.consume_builder_tender_kit() {
+            continue;
+        }
         let mut unit = unit_for_preset(
             PlanetUnitPresetId::BuilderSupply,
-            *depot,
+            depot,
             PlanetUnitNodeConfig {
                 pickup: Some(source),
                 dropoff: None,
@@ -1125,7 +1169,7 @@ pub fn update_units_and_construction<B: PlanetBuildingAccess>(
                 wait: None,
             },
         );
-        unit.path = vec![*depot];
+        unit.path = vec![depot];
         units.push(unit);
         if let Some(building) = buildings.get_mut(&target) {
             building.set_build_claimed(true);
@@ -1160,9 +1204,14 @@ pub fn update_units_and_construction<B: PlanetBuildingAccess>(
                 .construction
                 .and_then(|target| buildings.get(&target).map(|b| b.build_paid()))
                 .unwrap_or(true);
-            let assignment_valid =
-                current_builder_assignment_valid(&units[index], buildings, neighbors, ops);
-            let needs_assignment = depot_is_builder
+            let assignment_valid = current_builder_assignment_valid(
+                &units[index],
+                buildings,
+                neighbors,
+                ops,
+                depot_is_base,
+            );
+            let needs_assignment = (depot_is_builder || depot_is_base)
                 && (target_paid
                     || units[index].nodes.construction.is_none()
                     || units[index].nodes.pickup.is_none()
@@ -1188,6 +1237,7 @@ pub fn update_units_and_construction<B: PlanetBuildingAccess>(
                     &reserved_targets,
                     neighbors,
                     ops,
+                    depot_is_base,
                 ) {
                     if builder_assignment_changed(&units[index], new_target, new_source) {
                         units[index].nodes.construction = Some(new_target);
@@ -1277,7 +1327,13 @@ pub fn update_units_and_construction<B: PlanetBuildingAccess>(
                 units[index].assignment_check_timer += dt;
                 if units[index].assignment_check_timer >= 1.0 {
                     units[index].assignment_check_timer = 0.0;
-                    if current_builder_assignment_valid(&units[index], buildings, neighbors, ops) {
+                    if current_builder_assignment_valid(
+                        &units[index],
+                        buildings,
+                        neighbors,
+                        ops,
+                        false,
+                    ) {
                         index += 1;
                         continue;
                     }
@@ -1298,6 +1354,7 @@ pub fn update_units_and_construction<B: PlanetBuildingAccess>(
                         &reserved_targets,
                         neighbors,
                         ops,
+                        false,
                     ) {
                         if builder_assignment_changed(&units[index], new_target, new_source) {
                             units[index].nodes.construction = Some(new_target);
@@ -1374,6 +1431,7 @@ mod tests {
         build_time: f32,
         build_paid: bool,
         build_claimed: bool,
+        builder_tender_kits: u32,
     }
 
     impl PlanetBuildingAccess for TestBuilding {
@@ -1409,6 +1467,16 @@ mod tests {
         fn set_build_claimed(&mut self, value: bool) {
             self.build_claimed = value;
         }
+        fn has_builder_tender_kit(&self) -> bool {
+            self.builder_tender_kits > 0
+        }
+        fn consume_builder_tender_kit(&mut self) -> bool {
+            if self.builder_tender_kits == 0 {
+                return false;
+            }
+            self.builder_tender_kits -= 1;
+            true
+        }
     }
 
     fn test_ops() -> UnitOps<TestKind> {
@@ -1437,6 +1505,7 @@ mod tests {
             build_time: 1.0,
             build_paid: true,
             build_claimed: false,
+            builder_tender_kits: 0,
         }
     }
 
@@ -1447,6 +1516,69 @@ mod tests {
         let neighbors = vec![vec![1], vec![0, 2], vec![1]];
         let path = find_route_path_cells(0, 2, &buildings, &neighbors, &test_ops()).unwrap();
         assert_eq!(path, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn automatic_base_builder_requires_and_consumes_a_completed_kit() {
+        let mut buildings = HashMap::new();
+        buildings.insert(0, make_building(TestKind::Base));
+        let mut supply = make_building(TestKind::Builder);
+        supply.storage.insert(PlanetResourceKind::Stone, 10);
+        buildings.insert(1, supply);
+        let mut target = make_building(TestKind::Housing);
+        target.build_paid = false;
+        target.build_progress = 0.0;
+        buildings.insert(2, target);
+        let mut second_target = make_building(TestKind::Housing);
+        second_target.build_paid = false;
+        second_target.build_progress = 0.0;
+        buildings.insert(3, second_target);
+        let neighbors = vec![vec![1, 2, 3], vec![0, 2, 3], vec![0, 1, 3], vec![0, 1, 2]];
+        let grid = HexGrid {
+            freq: 1,
+            vertices: vec![],
+            faces: vec![],
+            face_centers: vec![],
+            vertex_faces: vec![],
+            base_face_buckets: vec![],
+            base_face_neighbors: vec![],
+        };
+        let mut units = Vec::new();
+
+        update_units_and_construction(
+            &mut units,
+            &mut buildings,
+            &grid,
+            &neighbors,
+            0.0,
+            &test_ops(),
+        );
+        assert!(units.is_empty());
+        assert_eq!(buildings[&0].builder_tender_kits, 0);
+
+        buildings.get_mut(&0).unwrap().builder_tender_kits = 1;
+        update_units_and_construction(
+            &mut units,
+            &mut buildings,
+            &grid,
+            &neighbors,
+            0.0,
+            &test_ops(),
+        );
+        assert_eq!(units.len(), 1);
+        assert_eq!(units[0].preset_id, PlanetUnitPresetId::BuilderSupply);
+        assert_eq!(buildings[&0].builder_tender_kits, 0);
+
+        buildings.get_mut(&2).unwrap().build_paid = true;
+        update_units_and_construction(
+            &mut units,
+            &mut buildings,
+            &grid,
+            &neighbors,
+            0.0,
+            &test_ops(),
+        );
+        assert_eq!(units[0].nodes.construction, Some(3));
     }
 
     #[test]
@@ -1627,8 +1759,10 @@ mod tests {
 
         let neighbors = vec![vec![1], vec![0, 2, 3], vec![1], vec![1]];
 
-        let first = next_builder_assignment(1, &buildings, None, &[], &neighbors, &test_ops());
-        let second = next_builder_assignment(1, &buildings, None, &[], &neighbors, &test_ops());
+        let first =
+            next_builder_assignment(1, &buildings, None, &[], &neighbors, &test_ops(), false);
+        let second =
+            next_builder_assignment(1, &buildings, None, &[], &neighbors, &test_ops(), false);
 
         assert_eq!(first, Some((2, 1)));
         assert_eq!(second, first);

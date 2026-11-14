@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::mpsc;
 
 use macroquad::prelude::*;
 
@@ -59,6 +60,10 @@ async fn main() {
     let mut units: Vec<Unit> = Vec::new();
     let mut planet_state: Option<scenes::planet::PlanetState> = None;
     let mut planet_loader = scenes::planet::PlanetLoader::start();
+    let (api_tx, api_rx) = mpsc::channel();
+    if let Err(error) = core::api::start(api_tx) {
+        eprintln!("GridGame local API unavailable: {error}");
+    }
     let greek_font = load_ttf_font("C:/Windows/Fonts/CascadiaMono.ttf")
         .await
         .ok();
@@ -76,6 +81,45 @@ async fn main() {
         if let Some(texture_data) = planet_loader.take_texture_data() {
             if planet_state.is_none() {
                 planet_state = Some(scenes::planet::PlanetState::from_texture_data(texture_data));
+            }
+        }
+        for _ in 0..32 {
+            let Some(message) = core::api::receive_request(&api_rx) else {
+                break;
+            };
+            let reply = match message.command {
+                core::api::ApiCommand::EnterPlanet => {
+                    scene = Scene::Planet;
+                    core::api::ApiReply::json(
+                        200,
+                        serde_json::json!({
+                            "scene": "planet",
+                            "planet_ready": planet_state.is_some(),
+                        }),
+                    )
+                }
+                command => match planet_state.as_mut() {
+                    Some(state) => state.handle_api_command(command),
+                    None => match command {
+                        core::api::ApiCommand::Status => core::api::ApiReply::json(
+                            200,
+                            serde_json::json!({
+                                "planet_ready": false,
+                                "cell_count": null,
+                                "building_count": 0,
+                                "unit_count": 0,
+                            }),
+                        ),
+                        _ => core::api::ApiReply::error(
+                            503,
+                            "planet_unavailable",
+                            "planet state is not available yet",
+                        ),
+                    },
+                },
+            };
+            if message.reply.send(reply).is_err() {
+                eprintln!("GridGame API client disconnected before receiving a reply");
             }
         }
         let mouse = vec2(mouse_position().0, mouse_position().1);
@@ -118,6 +162,9 @@ async fn main() {
                     planet_loader.log_entries(),
                     planet_loader.error(),
                 ) {
+                    if let Some(state) = planet_state.as_mut() {
+                        state.save_gameplay_state();
+                    }
                     break;
                 }
             }

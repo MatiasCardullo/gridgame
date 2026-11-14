@@ -204,7 +204,11 @@ fn load_heightmap_png(config: &PlanetNoiseConfig, size: u16) -> Option<Vec<u8>> 
     if image.width != size || image.height != size {
         return None;
     }
-    flip_rgba_vertical(&mut image.bytes, image.width as usize, image.height as usize);
+    flip_rgba_vertical(
+        &mut image.bytes,
+        image.width as usize,
+        image.height as usize,
+    );
     Some(image.bytes)
 }
 

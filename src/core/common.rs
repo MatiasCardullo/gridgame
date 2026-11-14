@@ -40,8 +40,6 @@ pub enum MachineBlockType {
     Crate,
 }
 
-
-
 // Available terrain/resource types.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum TileType {
@@ -836,12 +834,29 @@ pub fn axial_neighbors(hex: Axial) -> [Axial; 6] {
         Axial { q: 0, r: 1 },
     ];
     [
-        Axial { q: hex.q + dirs[0].q, r: hex.r + dirs[0].r },
-        Axial { q: hex.q + dirs[1].q, r: hex.r + dirs[1].r },
-        Axial { q: hex.q + dirs[2].q, r: hex.r + dirs[2].r },
-        Axial { q: hex.q + dirs[3].q, r: hex.r + dirs[3].r },
-        Axial { q: hex.q + dirs[4].q, r: hex.r + dirs[4].r },
-        Axial { q: hex.q + dirs[5].q, r: hex.r + dirs[5].r },
+        Axial {
+            q: hex.q + dirs[0].q,
+            r: hex.r + dirs[0].r,
+        },
+        Axial {
+            q: hex.q + dirs[1].q,
+            r: hex.r + dirs[1].r,
+        },
+        Axial {
+            q: hex.q + dirs[2].q,
+            r: hex.r + dirs[2].r,
+        },
+        Axial {
+            q: hex.q + dirs[3].q,
+            r: hex.r + dirs[3].r,
+        },
+        Axial {
+            q: hex.q + dirs[4].q,
+            r: hex.r + dirs[4].r,
+        },
+        Axial {
+            q: hex.q + dirs[5].q,
+            r: hex.r + dirs[5].r,
+        },
     ]
 }
-

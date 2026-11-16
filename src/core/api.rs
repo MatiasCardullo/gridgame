@@ -84,6 +84,7 @@ pub enum ApiInteriorPartKind {
 
 #[derive(Debug)]
 pub enum ApiCommand {
+    Screenshot,
     EnterPlanet,
     Status,
     Cells {
@@ -166,15 +167,28 @@ pub struct ApiMessage {
     pub reply: SyncSender<ApiReply>,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct ApiReply {
     pub status: u16,
     pub body: Value,
+    pub png: Option<Vec<u8>>,
 }
 
 impl ApiReply {
     pub fn json(status: u16, body: Value) -> Self {
-        Self { status, body }
+        Self {
+            status,
+            body,
+            png: None,
+        }
+    }
+
+    pub fn png(body: Vec<u8>) -> Self {
+        Self {
+            status: 200,
+            body: Value::Null,
+            png: Some(body),
+        }
     }
 
     pub fn error(status: u16, code: &str, message: impl Into<String>) -> Self {
@@ -289,22 +303,31 @@ fn handle_request(mut request: Request, sender: &Sender<ApiMessage>) {
         }
     };
 
-    let serialized = match serde_json::to_string(&reply.body) {
-        Ok(serialized) => serialized,
-        Err(error) => {
-            eprintln!("GridGame API response serialization failed: {error}");
-            r#"{"error":{"code":"serialization_error","message":"could not serialize response"}}"#
-                .to_string()
+    let (response, content_type) = match reply.png {
+        Some(png) => (Response::from_data(png), "image/png"),
+        None => {
+            let serialized = match serde_json::to_string(&reply.body) {
+                Ok(serialized) => serialized,
+                Err(error) => {
+                    eprintln!("GridGame API response serialization failed: {error}");
+                    r#"{"error":{"code":"serialization_error","message":"could not serialize response"}}"#
+                        .to_string()
+                }
+            };
+            (
+                Response::from_string(serialized),
+                "application/json; charset=utf-8",
+            )
         }
     };
-    let header = match Header::from_bytes("Content-Type", "application/json; charset=utf-8") {
+    let header = match Header::from_bytes("Content-Type", content_type) {
         Ok(header) => header,
         Err(error) => {
             eprintln!("GridGame API could not construct response header: {error:?}");
             return;
         }
     };
-    let response = Response::from_string(serialized)
+    let response = response
         .with_status_code(StatusCode(reply.status))
         .with_header(header);
     if let Err(error) = request.respond(response) {
@@ -395,6 +418,9 @@ fn dispatch(command: ApiCommand, sender: &Sender<ApiMessage>) -> ApiReply {
 
 fn parse_request(method: &str, url: &str, body: &[u8]) -> Result<ApiCommand, ParseError> {
     let (path, query) = url.split_once('?').unwrap_or((url, ""));
+    if path == format!("{API_PREFIX}/screenshot") && method == "GET" {
+        return Ok(ApiCommand::Screenshot);
+    }
     if path == format!("{API_PREFIX}/scene/planet") && method == "PUT" {
         return Ok(ApiCommand::EnterPlanet);
     }
@@ -697,6 +723,14 @@ mod tests {
         assert!(matches!(
             parse_request("PUT", "/api/v1/scene/planet", &[]),
             Ok(ApiCommand::EnterPlanet)
+        ));
+    }
+
+    #[test]
+    fn parses_screenshot_request() {
+        assert!(matches!(
+            parse_request("GET", "/api/v1/screenshot", &[]),
+            Ok(ApiCommand::Screenshot)
         ));
     }
 

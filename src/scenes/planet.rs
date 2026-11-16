@@ -1318,6 +1318,11 @@ impl PlanetState {
 
     pub fn handle_api_command(&mut self, command: ApiCommand) -> ApiReply {
         match command {
+            ApiCommand::Screenshot => ApiReply::error(
+                501,
+                "screenshot_unavailable",
+                "screenshots must be captured on the render thread",
+            ),
             ApiCommand::EnterPlanet => ApiReply::json(
                 200,
                 serde_json::json!({ "scene": "planet", "planet_ready": true }),

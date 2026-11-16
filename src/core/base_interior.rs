@@ -204,11 +204,11 @@ fn default_interior_camera_yaw() -> f32 {
 }
 
 fn default_interior_camera_pitch() -> f32 {
-    0.72
+    -0.65
 }
 
 fn default_interior_camera_distance() -> f32 {
-    240.0
+    100.0
 }
 
 pub fn default_interior_camera() -> InteriorCameraState {

@@ -1,6 +1,6 @@
 # Local REST API
 
-GridGame starts an HTTP/JSON API with the game. It binds to `127.0.0.1:39123` only and
+GridGame starts an HTTP API with the game. It binds to `127.0.0.1:39123` only and
 does not accept connections from other computers. There is no authentication; any local
 process able to connect can issue gameplay commands. The server also rejects unexpected
 `Host` and browser `Origin` headers; `POST` commands must use `application/json`.
@@ -19,6 +19,7 @@ remains the only code that mutates planet state. If the planet simulation is sti
 | `GET /buildings` | Read buildings, construction progress, and stored resources. |
 | `GET /units` | Read planet units, route nodes, location, fuel, and cargo. |
 | `GET /bases/{cell}/interior` | Inspect interior blocks, machine inventories, assembler state, arms, forklifts, and logistics requests for a Base. |
+| `GET /screenshot` | Capture the currently rendered frame as a PNG image. |
 
 Example:
 
@@ -28,6 +29,12 @@ curl "http://127.0.0.1:39123/api/v1/cells?offset=0&limit=25"
 
 Cell IDs are zero-based simulation-grid indexes. Cell responses may include a unit-vector
 `position` `[x, y, z]` for locating a cell on the planet.
+
+Save a screenshot of the current frame:
+
+```sh
+curl "http://127.0.0.1:39123/api/v1/screenshot" --output screenshot.png
+```
 
 ## Change the planet
 

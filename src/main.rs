@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::mpsc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use macroquad::prelude::*;
 
@@ -83,11 +84,16 @@ async fn main() {
                 planet_state = Some(scenes::planet::PlanetState::from_texture_data(texture_data));
             }
         }
+        let mut screenshot_replies = Vec::new();
         for _ in 0..32 {
             let Some(message) = core::api::receive_request(&api_rx) else {
                 break;
             };
             let reply = match message.command {
+                core::api::ApiCommand::Screenshot => {
+                    screenshot_replies.push(message.reply);
+                    continue;
+                }
                 core::api::ApiCommand::EnterPlanet => {
                     scene = Scene::Planet;
                     core::api::ApiReply::json(
@@ -214,7 +220,55 @@ async fn main() {
             }
         }
 
+        if !screenshot_replies.is_empty() {
+            let reply = capture_screenshot();
+            for screenshot_reply in screenshot_replies {
+                if screenshot_reply.send(reply.clone()).is_err() {
+                    eprintln!(
+                        "GridGame API screenshot client disconnected before receiving a reply"
+                    );
+                }
+            }
+        }
         next_frame().await;
+    }
+}
+
+fn capture_screenshot() -> core::api::ApiReply {
+    let timestamp = match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(duration) => duration.as_nanos(),
+        Err(error) => {
+            return core::api::ApiReply::error(
+                500,
+                "screenshot_failed",
+                format!("system clock is before the Unix epoch: {error}"),
+            );
+        }
+    };
+    let path = std::env::temp_dir().join(format!(
+        "gridgame-screenshot-{}-{timestamp}.png",
+        std::process::id()
+    ));
+    get_screen_data().export_png(&path.to_string_lossy());
+    match std::fs::read(&path) {
+        Ok(png) => {
+            if let Err(error) = std::fs::remove_file(&path) {
+                eprintln!("GridGame API could not remove temporary screenshot: {error}");
+            }
+            core::api::ApiReply::png(png)
+        }
+        Err(error) => {
+            if let Err(remove_error) = std::fs::remove_file(&path) {
+                if remove_error.kind() != std::io::ErrorKind::NotFound {
+                    eprintln!("GridGame API could not remove temporary screenshot: {remove_error}");
+                }
+            }
+            core::api::ApiReply::error(
+                500,
+                "screenshot_failed",
+                format!("could not read captured screenshot: {error}"),
+            )
+        }
     }
 }
 

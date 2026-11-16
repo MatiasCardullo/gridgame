@@ -22,10 +22,13 @@ const CELL_RADIUS_SCALE: f32 = 1.0;
 const BLOCK_Y: f32 = CELL_HEIGHT + 3.0;
 const ARM_BASE_HEIGHT: f32 = 16.0;
 const FLOOR_DRAW_RADIUS: i32 = 22;
+const BELT_HEIGHT: f32 = 3.6;
+const BELT_HALF_LENGTH: f32 = 17.0;
+const BELT_HALF_WIDTH: f32 = 9.0;
 
 fn machine_block_color(kind: MachineBlockType) -> Color {
     match kind {
-        MachineBlockType::ConveyorBelt => Color::from_rgba(232, 206, 92, 255),
+        MachineBlockType::ConveyorBelt => Color::from_rgba(12, 12, 14, 255),
         MachineBlockType::MechanicArm => Color::from_rgba(239, 137, 74, 255),
         MachineBlockType::Chest => Color::from_rgba(150, 150, 150, 255),
         MachineBlockType::Assembler => Color::from_rgba(78, 207, 211, 255),
@@ -321,48 +324,184 @@ fn belt_item_world_center(interior: &BaseInteriorState, hex: Axial, progress: f3
     from.lerp(to, progress.clamp(0.0, 1.0))
 }
 
-fn draw_oriented_box(
+fn belt_end_side_lengths(
+    direction: Vec3,
+    connected_direction: Vec3,
+    center_distance: f32,
+    front: bool,
+) -> (f32, f32) {
+    let axis = if front { direction } else { -direction };
+    let side = vec3(-axis.z, 0.0, axis.x);
+    let connected_side = vec3(-connected_direction.z, 0.0, connected_direction.x);
+    let current_to_connected = axis * center_distance;
+    let side_offset = (-current_to_connected).dot(connected_side);
+    let across_axis = axis.dot(connected_side);
+    if across_axis.abs() < 1e-4 || side_offset.abs() < 1e-4 {
+        let half_distance = center_distance * 0.5;
+        return (half_distance, half_distance);
+    }
+
+    let connected_edge = side_offset.signum() * BELT_HALF_WIDTH;
+    let negative_side =
+        (connected_edge - side_offset + BELT_HALF_WIDTH * side.dot(connected_side)) / across_axis;
+    let positive_side =
+        (connected_edge - side_offset - BELT_HALF_WIDTH * side.dot(connected_side)) / across_axis;
+    let lengths = (negative_side.max(0.0), positive_side.max(0.0));
+    if front {
+        lengths
+    } else {
+        (lengths.1, lengths.0)
+    }
+}
+
+fn belt_connection(
+    interior: &BaseInteriorState,
+    hex: Axial,
+    neighbor_index: usize,
+) -> Option<(Vec3, f32)> {
+    let neighbor_hex = axial_neighbors(hex)[neighbor_index];
+    let block = interior.block_at(neighbor_hex)?;
+    if block.kind != MachineBlockType::ConveyorBelt {
+        return None;
+    }
+    let center = hex_world_center(hex, 0.0);
+    let neighbor_center = hex_world_center(neighbor_hex, 0.0);
+    Some((
+        rotation_dir(block.rotation),
+        center.distance(neighbor_center),
+    ))
+}
+
+fn push_belt_quad(
+    vertices: &mut Vec<Vertex>,
+    indices: &mut Vec<u16>,
+    points: [Vec3; 4],
+    color: Color,
+) {
+    let first = vertices.len() as u16;
+    vertices.extend(
+        points
+            .into_iter()
+            .map(|point| Vertex::new(point.x, point.y, point.z, 0.0, 0.0, color)),
+    );
+    indices.extend([first, first + 1, first + 2, first + 1, first + 3, first + 2]);
+}
+
+fn draw_belt_prism(
     center: Vec3,
-    dir: Vec3,
-    side: Vec3,
-    length: f32,
-    height: f32,
-    width: f32,
+    direction: Vec3,
+    front_lengths: (f32, f32),
+    back_lengths: (f32, f32),
+    front_connected: bool,
+    back_connected: bool,
     fill: Color,
     outline: Color,
     wire_only: bool,
 ) {
-    let x = dir.normalize_or_zero() * length;
-    let y = vec3(0.0, height, 0.0);
-    let z = side.normalize_or_zero() * width;
-    let origin = center - x * 0.5 - y * 0.5 - z * 0.5;
-    if !wire_only {
-        draw_affine_parallelepiped(origin, x, y, z, None, fill);
-    }
-    let p000 = origin;
-    let p100 = origin + x;
-    let p010 = origin + y;
-    let p110 = origin + x + y;
-    let p001 = origin + z;
-    let p101 = origin + x + z;
-    let p011 = origin + y + z;
-    let p111 = origin + x + y + z;
-    let edges = [
-        (p000, p100),
-        (p000, p010),
-        (p000, p001),
-        (p100, p110),
-        (p100, p101),
-        (p010, p110),
-        (p010, p011),
-        (p001, p101),
-        (p001, p011),
-        (p110, p111),
-        (p101, p111),
-        (p011, p111),
-    ];
-    for (a, b) in edges {
-        draw_line_3d(a, b, outline);
+    let side = vec3(-direction.z, 0.0, direction.x);
+    let top_y = center.y + BELT_HEIGHT;
+    let front_negative =
+        vec3(center.x, top_y, center.z) + direction * front_lengths.0 - side * BELT_HALF_WIDTH;
+    let front_positive =
+        vec3(center.x, top_y, center.z) + direction * front_lengths.1 + side * BELT_HALF_WIDTH;
+    let back_negative =
+        vec3(center.x, top_y, center.z) - direction * back_lengths.0 - side * BELT_HALF_WIDTH;
+    let back_positive =
+        vec3(center.x, top_y, center.z) - direction * back_lengths.1 + side * BELT_HALF_WIDTH;
+    let bottom_offset = vec3(0.0, -BELT_HEIGHT, 0.0);
+    let front_negative_bottom = front_negative + bottom_offset;
+    let front_positive_bottom = front_positive + bottom_offset;
+    let back_negative_bottom = back_negative + bottom_offset;
+    let back_positive_bottom = back_positive + bottom_offset;
+
+    if wire_only {
+        let mut edges = vec![
+            (front_negative, back_negative),
+            (front_positive, back_positive),
+            (front_negative_bottom, back_negative_bottom),
+            (front_positive_bottom, back_positive_bottom),
+            (front_negative, front_negative_bottom),
+            (back_negative, back_negative_bottom),
+            (front_positive, front_positive_bottom),
+            (back_positive, back_positive_bottom),
+        ];
+        if !front_connected {
+            edges.extend([
+                (front_negative, front_positive),
+                (front_negative_bottom, front_positive_bottom),
+            ]);
+        }
+        if !back_connected {
+            edges.extend([
+                (back_negative, back_positive),
+                (back_negative_bottom, back_positive_bottom),
+            ]);
+        }
+        for (start, end) in edges {
+            draw_line_3d(start, end, outline);
+        }
+    } else {
+        let mut vertices = Vec::new();
+        let mut indices = Vec::new();
+        push_belt_quad(
+            &mut vertices,
+            &mut indices,
+            [front_negative, front_positive, back_negative, back_positive],
+            fill,
+        );
+        push_belt_quad(
+            &mut vertices,
+            &mut indices,
+            [
+                front_negative_bottom,
+                back_negative_bottom,
+                front_negative,
+                back_negative,
+            ],
+            Color::from_rgba(24, 24, 27, 255),
+        );
+        push_belt_quad(
+            &mut vertices,
+            &mut indices,
+            [
+                front_positive_bottom,
+                back_positive_bottom,
+                front_positive,
+                back_positive,
+            ],
+            Color::from_rgba(24, 24, 27, 255),
+        );
+        if !front_connected {
+            push_belt_quad(
+                &mut vertices,
+                &mut indices,
+                [
+                    front_negative_bottom,
+                    front_positive_bottom,
+                    front_negative,
+                    front_positive,
+                ],
+                Color::from_rgba(19, 19, 22, 255),
+            );
+        }
+        if !back_connected {
+            push_belt_quad(
+                &mut vertices,
+                &mut indices,
+                [
+                    back_negative_bottom,
+                    back_positive_bottom,
+                    back_negative,
+                    back_positive,
+                ],
+                Color::from_rgba(19, 19, 22, 255),
+            );
+        }
+        draw_mesh(&Mesh {
+            vertices,
+            indices,
+            texture: None,
+        });
     }
 }
 
@@ -387,16 +526,11 @@ fn build_template_camera(state: &InteriorCameraState) -> Camera3D {
 
 fn update_build_template_camera(
     camera: &mut InteriorCameraState,
-    blocked_hexes: &[Axial],
-    forklift_hexes: &[Axial],
     mouse: Vec2,
     ui_capturing: bool,
     dragging: &mut bool,
     last_mouse: &mut Vec2,
 ) {
-    if camera.distance > 80.0 {
-        camera.distance = 26.0;
-    }
     let camera_active = !ui_capturing && is_mouse_button_down(MouseButton::Right);
     if camera_active {
         let delta = mouse - *last_mouse;
@@ -414,55 +548,33 @@ fn update_build_template_camera(
         } else {
             180.0
         };
-        let forward_flat = vec2(camera.yaw.cos(), camera.yaw.sin()).normalize_or_zero();
-        let right_flat = vec2(-forward_flat.y, forward_flat.x);
-        let mut move_dir = vec2(0.0, 0.0);
+        let forward = vec3(camera.yaw.cos(), 0.0, camera.yaw.sin());
+        let right = vec3(-camera.yaw.sin(), 0.0, camera.yaw.cos());
+        let mut move_dir = Vec3::ZERO;
         if is_key_down(KeyCode::W) {
-            move_dir += forward_flat;
+            move_dir += forward;
         }
         if is_key_down(KeyCode::S) {
-            move_dir -= forward_flat;
+            move_dir -= forward;
         }
         if is_key_down(KeyCode::D) {
-            move_dir += right_flat;
+            move_dir += right;
         }
         if is_key_down(KeyCode::A) {
-            move_dir -= right_flat;
+            move_dir -= right;
+        }
+        if is_key_down(KeyCode::Space) {
+            move_dir.y += 1.0;
+        }
+        if is_key_down(KeyCode::LeftControl) || is_key_down(KeyCode::RightControl) {
+            move_dir.y -= 1.0;
         }
         if move_dir.length_squared() > f32::EPSILON {
             let step = move_dir.normalize() * (speed * dt);
-            let step_target_x = camera.focus_x + step.x;
-            let step_target_z = camera.focus_z + step.y;
-
-            let can_move_x = {
-                let candidate =
-                    pixel_to_hex(vec2(step_target_x, camera.focus_z), HEX_SIZE, Vec2::ZERO);
-                in_bounds(candidate, MapOutline::Hexagon)
-                    && !blocked_hexes.contains(&candidate)
-                    && !forklift_hexes.contains(&candidate)
-            };
-            if can_move_x {
-                camera.focus_x = step_target_x;
-            }
-
-            let can_move_z = {
-                let candidate =
-                    pixel_to_hex(vec2(camera.focus_x, step_target_z), HEX_SIZE, Vec2::ZERO);
-                in_bounds(candidate, MapOutline::Hexagon)
-                    && !blocked_hexes.contains(&candidate)
-                    && !forklift_hexes.contains(&candidate)
-            };
-            if can_move_z {
-                camera.focus_z = step_target_z;
-            }
+            camera.focus_x += step.x;
+            camera.distance = (camera.distance + step.y).clamp(4.0, 500.0);
+            camera.focus_z += step.z;
         }
-        if is_key_down(KeyCode::Space) {
-            camera.distance += speed * 0.55 * dt;
-        }
-        if is_key_down(KeyCode::LeftControl) || is_key_down(KeyCode::RightControl) {
-            camera.distance -= speed * 0.55 * dt;
-        }
-        camera.distance = camera.distance.clamp(10.0, 120.0);
     }
     *last_mouse = mouse;
 }
@@ -499,10 +611,11 @@ fn hover_hex_from_mouse_3d(camera: &Camera3D, mouse: Vec2) -> Option<Axial> {
 }
 
 fn draw_machine_block(
+    interior: &BaseInteriorState,
+    hex: Axial,
     kind: MachineBlockType,
     rotation: u8,
     center: Vec3,
-    colors: &RuntimeColors,
     wire_only: bool,
 ) {
     let fill = machine_block_color(kind);
@@ -510,26 +623,39 @@ fn draw_machine_block(
     match kind {
         MachineBlockType::ConveyorBelt => {
             let dir = rotation_dir(rotation);
-            let side = vec3(-dir.z, 0.0, dir.x);
-            draw_oriented_box(
-                center + vec3(0.0, 1.8, 0.0),
+            let front_connection = belt_connection(interior, hex, rotation as usize % 6);
+            let back_connection = belt_connection(interior, hex, (rotation as usize + 3) % 6);
+            let front_lengths = front_connection
+                .map(|(connected_dir, distance)| {
+                    belt_end_side_lengths(dir, connected_dir, distance, true)
+                })
+                .unwrap_or((BELT_HALF_LENGTH, BELT_HALF_LENGTH));
+            let back_lengths = back_connection
+                .map(|(connected_dir, distance)| {
+                    belt_end_side_lengths(dir, connected_dir, distance, false)
+                })
+                .unwrap_or((BELT_HALF_LENGTH, BELT_HALF_LENGTH));
+            draw_belt_prism(
+                center,
                 dir,
-                side,
-                34.0,
-                3.6,
-                18.0,
+                front_lengths,
+                back_lengths,
+                front_connection.is_some(),
+                back_connection.is_some(),
                 fill,
                 outline,
                 wire_only,
             );
-            let top = center + vec3(0.0, 4.4, 0.0);
+            let side = vec3(-dir.z, 0.0, dir.x);
+            let top = center + vec3(0.0, 4.6, 0.0);
+            let arrow_color = Color::from_rgba(255, 220, 0, 255);
             for offset in [-7.0_f32, 6.0] {
                 let mid = top + dir * offset;
                 let a = mid - dir * 5.0 + side * 3.5;
                 let b = mid;
                 let c = mid - dir * 5.0 - side * 3.5;
-                draw_line_3d(a, b, colors.text_primary);
-                draw_line_3d(c, b, colors.text_primary);
+                draw_line_3d(a, b, arrow_color);
+                draw_line_3d(c, b, arrow_color);
             }
         }
         MachineBlockType::MechanicArm => {
@@ -663,7 +789,7 @@ fn draw_world(
         let hex = block_record.hex;
         let block = &block_record.block;
         let center = hex_world_center(hex, BLOCK_Y);
-        draw_machine_block(block.kind, block.rotation, center, colors, false);
+        draw_machine_block(interior, hex, block.kind, block.rotation, center, false);
     }
 
     for container in &interior.containers {
@@ -861,7 +987,7 @@ fn draw_world(
 
     if let Some((hex, kind, rotation)) = preview {
         let center = hex_world_center(hex, BLOCK_Y);
-        draw_machine_block(kind, rotation, center, colors, true);
+        draw_machine_block(interior, hex, kind, rotation, center, true);
         draw_hex_tile(
             hex,
             0.04,
@@ -1006,29 +1132,9 @@ pub fn run(
     let panel_rect = panel_layout.rect;
     let ui_capturing = is_ui_capturing(panel_rect, window, confirm_window, ctx.mouse);
 
-    let (blocked_hexes, forklift_hexes) = state
-        .active_base_interior()
-        .map(|interior| {
-            (
-                interior
-                    .blocks
-                    .iter()
-                    .map(|record| record.hex)
-                    .collect::<Vec<_>>(),
-                interior
-                    .forklifts
-                    .iter()
-                    .map(|forklift| forklift.hex)
-                    .collect::<Vec<_>>(),
-            )
-        })
-        .unwrap_or_default();
-
     if let Some(interior) = state.active_base_interior_mut() {
         update_build_template_camera(
             &mut interior.camera,
-            &blocked_hexes,
-            &forklift_hexes,
             ctx.mouse,
             ui_capturing,
             dragging,
@@ -1622,6 +1728,45 @@ pub fn run(
             }
             if changed {
                 state.mark_buildings_dirty();
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn belt_joins_trim_straight_ends_and_miter_angled_ends() {
+        let direction = vec3(1.0, 0.0, 0.0);
+        let straight = belt_end_side_lengths(direction, direction, 26.0, true);
+        assert!((straight.0 - 13.0).abs() < 0.001);
+        assert!((straight.1 - 13.0).abs() < 0.001);
+
+        let angled_direction = vec3(0.5, 0.0, 0.866_025_4);
+        let front = belt_end_side_lengths(direction, angled_direction, 26.0, true);
+        let back = belt_end_side_lengths(direction, angled_direction, 26.0, false);
+        assert!(front.0 < 13.0 && front.1 > 13.0);
+        assert!(back.0 > 13.0 && back.1 < 13.0);
+        let connected_side = vec3(-angled_direction.z, 0.0, angled_direction.x);
+        let belt_side = vec3(0.0, 0.0, 1.0);
+        for (is_front, lengths) in [(true, front), (false, back)] {
+            let axis = if is_front { direction } else { -direction };
+            let endpoints = [
+                axis * lengths.0 - belt_side * BELT_HALF_WIDTH,
+                axis * lengths.1 + belt_side * BELT_HALF_WIDTH,
+            ];
+            let angled_cut_edge = endpoints[1] - endpoints[0];
+            assert!(angled_cut_edge.cross(angled_direction).length() < 0.001);
+            for endpoint in endpoints {
+                let relative_to_neighbor = endpoint - axis * 26.0;
+                let facing_side = (-axis * 26.0).dot(connected_side).signum();
+                assert!(
+                    (relative_to_neighbor.dot(connected_side) - facing_side * BELT_HALF_WIDTH)
+                        .abs()
+                        < 0.001
+                );
             }
         }
     }

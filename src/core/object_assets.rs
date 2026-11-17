@@ -3,6 +3,7 @@ use std::fs;
 use std::path::Path;
 
 use macroquad::prelude::{Color, Mesh, Vec2, Vec3, Vertex, draw_mesh, vec3};
+use serde::{Deserialize, Serialize};
 
 use crate::core::MachineBlockType;
 
@@ -230,6 +231,66 @@ impl EditableMesh {
         self.indices.len() / 3
     }
 
+    pub fn remove_faces(&mut self, removed_faces: &[usize]) -> Result<Vec<Option<usize>>, String> {
+        let face_count = self.face_count();
+        if self.indices.len() % 3 != 0 {
+            return Err("mesh index count is not divisible by three".to_string());
+        }
+        let mut removed = vec![false; face_count];
+        for &face in removed_faces {
+            let Some(slot) = removed.get_mut(face) else {
+                return Err(format!("face {face} is out of range"));
+            };
+            *slot = true;
+        }
+        let kept_count = removed.iter().filter(|&&value| !value).count();
+        if kept_count == 0 {
+            return Err("cannot delete every face from a model".to_string());
+        }
+
+        let mut face_remap = vec![None; face_count];
+        let mut kept_indices = Vec::with_capacity(kept_count * 3);
+        let mut next_face = 0;
+        for (face, is_removed) in removed.iter().copied().enumerate() {
+            if is_removed {
+                continue;
+            }
+            face_remap[face] = Some(next_face);
+            next_face += 1;
+            kept_indices.extend_from_slice(&self.indices[face * 3..face * 3 + 3]);
+        }
+
+        let mut used_vertices = vec![false; self.vertices.len()];
+        for &index in &kept_indices {
+            let Some(used) = used_vertices.get_mut(index as usize) else {
+                return Err(format!("mesh index {index} is out of range"));
+            };
+            *used = true;
+        }
+        let mut vertex_remap = vec![None; self.vertices.len()];
+        let mut compact_vertices = Vec::new();
+        for (old_index, vertex) in self.vertices.iter().copied().enumerate() {
+            if used_vertices[old_index] {
+                let new_index = u32::try_from(compact_vertices.len())
+                    .map_err(|_| "mesh has too many vertices to edit".to_string())?;
+                vertex_remap[old_index] = Some(new_index);
+                compact_vertices.push(vertex);
+            }
+        }
+        let compact_indices = kept_indices
+            .into_iter()
+            .map(|index| {
+                vertex_remap
+                    .get(index as usize)
+                    .and_then(|mapped| *mapped)
+                    .ok_or_else(|| format!("mesh index {index} could not be remapped"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        self.vertices = compact_vertices;
+        self.indices = compact_indices;
+        Ok(face_remap)
+    }
+
     pub fn extrude_face(&mut self, face_index: usize, distance: f32) -> Result<(), String> {
         let start = face_index
             .checked_mul(3)
@@ -277,10 +338,223 @@ impl EditableMesh {
     }
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct FaceMetadata {
+    pub face_names: Vec<Option<String>>,
+    pub groups: Vec<FaceGroup>,
+    next_group_id: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct FaceGroup {
+    pub id: u64,
+    pub name: String,
+    pub faces: Vec<usize>,
+}
+
+impl FaceMetadata {
+    fn for_face_count(face_count: usize) -> Self {
+        Self {
+            face_names: vec![None; face_count],
+            groups: Vec::new(),
+            next_group_id: 1,
+        }
+    }
+
+    fn validate(&mut self, face_count: usize) -> Result<(), String> {
+        if self.face_names.len() > face_count {
+            return Err(format!(
+                "face metadata has {} names for {face_count} faces",
+                self.face_names.len()
+            ));
+        }
+        self.face_names.resize(face_count, None);
+        let mut group_ids = HashSet::new();
+        let mut assigned_faces = HashSet::new();
+        for group in &mut self.groups {
+            if group.name.trim().is_empty() {
+                return Err(format!("face group {} has an empty name", group.id));
+            }
+            if !group_ids.insert(group.id) {
+                return Err(format!("duplicate face group id {}", group.id));
+            }
+            group.faces.sort_unstable();
+            group.faces.dedup();
+            for &face in &group.faces {
+                if face >= face_count {
+                    return Err(format!(
+                        "face group '{}' references missing face {face}",
+                        group.name
+                    ));
+                }
+                if !assigned_faces.insert(face) {
+                    return Err(format!("face {face} belongs to more than one group"));
+                }
+            }
+        }
+        self.groups.retain(|group| !group.faces.is_empty());
+        let minimum_next_id = self
+            .groups
+            .iter()
+            .map(|group| group.id.saturating_add(1))
+            .max()
+            .unwrap_or(1);
+        self.next_group_id = self.next_group_id.max(minimum_next_id);
+        Ok(())
+    }
+
+    pub fn group(&self, id: u64) -> Option<&FaceGroup> {
+        self.groups.iter().find(|group| group.id == id)
+    }
+
+    pub fn create_group(&mut self, faces: &[usize]) -> Result<u64, String> {
+        if faces.is_empty() {
+            return Err("select one or more faces before adding a group".to_string());
+        }
+        let mut selected = faces.to_vec();
+        selected.sort_unstable();
+        selected.dedup();
+        if let Some(&face) = selected.iter().find(|&&face| face >= self.face_names.len()) {
+            return Err(format!("face {face} is out of range"));
+        }
+        let id = self.next_group_id.max(1);
+        self.next_group_id = id
+            .checked_add(1)
+            .ok_or_else(|| "face group id limit reached".to_string())?;
+        let selected_faces = selected.iter().copied().collect::<HashSet<_>>();
+        for group in &mut self.groups {
+            group.faces.retain(|face| !selected_faces.contains(face));
+        }
+        self.groups.retain(|group| !group.faces.is_empty());
+        self.groups.push(FaceGroup {
+            id,
+            name: format!("Group {id}"),
+            faces: selected,
+        });
+        Ok(id)
+    }
+
+    pub fn assign_faces_to_group(&mut self, faces: &[usize], group_id: u64) -> Result<(), String> {
+        if !self.groups.iter().any(|group| group.id == group_id) {
+            return Err(format!("face group {group_id} does not exist"));
+        }
+        let mut selected = faces.to_vec();
+        selected.sort_unstable();
+        selected.dedup();
+        if let Some(&face) = selected.iter().find(|&&face| face >= self.face_names.len()) {
+            return Err(format!("face {face} is out of range"));
+        }
+        let selected_faces = selected.iter().copied().collect::<HashSet<_>>();
+        for group in &mut self.groups {
+            if group.id != group_id {
+                group.faces.retain(|face| !selected_faces.contains(face));
+            }
+        }
+        self.groups
+            .retain(|group| group.id == group_id || !group.faces.is_empty());
+        let target = self
+            .groups
+            .iter_mut()
+            .find(|group| group.id == group_id)
+            .ok_or_else(|| format!("face group {group_id} does not exist"))?;
+        target.faces.extend(selected);
+        target.faces.sort_unstable();
+        target.faces.dedup();
+        Ok(())
+    }
+
+    pub fn rename_face(&mut self, face: usize, name: String) -> Result<(), String> {
+        let name = name.trim().to_string();
+        if name.is_empty() {
+            return Err("face name cannot be empty".to_string());
+        }
+        let slot = self
+            .face_names
+            .get_mut(face)
+            .ok_or_else(|| format!("face {face} is out of range"))?;
+        *slot = Some(name);
+        Ok(())
+    }
+
+    pub fn rename_group(&mut self, group_id: u64, name: String) -> Result<(), String> {
+        let name = name.trim().to_string();
+        if name.is_empty() {
+            return Err("group name cannot be empty".to_string());
+        }
+        let group = self
+            .groups
+            .iter_mut()
+            .find(|group| group.id == group_id)
+            .ok_or_else(|| format!("face group {group_id} does not exist"))?;
+        group.name = name;
+        Ok(())
+    }
+
+    pub fn remove_group(&mut self, group_id: u64) -> Result<Vec<usize>, String> {
+        let index = self
+            .groups
+            .iter()
+            .position(|group| group.id == group_id)
+            .ok_or_else(|| format!("face group {group_id} does not exist"))?;
+        Ok(self.groups.remove(index).faces)
+    }
+
+    pub fn remap_after_face_removal(&mut self, face_remap: &[Option<usize>]) {
+        let old_names = std::mem::take(&mut self.face_names);
+        self.face_names = face_remap
+            .iter()
+            .filter_map(|mapped| mapped.map(|_| None))
+            .collect();
+        for (old_face, new_face) in face_remap.iter().enumerate() {
+            if let Some(new_face) = new_face
+                && let (Some(name), Some(slot)) = (
+                    old_names.get(old_face).cloned().flatten(),
+                    self.face_names.get_mut(*new_face),
+                )
+            {
+                *slot = Some(name);
+            }
+        }
+        for group in &mut self.groups {
+            group.faces = group
+                .faces
+                .iter()
+                .filter_map(|&face| face_remap.get(face).and_then(|mapped| *mapped))
+                .collect();
+            group.faces.sort_unstable();
+            group.faces.dedup();
+        }
+        self.groups.retain(|group| !group.faces.is_empty());
+    }
+
+    pub fn inherit_group_for_extrusion(
+        &mut self,
+        source_face: usize,
+        first_new_face: usize,
+        new_face_count: usize,
+    ) {
+        if let Some(group) = self
+            .groups
+            .iter_mut()
+            .find(|group| group.faces.contains(&source_face))
+        {
+            group
+                .faces
+                .extend(first_new_face..first_new_face + new_face_count);
+            group.faces.sort_unstable();
+        }
+        self.face_names
+            .resize(first_new_face + new_face_count, None);
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct CatalogEntry {
     pub definition: ObjectDefinition,
     pub mesh: Option<EditableMesh>,
+    pub metadata: FaceMetadata,
+    pub metadata_error: Option<String>,
     pub error: Option<String>,
     pub states: Vec<CatalogState>,
     pub states_error: Option<String>,
@@ -290,6 +564,8 @@ pub struct CatalogEntry {
 pub struct CatalogState {
     pub key: String,
     pub mesh: Option<EditableMesh>,
+    pub metadata: FaceMetadata,
+    pub metadata_error: Option<String>,
     pub error: Option<String>,
 }
 
@@ -308,10 +584,16 @@ impl ObjectCatalog {
                     Ok(mesh) => (Some(mesh), None),
                     Err(error) => (None, Some(error)),
                 };
+                let (metadata, metadata_error) = match mesh.as_ref() {
+                    Some(mesh) => load_face_metadata(Path::new(definition.path), mesh.face_count()),
+                    None => (FaceMetadata::default(), None),
+                };
                 let (states, states_error) = load_states(definition.states_path);
                 CatalogEntry {
                     definition,
                     mesh,
+                    metadata,
+                    metadata_error,
                     error,
                     states,
                     states_error,
@@ -363,14 +645,66 @@ impl ObjectCatalog {
             .as_mut()
     }
 
+    pub fn metadata(&self, id: ObjectId, state_key: Option<&str>) -> Option<&FaceMetadata> {
+        let entry = self
+            .entries
+            .iter()
+            .find(|entry| entry.definition.id == id)?;
+        match state_key {
+            Some(key) => entry
+                .states
+                .iter()
+                .find(|state| state.key == key)
+                .map(|state| &state.metadata),
+            None => Some(&entry.metadata),
+        }
+    }
+
+    pub fn metadata_mut(
+        &mut self,
+        id: ObjectId,
+        state_key: Option<&str>,
+    ) -> Option<&mut FaceMetadata> {
+        let entry = self
+            .entries
+            .iter_mut()
+            .find(|entry| entry.definition.id == id)?;
+        match state_key {
+            Some(key) => entry
+                .states
+                .iter_mut()
+                .find(|state| state.key == key)
+                .map(|state| &mut state.metadata),
+            None => Some(&mut entry.metadata),
+        }
+    }
+
     pub fn save(&mut self, id: ObjectId, mesh: EditableMesh) -> Result<(), String> {
+        let metadata = self
+            .metadata(id, None)
+            .cloned()
+            .ok_or_else(|| format!("unknown object id {id:?}"))?;
+        self.save_with_metadata(id, mesh, metadata)
+    }
+
+    pub fn save_with_metadata(
+        &mut self,
+        id: ObjectId,
+        mesh: EditableMesh,
+        mut metadata: FaceMetadata,
+    ) -> Result<(), String> {
         let entry = self
             .entries
             .iter_mut()
             .find(|entry| entry.definition.id == id)
             .ok_or_else(|| format!("unknown object id {id:?}"))?;
-        save_glb(Path::new(entry.definition.path), &mesh)?;
+        metadata.validate(mesh.face_count())?;
+        let path = Path::new(entry.definition.path);
+        save_glb(path, &mesh)?;
+        save_face_metadata(path, &metadata)?;
         entry.mesh = Some(mesh);
+        entry.metadata = metadata;
+        entry.metadata_error = None;
         entry.error = None;
         Ok(())
     }
@@ -380,6 +714,20 @@ impl ObjectCatalog {
         id: ObjectId,
         key: &str,
         mesh: EditableMesh,
+    ) -> Result<(), String> {
+        let metadata = self
+            .metadata(id, Some(key))
+            .cloned()
+            .unwrap_or_else(|| FaceMetadata::for_face_count(mesh.face_count()));
+        self.save_state_with_metadata(id, key, mesh, metadata)
+    }
+
+    pub fn save_state_with_metadata(
+        &mut self,
+        id: ObjectId,
+        key: &str,
+        mesh: EditableMesh,
+        mut metadata: FaceMetadata,
     ) -> Result<(), String> {
         if key.is_empty()
             || !key
@@ -401,20 +749,65 @@ impl ObjectCatalog {
         fs::create_dir_all(directory)
             .map_err(|error| format!("{}: {error}", directory.display()))?;
         let path = directory.join(format!("{key}.glb"));
+        metadata.validate(mesh.face_count())?;
         save_glb(&path, &mesh)?;
+        save_face_metadata(&path, &metadata)?;
         if let Some(state) = entry.states.iter_mut().find(|state| state.key == key) {
             state.mesh = Some(mesh);
+            state.metadata = metadata;
+            state.metadata_error = None;
             state.error = None;
         } else {
             entry.states.push(CatalogState {
                 key: key.to_string(),
                 mesh: Some(mesh),
+                metadata,
+                metadata_error: None,
                 error: None,
             });
             entry.states.sort_by(|left, right| left.key.cmp(&right.key));
         }
         Ok(())
     }
+}
+
+fn face_metadata_path(mesh_path: &Path) -> std::path::PathBuf {
+    mesh_path.with_extension("cad.json")
+}
+
+fn load_face_metadata(mesh_path: &Path, face_count: usize) -> (FaceMetadata, Option<String>) {
+    let path = face_metadata_path(mesh_path);
+    let bytes = match fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return (FaceMetadata::for_face_count(face_count), None);
+        }
+        Err(error) => {
+            return (
+                FaceMetadata::for_face_count(face_count),
+                Some(format!("{}: {error}", path.display())),
+            );
+        }
+    };
+    let loaded = serde_json::from_slice::<FaceMetadata>(&bytes)
+        .map_err(|error| format!("{}: {error}", path.display()))
+        .and_then(|mut metadata| {
+            metadata.validate(face_count)?;
+            Ok(metadata)
+        });
+    match loaded {
+        Ok(metadata) => (metadata, None),
+        Err(error) => (FaceMetadata::for_face_count(face_count), Some(error)),
+    }
+}
+
+fn save_face_metadata(mesh_path: &Path, metadata: &FaceMetadata) -> Result<(), String> {
+    let path = face_metadata_path(mesh_path);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|error| format!("{}: {error}", parent.display()))?;
+    }
+    let json = serde_json::to_vec_pretty(metadata).map_err(|error| error.to_string())?;
+    fs::write(&path, json).map_err(|error| format!("{}: {error}", path.display()))
 }
 
 fn load_states(states_path: Option<&str>) -> (Vec<CatalogState>, Option<String>) {
@@ -426,10 +819,16 @@ fn load_states(states_path: Option<&str>) -> (Vec<CatalogState>, Option<String>)
     let variants_path = directory.join("variants.glb");
     if variants_path.exists() {
         match load_glb_variants(&variants_path) {
-            Ok(loaded) => states.extend(loaded.into_iter().map(|(key, mesh)| CatalogState {
-                key,
-                mesh: Some(mesh),
-                error: None,
+            Ok(loaded) => states.extend(loaded.into_iter().map(|(key, mesh)| {
+                let state_path = directory.join(format!("{key}.glb"));
+                let (metadata, metadata_error) = load_face_metadata(&state_path, mesh.face_count());
+                CatalogState {
+                    key,
+                    mesh: Some(mesh),
+                    metadata,
+                    metadata_error,
+                    error: None,
+                }
             })),
             Err(error) => return (states, Some(error)),
         }
@@ -459,14 +858,21 @@ fn load_states(states_path: Option<&str>) -> (Vec<CatalogState>, Option<String>)
         };
         let loaded = load_glb(&path);
         let state = match loaded {
-            Ok(mesh) => CatalogState {
-                key: key.to_string(),
-                mesh: Some(mesh),
-                error: None,
-            },
+            Ok(mesh) => {
+                let (metadata, metadata_error) = load_face_metadata(&path, mesh.face_count());
+                CatalogState {
+                    key: key.to_string(),
+                    mesh: Some(mesh),
+                    metadata,
+                    metadata_error,
+                    error: None,
+                }
+            }
             Err(error) => CatalogState {
                 key: key.to_string(),
                 mesh: None,
+                metadata: FaceMetadata::default(),
+                metadata_error: None,
                 error: Some(error),
             },
         };
@@ -1013,6 +1419,83 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn removing_faces_compacts_vertices_and_remaps_metadata() {
+        let vertex =
+            |position| Vertex::new2(position, Vec2::ZERO, Color::from_rgba(80, 120, 160, 255));
+        let mut mesh = EditableMesh {
+            vertices: vec![
+                vertex(Vec3::ZERO),
+                vertex(Vec3::X),
+                vertex(Vec3::Y),
+                vertex(Vec3::Z),
+            ],
+            indices: vec![0, 1, 2, 0, 2, 3],
+        };
+        let mut metadata = FaceMetadata::for_face_count(2);
+        metadata.face_names[0] = Some("front".to_string());
+        metadata.face_names[1] = Some("side".to_string());
+        let group = metadata.create_group(&[0, 1]).unwrap();
+
+        let remap = mesh.remove_faces(&[0]).unwrap();
+        metadata.remap_after_face_removal(&remap);
+
+        assert_eq!(remap, vec![None, Some(0)]);
+        assert_eq!(mesh.vertices.len(), 3);
+        assert_eq!(mesh.indices, vec![0, 1, 2]);
+        assert_eq!(metadata.face_names, vec![Some("side".to_string())]);
+        assert_eq!(metadata.group(group).unwrap().faces, vec![0]);
+    }
+
+    #[test]
+    fn face_groups_move_members_and_can_be_renamed() {
+        let mut metadata = FaceMetadata::for_face_count(4);
+        let first = metadata.create_group(&[0, 1]).unwrap();
+        let second = metadata.create_group(&[2]).unwrap();
+        metadata.assign_faces_to_group(&[1, 2], second).unwrap();
+        metadata.rename_group(second, "Trim".to_string()).unwrap();
+
+        assert_eq!(metadata.group(first).unwrap().faces, vec![0]);
+        assert_eq!(metadata.group(second).unwrap().name, "Trim");
+        assert_eq!(metadata.group(second).unwrap().faces, vec![1, 2]);
+    }
+
+    #[test]
+    fn extruded_faces_inherit_group_without_names() {
+        let mut metadata = FaceMetadata::for_face_count(2);
+        metadata.rename_face(0, "source".to_string()).unwrap();
+        let group = metadata.create_group(&[0]).unwrap();
+
+        metadata.inherit_group_for_extrusion(0, 2, 7);
+
+        assert_eq!(
+            metadata.group(group).unwrap().faces,
+            vec![0, 2, 3, 4, 5, 6, 7, 8]
+        );
+        assert_eq!(metadata.face_names.len(), 9);
+        assert!(metadata.face_names[2..].iter().all(Option::is_none));
+    }
+
+    #[test]
+    fn face_metadata_round_trips_in_adjacent_sidecar() {
+        let directory =
+            std::env::temp_dir().join(format!("gridgame-cad-metadata-{}", std::process::id()));
+        let mesh_path = directory.join("model.glb");
+        let mut metadata = FaceMetadata::for_face_count(3);
+        metadata.rename_face(1, "door".to_string()).unwrap();
+        metadata.create_group(&[0, 2]).unwrap();
+
+        save_face_metadata(&mesh_path, &metadata).unwrap();
+        let (loaded, error) = load_face_metadata(&mesh_path, 3);
+
+        assert!(error.is_none());
+        assert_eq!(loaded.face_names, metadata.face_names);
+        assert_eq!(loaded.groups, metadata.groups);
+        assert_eq!(loaded.next_group_id, metadata.next_group_id);
+        fs::remove_file(face_metadata_path(&mesh_path)).unwrap();
+        fs::remove_dir(directory).unwrap();
     }
 
     #[test]

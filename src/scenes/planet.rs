@@ -23,6 +23,7 @@ use crate::core::debug::{
 use crate::core::map_common::{
     MapOutline, build_panel_layout, handle_window_drag, in_bounds, is_ui_capturing,
 };
+use crate::core::object_assets::{ObjectCatalog, ObjectId};
 use crate::core::planet_grid::{
     HexGrid, align_vertices_to_poles, build_faces, build_frequency_geodesic, build_geodesic_sphere,
     build_hex_grid_from_data, build_vertex_neighbors, icosahedron_edges, icosahedron_vertices,
@@ -492,6 +493,20 @@ fn unit_preset_name(preset: PlanetUnitPresetId) -> &'static str {
         PlanetUnitPresetId::Hauler => "hauler",
         PlanetUnitPresetId::BuilderSupply => "builder_supply",
         PlanetUnitPresetId::Shuttle => "shuttle",
+    }
+}
+
+fn building_object_id(kind: PlanetBuildingKind) -> ObjectId {
+    match kind {
+        PlanetBuildingKind::Base => ObjectId::PlanetBase,
+        PlanetBuildingKind::Builder => ObjectId::PlanetBuilder,
+        PlanetBuildingKind::Housing => ObjectId::PlanetHousing,
+        PlanetBuildingKind::Factory => ObjectId::PlanetFactory,
+        PlanetBuildingKind::Mine => ObjectId::PlanetMine,
+        PlanetBuildingKind::Warehouse => ObjectId::PlanetWarehouse,
+        PlanetBuildingKind::Refuel => ObjectId::PlanetRefuel,
+        PlanetBuildingKind::Logistics => ObjectId::PlanetLogistics,
+        PlanetBuildingKind::Route => ObjectId::PlanetRoute,
     }
 }
 
@@ -3895,6 +3910,7 @@ fn draw_sim_buildings(
     buildings: &HashMap<u32, PlanetBuildingState>,
     radius: f32,
     min_cell_edge_dist_unit: f32,
+    assets: &ObjectCatalog,
 ) {
     let target_apothem = (min_cell_edge_dist_unit * 0.9 * 0.62).max(0.0005);
     // Keep buildings above surface but below overlay lines (PLANET_OVERLAY_OFFSET=0.01).
@@ -3948,6 +3964,45 @@ fn draw_sim_buildings(
             outer_dirs.push((vertex_dir + ring * outer_radius).normalize());
         }
 
+        let route_state = if kind == PlanetBuildingKind::Route {
+            let mut seen_neighbors = HashSet::new();
+            let mut neighbors = Vec::new();
+            for &face_index in face_list {
+                let Some(face) = visual_grid.faces.get(face_index as usize) else {
+                    continue;
+                };
+                for &candidate in face {
+                    if candidate == *cell_index || !seen_neighbors.insert(candidate) {
+                        continue;
+                    }
+                    let Some(neighbor_dir) = visual_grid.vertices.get(candidate as usize) else {
+                        continue;
+                    };
+                    let p = vec2(neighbor_dir.dot(tangent_x), neighbor_dir.dot(tangent_y));
+                    let state = match buildings.get(&candidate).map(|neighbor| neighbor.kind) {
+                        Some(PlanetBuildingKind::Route) => '2',
+                        Some(_) => '1',
+                        None => '0',
+                    };
+                    neighbors.push((p.y.atan2(p.x), state));
+                }
+            }
+            neighbors.sort_by(|left, right| left.0.total_cmp(&right.0));
+            (neighbors.len() == sides).then(|| {
+                let key = format!(
+                    "p{}-{}",
+                    sides,
+                    neighbors.iter().map(|(_, state)| state).collect::<String>()
+                );
+                (
+                    key,
+                    neighbors.first().map(|(angle, _)| *angle).unwrap_or(0.0),
+                )
+            })
+        } else {
+            None
+        };
+
         let color = match kind {
             PlanetBuildingKind::Base => Color::from_rgba(80, 220, 220, 255),
             PlanetBuildingKind::Builder => Color::from_rgba(255, 214, 102, 255),
@@ -3960,6 +4015,55 @@ fn draw_sim_buildings(
             PlanetBuildingKind::Route => Color::from_rgba(220, 220, 120, 255),
         };
         let base_radius = radius + surface_lift;
+        let is_route = kind == PlanetBuildingKind::Route;
+        let source_mesh = if is_route {
+            route_state
+                .as_ref()
+                .and_then(|(key, _)| assets.get_state(ObjectId::PlanetRoute, key))
+        } else {
+            assets.get(building_object_id(kind))
+        };
+        if let Some(source_mesh) = source_mesh {
+            let model_radius = if is_route {
+                radius + surface_lift + 0.0005
+            } else {
+                base_radius
+            };
+            let height_scale = match kind {
+                PlanetBuildingKind::Route => 0.42,
+                PlanetBuildingKind::Logistics => 0.74,
+                PlanetBuildingKind::Warehouse => 0.70,
+                PlanetBuildingKind::Refuel => 0.78,
+                PlanetBuildingKind::Housing => 0.82,
+                PlanetBuildingKind::Builder => 0.90,
+                PlanetBuildingKind::Mine => 1.00,
+                PlanetBuildingKind::Factory => 1.08,
+                PlanetBuildingKind::Base => 1.15,
+            };
+            let model_height = if is_route {
+                0.00012
+            } else {
+                ((target_apothem * radius * 1.9) * height_scale).max(0.008)
+            };
+            let model_scale = outer_radius * model_radius;
+            let mesh = source_mesh.transformed(|point| {
+                let angle = route_state.as_ref().map(|(_, angle)| *angle).unwrap_or(0.0);
+                let local_x = point.x * angle.cos() - point.z * angle.sin();
+                let local_z = point.x * angle.sin() + point.z * angle.cos();
+                vertex_dir * (model_radius + point.y * model_height)
+                    + tangent_x * (local_x * model_scale)
+                    + tangent_y * (local_z * model_scale)
+            });
+            match mesh.render() {
+                Ok(()) => continue,
+                Err(error) => {
+                    eprintln!("GridGame could not render {} model: {error}", kind.label())
+                }
+            }
+            if !is_route {
+                continue;
+            }
+        }
         if kind == PlanetBuildingKind::Route {
             let route_lift = surface_lift + 0.0005;
             let route_radius = radius + route_lift;
@@ -4809,6 +4913,7 @@ pub fn run(
     state: &mut PlanetState,
     scene: &mut Scene,
     greek_font: Option<&Font>,
+    assets: &ObjectCatalog,
 ) {
     if is_key_pressed(KeyCode::Escape) {
         state.save_gameplay_state();
@@ -5255,6 +5360,7 @@ pub fn run(
             &state.buildings,
             radius,
             state.min_cell_edge_dist_unit,
+            assets,
         );
         let unit_color = ctx.colors_rt.port_out;
         let unit_outline = ctx.colors_rt.text_primary;
@@ -5296,7 +5402,30 @@ pub fn run(
                 }
                 let side = normal.cross(forward).normalize_or_zero();
                 let size = vec3(unit_length, unit_width, unit_height);
-                draw_oriented_prism(world, forward, side, normal, size, unit_color, unit_outline);
+                if let Some(source_mesh) = assets.get(ObjectId::PlanetUnit) {
+                    let mut mesh = source_mesh.transformed(|point| {
+                        world
+                            + forward * (point.x * unit_length / 1.2)
+                            + normal * (point.y * unit_height / 0.5)
+                            + side * (point.z * unit_width / 0.7)
+                    });
+                    for vertex in &mut mesh.vertices {
+                        vertex.color = unit_color.into();
+                    }
+                    if let Err(error) = mesh.render() {
+                        eprintln!("GridGame could not render planet unit model: {error}");
+                    }
+                } else {
+                    draw_oriented_prism(
+                        world,
+                        forward,
+                        side,
+                        normal,
+                        size,
+                        unit_color,
+                        unit_outline,
+                    );
+                }
             }
         }
     }

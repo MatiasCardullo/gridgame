@@ -7,6 +7,7 @@ use macroquad::prelude::*;
 
 mod core;
 mod scenes;
+use core::object_assets::ObjectCatalog;
 use core::ui::{UiButtonColors, WindowState};
 use core::{
     Axial, ConfigData, FrameContext, MachineBlockType, PlacedBlock, Scene, TileData, Unit,
@@ -59,6 +60,8 @@ async fn main() {
         show_units: false,
     };
     let mut units: Vec<Unit> = Vec::new();
+    let mut object_catalog = ObjectCatalog::load();
+    let mut cad_state = scenes::cad::CadSceneState::default();
     let mut planet_state: Option<scenes::planet::PlanetState> = None;
     let mut planet_loader = scenes::planet::PlanetLoader::start();
     let (api_tx, api_rx) = mpsc::channel();
@@ -188,7 +191,13 @@ async fn main() {
             }
             Scene::Planet => {
                 if let Some(state) = planet_state.as_mut() {
-                    scenes::planet::run(&ctx, state, &mut scene, greek_font.as_ref());
+                    scenes::planet::run(
+                        &ctx,
+                        state,
+                        &mut scene,
+                        greek_font.as_ref(),
+                        &object_catalog,
+                    );
                 } else {
                     draw_planet_loading_screen(&ctx, &planet_loader);
                     if is_key_pressed(KeyCode::Escape) {
@@ -213,10 +222,14 @@ async fn main() {
                         &mut scene,
                         &config,
                         &colors_rt,
+                        &object_catalog,
                     );
                 } else {
                     scene = Scene::Planet;
                 }
+            }
+            Scene::Cad => {
+                scenes::cad::run(&ctx, &mut cad_state, &mut object_catalog, &mut scene);
             }
         }
 

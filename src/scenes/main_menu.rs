@@ -67,6 +67,13 @@ pub fn run(
     }
     y += btn_h + 12.0;
 
+    let rect_cad = Rect::new((screen_width() - btn_w) * 0.5, y, btn_w, btn_h);
+    let (clicked_cad, _) = ui_button(rect_cad, "CAD", ctx.mouse, ctx.font_md, ctx.button_colors);
+    if clicked_cad {
+        *scene = Scene::Cad;
+    }
+    y += btn_h + 12.0;
+
     let rect_exit = Rect::new((screen_width() - btn_w) * 0.5, y, btn_w, btn_h);
     let (clicked_exit, _) = ui_button(
         rect_exit,

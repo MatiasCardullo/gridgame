@@ -22,6 +22,8 @@ cargo test
 ## Current implementation
 
 - Main menu and runtime configuration screen.
+- CAD object browser for planet buildings, units, and base-interior machine blocks, backed by editable GLB assets.
+- In-game object viewer/editor with orbit, zoom, pan, vertex/face selection, transforms, extrusion, save, and discard.
 - Procedurally generated spherical planet with cached mesh and simulation grid.
 - Depletable per-cell resources: iron, copper, gold, zinc, lead, aluminum, and water.
 - Planet buildings: Base, Builder, Housing, Factory, Mine, Warehouse, Refuel, Logistics, and Route.
@@ -63,6 +65,15 @@ for endpoints and request examples.
 - `R`: rotate selected block.
 - `Escape`: return to planet.
 
+### CAD object viewer
+
+- Select an object category and model in the left panel.
+- Right mouse drag: orbit; middle mouse drag: pan; mouse wheel: zoom.
+- Select **Edit**, then choose vertex or face selection.
+- Shift-click vertices to add or remove them from the selection.
+- Use the move and scale buttons to edit the selection; select a face and use **Extrude** to add geometry.
+- **Save** writes changes to the selected GLB asset; **Discard** restores its last saved geometry.
+
 ## Runtime data
 
 The game creates `planet_data/` as needed:
@@ -81,5 +92,8 @@ The game creates `planet_data/` as needed:
 - `src/main.rs`: application loop and scene routing.
 - `src/scenes/`: main menu, configuration, planet, and build-template scenes.
 - `src/core/`: shared grid, planet, unit, interior, persistence, and UI systems.
+- `src/core/object_assets.rs`: GLB mesh loading, saving, object catalog, and edit operations.
+- `src/scenes/cad.rs`: CAD object browser, viewer, camera, and mesh editor.
+- `assets/objects/`: tracked GLB models grouped into `buildings/`, `units/`, and `machine_blocks/`.
 - `config.json`: persisted runtime settings.
 - `roadmap.md`: implementation status and next milestones.

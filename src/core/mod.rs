@@ -4,6 +4,7 @@ pub mod build_units;
 pub mod common;
 pub mod debug;
 pub mod map_common;
+pub mod object_assets;
 pub mod planet_grid;
 pub mod planet_resources;
 pub mod planet_texture;

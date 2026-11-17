@@ -25,6 +25,8 @@ const FLOOR_DRAW_RADIUS: i32 = 22;
 const BELT_HEIGHT: f32 = 3.6;
 const BELT_HALF_LENGTH: f32 = 17.0;
 const BELT_HALF_WIDTH: f32 = 9.0;
+const BELT_WALL_EXTRA_HEIGHT: f32 = 2.0;
+const BELT_WALL_THICKNESS: f32 = 1.5;
 
 fn machine_block_color(kind: MachineBlockType) -> Color {
     match kind {
@@ -330,6 +332,22 @@ fn belt_end_side_lengths(
     center_distance: f32,
     front: bool,
 ) -> (f32, f32) {
+    belt_end_side_lengths_for_width(
+        direction,
+        connected_direction,
+        center_distance,
+        front,
+        BELT_HALF_WIDTH,
+    )
+}
+
+fn belt_end_side_lengths_for_width(
+    direction: Vec3,
+    connected_direction: Vec3,
+    center_distance: f32,
+    front: bool,
+    half_width: f32,
+) -> (f32, f32) {
     let axis = if front { direction } else { -direction };
     let side = vec3(-axis.z, 0.0, axis.x);
     let connected_side = vec3(-connected_direction.z, 0.0, connected_direction.x);
@@ -341,11 +359,11 @@ fn belt_end_side_lengths(
         return (half_distance, half_distance);
     }
 
-    let connected_edge = side_offset.signum() * BELT_HALF_WIDTH;
+    let connected_edge = side_offset.signum() * half_width;
     let negative_side =
-        (connected_edge - side_offset + BELT_HALF_WIDTH * side.dot(connected_side)) / across_axis;
+        (connected_edge - side_offset + half_width * side.dot(connected_side)) / across_axis;
     let positive_side =
-        (connected_edge - side_offset - BELT_HALF_WIDTH * side.dot(connected_side)) / across_axis;
+        (connected_edge - side_offset - half_width * side.dot(connected_side)) / across_axis;
     let lengths = (negative_side.max(0.0), positive_side.max(0.0));
     if front {
         lengths
@@ -372,6 +390,129 @@ fn belt_connection(
     ))
 }
 
+fn belt_side_wall_gaps(
+    interior: &BaseInteriorState,
+    hex: Axial,
+    rotation: usize,
+) -> [Vec<(f32, f32)>; 2] {
+    let rotation = rotation % 6;
+    let front_index = rotation;
+    let back_index = (rotation + 3) % 6;
+    let direction = rotation_dir(rotation as u8);
+    let side = vec3(-direction.z, 0.0, direction.x);
+    let center = hex_world_center(hex, 0.0);
+    let neighbors = axial_neighbors(hex);
+    let mut gaps = [Vec::new(), Vec::new()];
+
+    for (neighbor_index, neighbor_hex) in neighbors.into_iter().enumerate() {
+        if neighbor_index == front_index || neighbor_index == back_index {
+            continue;
+        }
+        let Some(block) = interior.block_at(neighbor_hex) else {
+            continue;
+        };
+        let neighbor_rotation = block.rotation as usize % 6;
+        if block.kind != MachineBlockType::ConveyorBelt
+            || (neighbor_rotation != neighbor_index
+                && neighbor_rotation != (neighbor_index + 3) % 6)
+        {
+            continue;
+        }
+        let relative = hex_world_center(neighbor_hex, 0.0) - center;
+        let side_index = usize::from(relative.dot(side) >= 0.0);
+        let neighbor_direction = rotation_dir(block.rotation);
+        let neighbor_front = belt_connection(interior, neighbor_hex, block.rotation as usize % 6);
+        let neighbor_back =
+            belt_connection(interior, neighbor_hex, (block.rotation as usize + 3) % 6);
+        let neighbor_front_lengths = neighbor_front
+            .map(|(connected_direction, distance)| {
+                belt_end_side_lengths(neighbor_direction, connected_direction, distance, true)
+            })
+            .unwrap_or((BELT_HALF_LENGTH, BELT_HALF_LENGTH));
+        let neighbor_back_lengths = neighbor_back
+            .map(|(connected_direction, distance)| {
+                belt_end_side_lengths(neighbor_direction, connected_direction, distance, false)
+            })
+            .unwrap_or((BELT_HALF_LENGTH, BELT_HALF_LENGTH));
+        let neighbor_side = vec3(-neighbor_direction.z, 0.0, neighbor_direction.x);
+        let neighbor_center = hex_world_center(neighbor_hex, 0.0);
+        let neighbor_polygon = [
+            neighbor_center + neighbor_direction * neighbor_front_lengths.0
+                - neighbor_side * BELT_HALF_WIDTH,
+            neighbor_center
+                + neighbor_direction * neighbor_front_lengths.1
+                + neighbor_side * BELT_HALF_WIDTH,
+            neighbor_center - neighbor_direction * neighbor_back_lengths.1
+                + neighbor_side * BELT_HALF_WIDTH,
+            neighbor_center
+                - neighbor_direction * neighbor_back_lengths.0
+                - neighbor_side * BELT_HALF_WIDTH,
+        ];
+        let wall_line_origin = center
+            + side
+                * (if side_index == 0 {
+                    -BELT_HALF_WIDTH
+                } else {
+                    BELT_HALF_WIDTH
+                });
+        let mut intersections = Vec::new();
+        for edge_index in 0..neighbor_polygon.len() {
+            let start = neighbor_polygon[edge_index];
+            let end = neighbor_polygon[(edge_index + 1) % neighbor_polygon.len()];
+            let edge = end - start;
+            let offset = start - wall_line_origin;
+            let denominator = direction.x * edge.z - direction.z * edge.x;
+            if denominator.abs() < 1e-4 {
+                continue;
+            }
+            let distance = (offset.x * edge.z - offset.z * edge.x) / denominator;
+            let edge_fraction = (offset.x * direction.z - offset.z * direction.x) / denominator;
+            if (-1e-4..=1.0001).contains(&edge_fraction) {
+                intersections.push(distance);
+            }
+        }
+        intersections.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        intersections.dedup_by(|a, b| (*a - *b).abs() < 1e-3);
+        if let (Some(first), Some(last)) = (intersections.first(), intersections.last()) {
+            if last - first > 1e-3 {
+                gaps[side_index].push((*first, *last));
+            }
+        }
+    }
+
+    gaps
+}
+
+fn belt_wall_sections(start: f32, end: f32, gaps: &[(f32, f32)]) -> Vec<(f32, f32)> {
+    let mut gaps = gaps.to_vec();
+    gaps.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+    let mut sections = Vec::with_capacity(gaps.len() + 1);
+    let mut cursor = start;
+    for (gap_start, gap_end) in gaps {
+        let gap_start = gap_start.max(start).min(end);
+        let gap_end = gap_end.max(start).min(end);
+        if gap_start > cursor {
+            sections.push((cursor, gap_start));
+        }
+        cursor = cursor.max(gap_end);
+    }
+    if cursor < end {
+        sections.push((cursor, end));
+    }
+    sections
+}
+
+fn belt_has_angled_front_connection(
+    interior: &BaseInteriorState,
+    hex: Axial,
+    rotation: u8,
+) -> bool {
+    let direction = rotation_dir(rotation);
+    belt_connection(interior, hex, rotation as usize % 6)
+        .map(|(connected_direction, _)| direction.dot(connected_direction) < 0.999)
+        .unwrap_or(false)
+}
+
 fn push_belt_quad(
     vertices: &mut Vec<Vertex>,
     indices: &mut Vec<u16>,
@@ -385,6 +526,149 @@ fn push_belt_quad(
             .map(|point| Vertex::new(point.x, point.y, point.z, 0.0, 0.0, color)),
     );
     indices.extend([first, first + 1, first + 2, first + 1, first + 3, first + 2]);
+}
+
+fn draw_belt_wall(
+    center: Vec3,
+    direction: Vec3,
+    side_sign: f32,
+    start_fraction: f32,
+    end_fraction: f32,
+    inner_back_length: f32,
+    inner_front_length: f32,
+    outer_back_length: f32,
+    outer_front_length: f32,
+    fill: Color,
+    outline: Color,
+    wire_only: bool,
+) {
+    let side = vec3(-direction.z, 0.0, direction.x);
+    let inner_offset = side * (BELT_HALF_WIDTH * side_sign);
+    let outer_offset = side * ((BELT_HALF_WIDTH + BELT_WALL_THICKNESS) * side_sign);
+    let bottom = vec3(0.0, -center.y, 0.0);
+    let top = vec3(0.0, BELT_HEIGHT + BELT_WALL_EXTRA_HEIGHT, 0.0);
+    let inner_start_length =
+        -inner_back_length + (inner_back_length + inner_front_length) * start_fraction;
+    let inner_end_length =
+        -inner_back_length + (inner_back_length + inner_front_length) * end_fraction;
+    let outer_start_length =
+        -outer_back_length + (outer_back_length + outer_front_length) * start_fraction;
+    let outer_end_length =
+        -outer_back_length + (outer_back_length + outer_front_length) * end_fraction;
+    let inner_start = center + direction * inner_start_length + inner_offset;
+    let inner_end = center + direction * inner_end_length + inner_offset;
+    let outer_start = center + direction * outer_start_length + outer_offset;
+    let outer_end = center + direction * outer_end_length + outer_offset;
+    let corners = [
+        inner_start + bottom,
+        inner_end + bottom,
+        outer_start + bottom,
+        outer_end + bottom,
+        inner_start + top,
+        inner_end + top,
+        outer_start + top,
+        outer_end + top,
+    ];
+
+    if wire_only {
+        for (start, end) in [
+            (0, 1),
+            (2, 3),
+            (4, 5),
+            (6, 7),
+            (0, 4),
+            (1, 5),
+            (2, 6),
+            (3, 7),
+            (0, 2),
+            (1, 3),
+            (4, 6),
+            (5, 7),
+        ] {
+            draw_line_3d(corners[start], corners[end], outline);
+        }
+        return;
+    }
+
+    let mut vertices = Vec::new();
+    let mut indices = Vec::new();
+    push_belt_quad(
+        &mut vertices,
+        &mut indices,
+        [corners[2], corners[3], corners[6], corners[7]],
+        fill,
+    );
+    push_belt_quad(
+        &mut vertices,
+        &mut indices,
+        [corners[0], corners[4], corners[1], corners[5]],
+        shade(fill, 0.8),
+    );
+    push_belt_quad(
+        &mut vertices,
+        &mut indices,
+        [corners[4], corners[6], corners[5], corners[7]],
+        shade(fill, 1.2),
+    );
+    push_belt_quad(
+        &mut vertices,
+        &mut indices,
+        [corners[0], corners[2], corners[4], corners[6]],
+        shade(fill, 0.9),
+    );
+    push_belt_quad(
+        &mut vertices,
+        &mut indices,
+        [corners[1], corners[5], corners[3], corners[7]],
+        shade(fill, 0.9),
+    );
+    draw_mesh(&Mesh {
+        vertices,
+        indices,
+        texture: None,
+    });
+}
+
+fn draw_belt_walls(
+    center: Vec3,
+    direction: Vec3,
+    front_lengths: (f32, f32),
+    back_lengths: (f32, f32),
+    front_outer_lengths: (f32, f32),
+    back_outer_lengths: (f32, f32),
+    side_wall_gaps: [Vec<(f32, f32)>; 2],
+    wire_only: bool,
+) {
+    let wall_color = Color::from_rgba(115, 115, 120, 255);
+    let wall_outline = shade(wall_color, 0.55);
+    for (side_index, side_sign) in [-1.0_f32, 1.0].into_iter().enumerate() {
+        let front_length = [front_lengths.0, front_lengths.1][side_index];
+        let back_length = [back_lengths.0, back_lengths.1][side_index];
+        let front_outer_length = [front_outer_lengths.0, front_outer_lengths.1][side_index];
+        let back_outer_length = [back_outer_lengths.0, back_outer_lengths.1][side_index];
+        let total_inner_length = back_length + front_length;
+        if total_inner_length <= f32::EPSILON {
+            continue;
+        }
+        for (start, end) in
+            belt_wall_sections(-back_length, front_length, &side_wall_gaps[side_index])
+        {
+            draw_belt_wall(
+                center,
+                direction,
+                side_sign,
+                (start + back_length) / total_inner_length,
+                (end + back_length) / total_inner_length,
+                back_length,
+                front_length,
+                back_outer_length,
+                front_outer_length,
+                wall_color,
+                wall_outline,
+                wire_only,
+            );
+        }
+    }
 }
 
 fn draw_belt_prism(
@@ -415,16 +699,7 @@ fn draw_belt_prism(
     let back_positive_bottom = back_positive + bottom_offset;
 
     if wire_only {
-        let mut edges = vec![
-            (front_negative, back_negative),
-            (front_positive, back_positive),
-            (front_negative_bottom, back_negative_bottom),
-            (front_positive_bottom, back_positive_bottom),
-            (front_negative, front_negative_bottom),
-            (back_negative, back_negative_bottom),
-            (front_positive, front_positive_bottom),
-            (back_positive, back_positive_bottom),
-        ];
+        let mut edges = Vec::new();
         if !front_connected {
             edges.extend([
                 (front_negative, front_positive),
@@ -448,28 +723,6 @@ fn draw_belt_prism(
             &mut indices,
             [front_negative, front_positive, back_negative, back_positive],
             fill,
-        );
-        push_belt_quad(
-            &mut vertices,
-            &mut indices,
-            [
-                front_negative_bottom,
-                back_negative_bottom,
-                front_negative,
-                back_negative,
-            ],
-            Color::from_rgba(24, 24, 27, 255),
-        );
-        push_belt_quad(
-            &mut vertices,
-            &mut indices,
-            [
-                front_positive_bottom,
-                back_positive_bottom,
-                front_positive,
-                back_positive,
-            ],
-            Color::from_rgba(24, 24, 27, 255),
         );
         if !front_connected {
             push_belt_quad(
@@ -635,6 +888,30 @@ fn draw_machine_block(
                     belt_end_side_lengths(dir, connected_dir, distance, false)
                 })
                 .unwrap_or((BELT_HALF_LENGTH, BELT_HALF_LENGTH));
+            let wall_half_width = BELT_HALF_WIDTH + BELT_WALL_THICKNESS;
+            let front_outer_lengths = front_connection
+                .map(|(connected_dir, distance)| {
+                    belt_end_side_lengths_for_width(
+                        dir,
+                        connected_dir,
+                        distance,
+                        true,
+                        wall_half_width,
+                    )
+                })
+                .unwrap_or((BELT_HALF_LENGTH, BELT_HALF_LENGTH));
+            let back_outer_lengths = back_connection
+                .map(|(connected_dir, distance)| {
+                    belt_end_side_lengths_for_width(
+                        dir,
+                        connected_dir,
+                        distance,
+                        false,
+                        wall_half_width,
+                    )
+                })
+                .unwrap_or((BELT_HALF_LENGTH, BELT_HALF_LENGTH));
+            let side_wall_gaps = belt_side_wall_gaps(interior, hex, rotation as usize % 6);
             draw_belt_prism(
                 center,
                 dir,
@@ -646,10 +923,24 @@ fn draw_machine_block(
                 outline,
                 wire_only,
             );
+            draw_belt_walls(
+                center,
+                dir,
+                front_lengths,
+                back_lengths,
+                front_outer_lengths,
+                back_outer_lengths,
+                side_wall_gaps,
+                wire_only,
+            );
             let side = vec3(-dir.z, 0.0, dir.x);
             let top = center + vec3(0.0, 4.6, 0.0);
             let arrow_color = Color::from_rgba(255, 220, 0, 255);
-            for offset in [-7.0_f32, 6.0] {
+            let mut arrow_offsets = vec![-7.0_f32, 6.0];
+            if belt_has_angled_front_connection(interior, hex, rotation) {
+                arrow_offsets.push(19.0);
+            }
+            for offset in arrow_offsets {
                 let mid = top + dir * offset;
                 let a = mid - dir * 5.0 + side * 3.5;
                 let b = mid;
@@ -1749,6 +2040,15 @@ mod tests {
         let back = belt_end_side_lengths(direction, angled_direction, 26.0, false);
         assert!(front.0 < 13.0 && front.1 > 13.0);
         assert!(back.0 > 13.0 && back.1 < 13.0);
+        let wall_front = belt_end_side_lengths_for_width(
+            direction,
+            angled_direction,
+            26.0,
+            true,
+            BELT_HALF_WIDTH + BELT_WALL_THICKNESS,
+        );
+        assert!(wall_front.0 < BELT_HALF_LENGTH);
+        assert!(wall_front.1 > BELT_HALF_LENGTH);
         let connected_side = vec3(-angled_direction.z, 0.0, angled_direction.x);
         let belt_side = vec3(0.0, 0.0, 1.0);
         for (is_front, lengths) in [(true, front), (false, back)] {
@@ -1769,5 +2069,81 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn belt_side_wall_gaps_cover_all_directions_and_rotations() {
+        let hex = Axial { q: 0, r: 0 };
+        for rotation in 0..6 {
+            for side_offset in [1, 2, 4, 5] {
+                let neighbor_index = (rotation + side_offset) % 6;
+                let neighbor_hex = axial_neighbors(hex)[neighbor_index];
+                let expected_side = if side_offset == 1 || side_offset == 2 {
+                    0
+                } else {
+                    1
+                };
+                for neighbor_rotation in [neighbor_index, (neighbor_index + 3) % 6] {
+                    let mut interior = BaseInteriorState::default();
+                    interior.blocks.clear();
+                    interior.upsert_block(
+                        neighbor_hex,
+                        MachineBlock {
+                            kind: MachineBlockType::ConveyorBelt,
+                            rotation: neighbor_rotation as u8,
+                        },
+                    );
+
+                    let gaps = belt_side_wall_gaps(&interior, hex, rotation);
+                    assert_eq!(gaps[expected_side].len(), 1);
+                    assert!(gaps[expected_side][0].0 < gaps[expected_side][0].1);
+                    assert!(
+                        gaps[1 - expected_side].is_empty(),
+                        "rotation {rotation}, side offset {side_offset}"
+                    );
+                }
+
+                let mut interior = BaseInteriorState::default();
+                interior.blocks.clear();
+                interior.upsert_block(
+                    neighbor_hex,
+                    MachineBlock {
+                        kind: MachineBlockType::ConveyorBelt,
+                        rotation: ((neighbor_index + 1) % 6) as u8,
+                    },
+                );
+                assert_eq!(
+                    belt_side_wall_gaps(&interior, hex, rotation),
+                    [Vec::new(), Vec::new()],
+                    "non-connecting rotation {rotation}, side offset {side_offset}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn belt_wall_sections_keep_wall_on_both_sides_of_a_merge_gap() {
+        assert_eq!(
+            belt_wall_sections(-17.0, 17.0, &[(-4.0, 5.0)]),
+            vec![(-17.0, -4.0), (5.0, 17.0)]
+        );
+    }
+
+    #[test]
+    fn angled_front_belt_connection_gets_merge_arrow() {
+        let hex = Axial { q: 0, r: 0 };
+        let front_hex = axial_neighbors(hex)[0];
+        let mut interior = BaseInteriorState::default();
+        interior.upsert_block(
+            front_hex,
+            MachineBlock {
+                kind: MachineBlockType::ConveyorBelt,
+                rotation: 1,
+            },
+        );
+
+        assert!(belt_has_angled_front_connection(&interior, hex, 0));
+        interior.block_at_mut(front_hex).unwrap().rotation = 0;
+        assert!(!belt_has_angled_front_connection(&interior, hex, 0));
     }
 }

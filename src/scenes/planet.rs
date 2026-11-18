@@ -23,7 +23,10 @@ use crate::core::debug::{
 use crate::core::map_common::{
     MapOutline, build_panel_layout, handle_window_drag, in_bounds, is_ui_capturing,
 };
-use crate::core::object_assets::{ObjectCatalog, ObjectId};
+use crate::core::object_assets::{
+    EditableMesh, ObjectCatalog, ObjectId, RadialNeighborState, VariantMode,
+    radial_sector_state_key,
+};
 use crate::core::planet_grid::{
     HexGrid, align_vertices_to_poles, build_faces, build_frequency_geodesic, build_geodesic_sphere,
     build_hex_grid_from_data, build_vertex_neighbors, icosahedron_edges, icosahedron_vertices,
@@ -3903,6 +3906,15 @@ fn draw_global_hex_cell(
     Some(best_index)
 }
 
+fn rotate_radial_sector(mesh: &EditableMesh, sector: usize, sides: usize) -> EditableMesh {
+    let angle = std::f32::consts::TAU * sector as f32 / sides as f32;
+    mesh.transformed(|point| {
+        let x = point.x * angle.cos() - point.z * angle.sin();
+        let z = point.x * angle.sin() + point.z * angle.cos();
+        vec3(x, point.y, z)
+    })
+}
+
 fn draw_sim_buildings(
     visual_grid: &HexGrid,
     _sim_world: Option<&PlanetSimWorld>,
@@ -3964,7 +3976,14 @@ fn draw_sim_buildings(
             outer_dirs.push((vertex_dir + ring * outer_radius).normalize());
         }
 
-        let route_state = if kind == PlanetBuildingKind::Route {
+        let object_id = building_object_id(kind);
+        let variant_mode = assets
+            .variant_config(object_id)
+            .map(|config| config.mode)
+            .unwrap_or(VariantMode::None);
+        let route_state = if kind == PlanetBuildingKind::Route
+            || variant_mode == VariantMode::Custom
+        {
             let mut seen_neighbors = HashSet::new();
             let mut neighbors = Vec::new();
             for &face_index in face_list {
@@ -3980,9 +3999,9 @@ fn draw_sim_buildings(
                     };
                     let p = vec2(neighbor_dir.dot(tangent_x), neighbor_dir.dot(tangent_y));
                     let state = match buildings.get(&candidate).map(|neighbor| neighbor.kind) {
-                        Some(PlanetBuildingKind::Route) => '2',
-                        Some(_) => '1',
-                        None => '0',
+                        Some(PlanetBuildingKind::Route) => RadialNeighborState::Route,
+                        Some(_) => RadialNeighborState::OtherBuilding,
+                        None => RadialNeighborState::Empty,
                     };
                     neighbors.push((p.y.atan2(p.x), state));
                 }
@@ -3992,11 +4011,22 @@ fn draw_sim_buildings(
                 let key = format!(
                     "p{}-{}",
                     sides,
-                    neighbors.iter().map(|(_, state)| state).collect::<String>()
+                    neighbors
+                        .iter()
+                        .map(|(_, state)| match state {
+                            RadialNeighborState::Empty => '0',
+                            RadialNeighborState::OtherBuilding => '1',
+                            RadialNeighborState::Route => '2',
+                        })
+                        .collect::<String>()
                 );
                 (
                     key,
                     neighbors.first().map(|(angle, _)| *angle).unwrap_or(0.0),
+                    neighbors
+                        .into_iter()
+                        .map(|(_, state)| state)
+                        .collect::<Vec<_>>(),
                 )
             })
         } else {
@@ -4016,14 +4046,72 @@ fn draw_sim_buildings(
         };
         let base_radius = radius + surface_lift;
         let is_route = kind == PlanetBuildingKind::Route;
-        let source_mesh = if is_route {
+        let radial_group_program = assets
+            .metadata(object_id, None)
+            .is_some_and(|metadata| metadata.radial_main_group_id().is_some());
+        let source_mesh = if is_route && radial_group_program {
             route_state
                 .as_ref()
-                .and_then(|(key, _)| assets.get_state(ObjectId::PlanetRoute, key))
+                .and_then(|(_, _, neighbors)| {
+                    let metadata = assets.metadata(object_id, None)?;
+                    let base_mesh = assets.get(object_id)?;
+                    let mut composite = EditableMesh {
+                        vertices: Vec::new(),
+                        indices: Vec::new(),
+                    };
+                    for (sector_index, condition) in neighbors.iter().copied().enumerate() {
+                        let sector_mesh = match metadata.radial_sector_mesh(base_mesh, condition) {
+                            Ok(Some(sector_mesh)) => sector_mesh,
+                            Ok(None) => return None,
+                            Err(error) => {
+                                eprintln!("GridGame could not build route sector: {error}");
+                                return None;
+                            }
+                        };
+                        let sector_mesh = rotate_radial_sector(&sector_mesh, sector_index, sides);
+                        if let Err(error) = composite.append(&sector_mesh) {
+                            eprintln!("GridGame could not compose route sector: {error}");
+                            return None;
+                        }
+                    }
+                    Some(composite)
+                })
+                .or_else(|| assets.get(object_id).cloned())
+        } else if is_route && variant_mode == VariantMode::Radial {
+            route_state
+                .as_ref()
+                .and_then(|(_, _, neighbors)| {
+                    let mut composite = EditableMesh {
+                        vertices: Vec::new(),
+                        indices: Vec::new(),
+                    };
+                    for (sector, condition) in neighbors.iter().copied().enumerate() {
+                        let key = radial_sector_state_key(sides, sector, condition);
+                        let state_mesh = assets.get_state(ObjectId::PlanetRoute, &key)?;
+                        if let Err(error) = composite.append(state_mesh) {
+                            eprintln!("GridGame could not compose route state {key}: {error}");
+                            return None;
+                        }
+                    }
+                    Some(composite)
+                })
+                .or_else(|| assets.get(object_id).cloned())
+        } else if variant_mode == VariantMode::Custom {
+            route_state
+                .as_ref()
+                .and_then(|(key, _, _)| assets.custom_state_key(object_id, key))
+                .and_then(|key| assets.get_state(object_id, key))
+                .cloned()
+                .or_else(|| assets.get(object_id).cloned())
+        } else if is_route {
+            route_state
+                .as_ref()
+                .and_then(|(key, _, _)| assets.get_state(ObjectId::PlanetRoute, key))
+                .cloned()
         } else {
-            assets.get(building_object_id(kind))
+            assets.get(object_id).cloned()
         };
-        if let Some(source_mesh) = source_mesh {
+        if let Some(source_mesh) = source_mesh.as_ref() {
             let model_radius = if is_route {
                 radius + surface_lift + 0.0005
             } else {
@@ -4047,7 +4135,14 @@ fn draw_sim_buildings(
             };
             let model_scale = outer_radius * model_radius;
             let mesh = source_mesh.transformed(|point| {
-                let angle = route_state.as_ref().map(|(_, angle)| *angle).unwrap_or(0.0);
+                let angle = if is_route {
+                    route_state
+                        .as_ref()
+                        .map(|(_, angle, _)| *angle)
+                        .unwrap_or(0.0)
+                } else {
+                    0.0
+                };
                 let local_x = point.x * angle.cos() - point.z * angle.sin();
                 let local_z = point.x * angle.sin() + point.z * angle.cos();
                 vertex_dir * (model_radius + point.y * model_height)
@@ -6533,6 +6628,27 @@ mod tests {
     use crate::core::planet_resources::{
         LithologyKind, PlanetCellState, PlanetDeposit, sim_world_for_tests,
     };
+
+    #[test]
+    fn radial_sector_rotation_positions_geometry_in_five_and_six_slots() {
+        let mesh = EditableMesh {
+            vertices: vec![Vertex::new2(Vec3::X, Vec2::ZERO, WHITE)],
+            indices: Vec::new(),
+        };
+        let pentagon_sector = rotate_radial_sector(&mesh, 1, 5);
+        let hexagon_sector = rotate_radial_sector(&mesh, 3, 6);
+
+        assert!(
+            (pentagon_sector.vertices[0].position.x - (std::f32::consts::TAU / 5.0).cos()).abs()
+                < 1e-6
+        );
+        assert!(
+            (pentagon_sector.vertices[0].position.z - (std::f32::consts::TAU / 5.0).sin()).abs()
+                < 1e-6
+        );
+        assert!((hexagon_sector.vertices[0].position.x + 1.0).abs() < 1e-6);
+        assert!(hexagon_sector.vertices[0].position.z.abs() < 1e-6);
+    }
 
     fn test_building() -> PlanetBuildingState {
         PlanetBuildingState {

@@ -3,7 +3,7 @@ use std::collections::HashSet;
 use macroquad::prelude::*;
 
 use crate::core::object_assets::{
-    EditableMesh, FaceMetadata, ObjectCatalog, ObjectCategory, ObjectId,
+    EditableMesh, FaceGroupProgram, FaceMetadata, ObjectCatalog, ObjectCategory, ObjectId,
 };
 use crate::core::ui::ui_button;
 use crate::core::{FrameContext, Scene};
@@ -54,7 +54,6 @@ enum SidebarItem {
 pub struct CadSceneState {
     category: ObjectCategory,
     selected: ObjectId,
-    selected_state: Option<String>,
     editing: bool,
     dirty: bool,
     exit_confirmation_open: bool,
@@ -82,7 +81,6 @@ impl Default for CadSceneState {
         Self {
             category: ObjectCategory::Buildings,
             selected: ObjectId::PlanetBase,
-            selected_state: None,
             editing: false,
             dirty: false,
             exit_confirmation_open: false,
@@ -126,7 +124,7 @@ fn object_camera(state: &CadSceneState) -> Camera3D {
 }
 
 fn zoom_distance(distance: f32, wheel: f32) -> f32 {
-    (distance * (-wheel * 0.05).exp()).clamp(CAMERA_MIN_DISTANCE, CAMERA_MAX_DISTANCE)
+    (distance * (-wheel * 0.01).exp()).clamp(CAMERA_MIN_DISTANCE, CAMERA_MAX_DISTANCE)
 }
 
 fn mesh_center_and_scale(mesh: &EditableMesh) -> (Vec3, f32) {
@@ -366,42 +364,28 @@ fn selected_mesh<'a>(
     catalog: &'a ObjectCatalog,
     state: &CadSceneState,
 ) -> Option<&'a EditableMesh> {
-    state
-        .selected_state
-        .as_deref()
-        .and_then(|key| catalog.get_state(state.selected, key))
-        .or_else(|| {
-            state
-                .selected_state
-                .is_none()
-                .then(|| catalog.get(state.selected))
-                .flatten()
-        })
+    catalog.get(state.selected)
 }
 
 fn selected_mesh_mut<'a>(
     catalog: &'a mut ObjectCatalog,
     state: &CadSceneState,
 ) -> Option<&'a mut EditableMesh> {
-    if let Some(key) = state.selected_state.as_deref() {
-        catalog.get_state_mut(state.selected, key)
-    } else {
-        catalog.get_mut(state.selected)
-    }
+    catalog.get_mut(state.selected)
 }
 
 fn selected_metadata<'a>(
     catalog: &'a ObjectCatalog,
     state: &CadSceneState,
 ) -> Option<&'a FaceMetadata> {
-    catalog.metadata(state.selected, state.selected_state.as_deref())
+    catalog.metadata(state.selected, None)
 }
 
 fn selected_metadata_mut<'a>(
     catalog: &'a mut ObjectCatalog,
     state: &CadSceneState,
 ) -> Option<&'a mut FaceMetadata> {
-    catalog.metadata_mut(state.selected, state.selected_state.as_deref())
+    catalog.metadata_mut(state.selected, None)
 }
 
 fn capture_snapshot(
@@ -484,10 +468,7 @@ fn save_selected_mesh(catalog: &mut ObjectCatalog, state: &CadSceneState) -> Res
     let mesh = selected_mesh(catalog, state)
         .cloned()
         .ok_or_else(|| "Selected object is unavailable".to_string())?;
-    match state.selected_state.as_deref() {
-        Some(key) => catalog.save_state(state.selected, key, mesh),
-        None => catalog.save(state.selected, mesh),
-    }
+    catalog.save(state.selected, mesh)
 }
 
 fn restore_original_mesh(
@@ -532,25 +513,8 @@ fn close_editor(state: &mut CadSceneState) {
     state.redo_stack.clear();
 }
 
-fn state_index(entry: &crate::core::object_assets::CatalogEntry, state: &CadSceneState) -> usize {
-    state
-        .selected_state
-        .as_deref()
-        .and_then(|key| entry.states.iter().position(|variant| variant.key == key))
-        .map(|index| index + 1)
-        .unwrap_or(0)
-}
-
-fn state_key_at(entry: &crate::core::object_assets::CatalogEntry, index: usize) -> Option<String> {
-    index
-        .checked_sub(1)
-        .and_then(|variant_index| entry.states.get(variant_index))
-        .map(|variant| variant.key.clone())
-}
-
 fn switch_to_object(state: &mut CadSceneState, id: ObjectId) {
     state.selected = id;
-    state.selected_state = None;
     state.editing = false;
     state.dirty = false;
     state.original_mesh = None;
@@ -567,24 +531,6 @@ fn switch_to_object(state: &mut CadSceneState, id: ObjectId) {
     state.error = None;
     state.target = Vec3::ZERO;
     state.distance = 4.0;
-}
-
-fn switch_to_state(state: &mut CadSceneState, key: Option<String>) {
-    state.selected_state = key;
-    state.editing = false;
-    state.dirty = false;
-    state.original_mesh = None;
-    state.original_metadata = None;
-    state.selection_mode = SelectionMode::Vertex;
-    state.selected_faces.clear();
-    state.selected_group = None;
-    state.selected_vertices.clear();
-    state.dragged_faces = None;
-    state.rename_dialog = None;
-    state.undo_stack.clear();
-    state.redo_stack.clear();
-    state.face_scroll = 0;
-    state.error = None;
 }
 
 fn move_selected(mesh: &mut EditableMesh, state: &CadSceneState, offset: Vec3) -> bool {
@@ -663,19 +609,62 @@ fn selected_indices(mesh: &EditableMesh, state: &CadSceneState) -> Vec<usize> {
 }
 
 fn sidebar_items(metadata: &FaceMetadata, face_count: usize) -> Vec<SidebarItem> {
-    let mut items = Vec::new();
-    let mut grouped_faces = HashSet::new();
-    for group in &metadata.groups {
-        items.push(SidebarItem::Group(group.id));
+    fn append_group(
+        metadata: &FaceMetadata,
+        group_id: u64,
+        face_count: usize,
+        grouped_faces: &mut HashSet<usize>,
+        visited: &mut HashSet<u64>,
+        items: &mut Vec<SidebarItem>,
+    ) {
+        if !visited.insert(group_id) {
+            return;
+        }
+        let Some(group) = metadata.group(group_id) else {
+            return;
+        };
+        items.push(SidebarItem::Group(group_id));
         for &face in &group.faces {
             if face < face_count {
                 grouped_faces.insert(face);
                 items.push(SidebarItem::Face {
                     index: face,
-                    group: Some(group.id),
+                    group: Some(group_id),
                 });
             }
         }
+        for child in metadata
+            .groups
+            .iter()
+            .filter(|child| child.parent_id == Some(group_id))
+        {
+            append_group(
+                metadata,
+                child.id,
+                face_count,
+                grouped_faces,
+                visited,
+                items,
+            );
+        }
+    }
+
+    let mut items = Vec::new();
+    let mut grouped_faces = HashSet::new();
+    let mut visited = HashSet::new();
+    for group in metadata
+        .groups
+        .iter()
+        .filter(|group| group.parent_id.is_none())
+    {
+        append_group(
+            metadata,
+            group.id,
+            face_count,
+            &mut grouped_faces,
+            &mut visited,
+            &mut items,
+        );
     }
     for face in 0..face_count {
         if !grouped_faces.contains(&face) {
@@ -686,6 +675,20 @@ fn sidebar_items(metadata: &FaceMetadata, face_count: usize) -> Vec<SidebarItem>
         }
     }
     items
+}
+
+fn group_depth(metadata: &FaceMetadata, group_id: u64) -> usize {
+    let mut depth = 0;
+    let mut current = metadata.group(group_id).and_then(|group| group.parent_id);
+    let mut visited = HashSet::new();
+    while let Some(parent_id) = current {
+        if !visited.insert(parent_id) {
+            break;
+        }
+        depth += 1;
+        current = metadata.group(parent_id).and_then(|group| group.parent_id);
+    }
+    depth
 }
 
 fn select_face(state: &mut CadSceneState, face: usize, extend: bool) {
@@ -713,12 +716,12 @@ fn select_group(
     metadata: &FaceMetadata,
     group_id: u64,
 ) -> Result<(), String> {
-    let group = metadata
-        .group(group_id)
+    let faces = metadata
+        .faces_for_group(group_id)
         .ok_or_else(|| format!("face group {group_id} does not exist"))?;
     state.selection_mode = SelectionMode::Face;
     state.selected_group = Some(group_id);
-    state.selected_faces = group.faces.clone();
+    state.selected_faces = faces;
     state.selected_vertices.clear();
     Ok(())
 }
@@ -729,9 +732,16 @@ fn create_selected_group(
 ) -> Result<(), String> {
     let snapshot = capture_snapshot(catalog, state)?;
     let selected_faces = state.selected_faces.clone();
+    let parent_id = selected_metadata(catalog, state).and_then(|metadata| {
+        state.selected_group.or_else(|| {
+            (state.selected == ObjectId::PlanetRoute)
+                .then(|| metadata.radial_main_group_id())
+                .flatten()
+        })
+    });
     let group_id = selected_metadata_mut(catalog, state)
         .ok_or_else(|| "Selected face metadata is unavailable".to_string())?
-        .create_group(&selected_faces)?;
+        .create_group_under(&selected_faces, parent_id)?;
     let group_faces = selected_metadata(catalog, state)
         .and_then(|metadata| metadata.group(group_id))
         .map(|group| group.faces.clone())
@@ -970,11 +980,21 @@ pub fn run(
         for row in state.face_scroll..(state.face_scroll + visible_rows).min(items.len()) {
             let item = items[row];
             let y = FACE_LIST_TOP + (row - state.face_scroll) as f32 * FACE_ROW_HEIGHT;
-            let nested_face = matches!(item, SidebarItem::Face { group: Some(_), .. });
+            let (depth, nested_face) = selected_metadata(catalog, state)
+                .map(|metadata| match item {
+                    SidebarItem::Group(group_id) => (group_depth(metadata, group_id), false),
+                    SidebarItem::Face {
+                        group: Some(group_id),
+                        ..
+                    } => (group_depth(metadata, group_id), true),
+                    SidebarItem::Face { group: None, .. } => (0, false),
+                })
+                .unwrap_or((0, false));
+            let indent = depth as f32 * 10.0 + if nested_face { 10.0 } else { 0.0 };
             let rect = Rect::new(
-                if nested_face { 22.0 } else { 12.0 },
+                12.0 + indent,
                 y,
-                SIDEBAR_WIDTH - if nested_face { 34.0 } else { 24.0 },
+                SIDEBAR_WIDTH - 24.0 - indent,
                 FACE_ROW_HEIGHT - 2.0,
             );
             if !modal_open && !rename_dialog_open && list_row_clicked(rect, ctx.mouse) {
@@ -1042,17 +1062,18 @@ pub fn run(
                 state.undo_stack.clear();
                 state.redo_stack.clear();
                 state.error = None;
+                if state.selected == ObjectId::PlanetRoute {
+                    match selected_metadata_mut(catalog, state)
+                        .ok_or_else(|| "Selected face metadata is unavailable".to_string())
+                        .and_then(FaceMetadata::ensure_radial_program)
+                    {
+                        Ok(changed) => state.dirty = changed,
+                        Err(error) => state.error = Some(error),
+                    }
+                }
             } else {
                 state.error = selected_entry(catalog, state.selected)
-                    .and_then(|entry| {
-                        state
-                            .selected_state
-                            .as_ref()
-                            .and_then(|key| entry.states.iter().find(|variant| &variant.key == key))
-                            .and_then(|variant| variant.metadata_error.clone())
-                            .or_else(|| entry.metadata_error.clone())
-                            .or_else(|| entry.error.clone())
-                    })
+                    .and_then(|entry| entry.metadata_error.clone().or_else(|| entry.error.clone()))
                     .or_else(|| Some("Selected object is unavailable".to_string()));
             }
         }
@@ -1137,34 +1158,6 @@ pub fn run(
             undo_or_redo(catalog, state, false);
         }
     }
-    if let Some(entry) = selected_entry(catalog, state.selected)
-        && !entry.states.is_empty()
-    {
-        x += 94.0;
-        if !modal_open && !rename_dialog_open && button(ctx, Rect::new(x, 12.0, 42.0, 34.0), "<") {
-            if !state.dirty {
-                let count = entry.states.len() + 1;
-                let previous = (state_index(entry, state) + count - 1) % count;
-                switch_to_state(state, state_key_at(entry, previous));
-            } else {
-                state.error = Some("Save or discard edits before changing states".to_string());
-            }
-        }
-        x += 50.0;
-        if !modal_open && !rename_dialog_open && button(ctx, Rect::new(x, 12.0, 42.0, 34.0), ">") {
-            if !state.dirty {
-                let count = entry.states.len() + 1;
-                let next = (state_index(entry, state) + 1) % count;
-                switch_to_state(state, state_key_at(entry, next));
-            } else {
-                state.error = Some("Save or discard edits before changing states".to_string());
-            }
-        }
-        x += 50.0;
-        let current = state.selected_state.as_deref().unwrap_or("Base mesh");
-        draw_text(current, x, 35.0, ctx.font_sm, ctx.colors_rt.text_secondary);
-    }
-
     let mut action_x = SIDEBAR_WIDTH + 12.0;
     let action_y = 76.0;
     if state.editing {
@@ -1401,15 +1394,16 @@ pub fn run(
         ctx.colors_rt.panel_border,
     );
     let title = selected_entry(catalog, state.selected)
-        .map(|entry| match state.selected_state.as_deref() {
-            Some(key) => format!("{} / {key}", entry.definition.label),
-            None => entry.definition.label.to_string(),
-        })
+        .map(|entry| entry.definition.label.to_string())
         .unwrap_or_else(|| "Object".to_string());
     draw_text(&title, 12.0, 36.0, ctx.font_lg, ctx.colors_rt.text_primary);
     if state.editing {
         draw_text(
-            "Groups and faces",
+            if state.selected == ObjectId::PlanetRoute {
+                "Radial route program"
+            } else {
+                "Groups and faces"
+            },
             12.0,
             140.0,
             ctx.font_md,
@@ -1434,15 +1428,32 @@ pub fn run(
             for row in state.face_scroll..(state.face_scroll + visible_rows).min(items.len()) {
                 let item = items[row];
                 let y = FACE_LIST_TOP + (row - state.face_scroll) as f32 * FACE_ROW_HEIGHT;
-                let (label, selected, nested, color) = match item {
+                let (label, selected, depth, is_face, color) = match item {
                     SidebarItem::Group(group_id) => {
                         let group = metadata.group(group_id).expect("listed group must exist");
+                        let face_count = metadata
+                            .faces_for_group(group_id)
+                            .map_or(group.faces.len(), |faces| faces.len());
+                        let label = match group.program {
+                            FaceGroupProgram::RadialRepeat => {
+                                format!("{} [Radial] ({face_count})", group.name)
+                            }
+                            _ => format!("{} ({face_count})", group.name),
+                        };
                         let dragging_over = state.dragged_faces.is_some()
-                            && Rect::new(12.0, y, SIDEBAR_WIDTH - 24.0, FACE_ROW_HEIGHT - 2.0)
-                                .contains(ctx.mouse);
+                            && Rect::new(
+                                12.0 + group_depth(metadata, group_id) as f32 * 10.0,
+                                y,
+                                SIDEBAR_WIDTH
+                                    - 24.0
+                                    - group_depth(metadata, group_id) as f32 * 10.0,
+                                FACE_ROW_HEIGHT - 2.0,
+                            )
+                            .contains(ctx.mouse);
                         (
-                            format!("{} ({})", group.name, group.faces.len()),
+                            label,
                             state.selected_group == Some(group_id) || dragging_over,
+                            group_depth(metadata, group_id),
                             false,
                             Color::from_rgba(55, 91, 156, 255),
                         )
@@ -1457,15 +1468,19 @@ pub fn run(
                         (
                             name,
                             state.selected_faces.contains(&index),
+                            group
+                                .map(|id| group_depth(metadata, id))
+                                .unwrap_or_default(),
                             group.is_some(),
                             Color::from_rgba(27, 119, 105, 255),
                         )
                     }
                 };
+                let indent = depth as f32 * 10.0 + if is_face && depth > 0 { 10.0 } else { 0.0 };
                 let rect = Rect::new(
-                    if nested { 22.0 } else { 12.0 },
+                    12.0 + indent,
                     y,
-                    SIDEBAR_WIDTH - if nested { 34.0 } else { 24.0 },
+                    SIDEBAR_WIDTH - 24.0 - indent,
                     FACE_ROW_HEIGHT - 2.0,
                 );
                 draw_list_row(ctx, rect, &label, selected, color);
@@ -1504,12 +1519,17 @@ pub fn run(
         }
     }
     if let Some(entry) = selected_entry(catalog, state.selected)
-        && let Some(error) = state
-            .selected_state
+        && let Some(error) = entry
+            .metadata_error
             .as_ref()
-            .and_then(|key| entry.states.iter().find(|variant| &variant.key == key))
-            .and_then(|variant| variant.metadata_error.as_ref().or(variant.error.as_ref()))
-            .or(entry.metadata_error.as_ref())
+            .or_else(|| {
+                entry
+                    .states
+                    .iter()
+                    .find_map(|state| state.metadata_error.as_ref())
+            })
+            .or_else(|| entry.states.iter().find_map(|state| state.error.as_ref()))
+            .or(entry.variant_config_error.as_ref())
             .or(entry.states_error.as_ref())
             .or(entry.error.as_ref())
     {
@@ -1531,6 +1551,7 @@ pub fn run(
             Color::from_rgba(255, 220, 100, 255),
         );
     }
+
     if let Some(dialog) = &state.rename_dialog {
         draw_rectangle(
             0.0,
@@ -1708,6 +1729,44 @@ mod tests {
         assert_eq!(
             zoom_distance(CAMERA_MAX_DISTANCE, -100.0),
             CAMERA_MAX_DISTANCE
+        );
+    }
+
+    #[test]
+    fn radial_route_groups_appear_as_a_main_group_with_condition_children() {
+        let mut metadata = FaceMetadata::default();
+        metadata.ensure_radial_program().unwrap();
+
+        let main_id = metadata.radial_main_group_id().unwrap();
+        let items = sidebar_items(&metadata, 0);
+
+        assert_eq!(items.first(), Some(&SidebarItem::Group(main_id)));
+        let children = metadata
+            .groups
+            .iter()
+            .filter(|group| group.parent_id == Some(main_id))
+            .collect::<Vec<_>>();
+        assert_eq!(children.len(), 3);
+        let conditions = children
+            .iter()
+            .filter_map(|group| match group.program {
+                FaceGroupProgram::IfNeighbor(condition) => Some(condition),
+                _ => None,
+            })
+            .collect::<HashSet<_>>();
+        assert_eq!(
+            conditions,
+            HashSet::from([
+                crate::core::object_assets::RadialNeighborState::Empty,
+                crate::core::object_assets::RadialNeighborState::Route,
+                crate::core::object_assets::RadialNeighborState::OtherBuilding,
+            ])
+        );
+        assert_eq!(
+            items,
+            std::iter::once(SidebarItem::Group(main_id))
+                .chain(children.iter().map(|group| SidebarItem::Group(group.id)))
+                .collect::<Vec<_>>()
         );
     }
 

@@ -10,7 +10,7 @@ use crate::core::map_common::{
     ConfirmAction, MapOutline, build_panel_layout, confirm_label_for_target, draw_common_hud,
     draw_window_frame, in_bounds, is_ui_capturing, popup_rect_near_mouse, run_confirm_window,
 };
-use crate::core::object_assets::{ObjectCatalog, machine_object_id};
+use crate::core::object_assets::{ObjectCatalog, VariantMode, machine_object_id};
 use crate::core::ui::{WINDOW_TITLE_HEIGHT, WindowState, ui_button};
 use crate::core::{
     AppConfig, Axial, FrameContext, MachineBlock, MachineBlockType, RuntimeColors, Scene,
@@ -919,10 +919,19 @@ fn draw_machine_block(
     let mut conveyor_state_drawn = false;
     if !wire_only && kind == MachineBlockType::ConveyorBelt {
         let state_key = conveyor_state_key(interior, hex, rotation);
-        if let Some(source_mesh) = assets.get_state(
-            machine_object_id(MachineBlockType::ConveyorBelt),
-            &state_key,
-        ) {
+        let object_id = machine_object_id(MachineBlockType::ConveyorBelt);
+        let source_mesh = if assets
+            .variant_config(object_id)
+            .is_some_and(|config| config.mode == VariantMode::Custom)
+        {
+            assets
+                .custom_state_key(object_id, &state_key)
+                .and_then(|custom_key| assets.get_state(object_id, custom_key))
+                .or_else(|| assets.get(object_id))
+        } else {
+            assets.get_state(object_id, &state_key)
+        };
+        if let Some(source_mesh) = source_mesh {
             let forward = rotation_dir(rotation);
             let side = vec3(-forward.z, 0.0, forward.x);
             let mesh = source_mesh.transformed(|point| {

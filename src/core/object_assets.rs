@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use macroquad::prelude::{Color, Mesh, Vec2, Vec3, Vertex, draw_mesh, vec3};
 use serde::{Deserialize, Serialize};
@@ -52,6 +52,204 @@ pub struct ObjectDefinition {
     pub label: &'static str,
     pub path: &'static str,
     pub states_path: Option<&'static str>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VariantMode {
+    #[default]
+    None,
+    Radial,
+    Mirror,
+    Custom,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MirrorAxis {
+    #[default]
+    Longitudinal,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RadialNeighborState {
+    Empty,
+    Route,
+    OtherBuilding,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "condition", rename_all = "snake_case")]
+pub enum FaceGroupProgram {
+    #[default]
+    Geometry,
+    RadialRepeat,
+    IfNeighbor(RadialNeighborState),
+}
+
+impl RadialNeighborState {
+    pub fn state_key_part(self) -> &'static str {
+        match self {
+            Self::Empty => "empty",
+            Self::Route => "route",
+            Self::OtherBuilding => "building",
+        }
+    }
+}
+
+pub fn radial_sector_state_key(sides: usize, sector: usize, state: RadialNeighborState) -> String {
+    format!("radial-p{sides}-s{sector}-{}", state.state_key_part())
+}
+
+#[cfg(test)]
+pub fn reflected_belt_state_key(key: &str) -> Result<String, String> {
+    let mut parts = key.split('-');
+    let front = parts
+        .next()
+        .and_then(|part| part.strip_prefix('f'))
+        .and_then(|value| value.parse::<u8>().ok())
+        .ok_or_else(|| format!("invalid belt state key '{key}'"))?;
+    let back = parts
+        .next()
+        .and_then(|part| part.strip_prefix('b'))
+        .and_then(|value| value.parse::<u8>().ok())
+        .ok_or_else(|| format!("invalid belt state key '{key}'"))?;
+    let side = parts
+        .next()
+        .and_then(|part| part.strip_prefix('s'))
+        .and_then(|value| u8::from_str_radix(value, 16).ok())
+        .ok_or_else(|| format!("invalid belt state key '{key}'"))?;
+    if parts.next().is_some() || front > 6 || back > 6 || side > 0x0f {
+        return Err(format!("invalid belt state key '{key}'"));
+    }
+    let reflect_orientation = |value: u8| if value == 0 { 0 } else { 7 - value };
+    let reflected_side =
+        (side & 0b0001) << 3 | (side & 0b0010) << 1 | (side & 0b0100) >> 1 | (side & 0b1000) >> 3;
+    Ok(format!(
+        "f{}-b{}-s{reflected_side:02x}",
+        reflect_orientation(front),
+        reflect_orientation(back)
+    ))
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct VariantConfig {
+    pub mode: VariantMode,
+    pub radial_sector_groups: Vec<RadialSectorGroup>,
+    pub mirror_axis: MirrorAxis,
+    pub mirror_pairs: Vec<MirrorPair>,
+    pub custom_patterns: Vec<CustomVariantPattern>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RadialSectorGroup {
+    pub sides: usize,
+    pub sector: usize,
+    pub face_group_id: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MirrorPair {
+    pub source_key: String,
+    pub reflected_key: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CustomVariantPattern {
+    pub name: String,
+    pub condition_key: String,
+    pub state_key: String,
+}
+
+impl VariantConfig {
+    pub fn validate(&self) -> Result<(), String> {
+        let mut sectors = HashSet::new();
+        let mut group_ids = HashSet::new();
+        for assignment in &self.radial_sector_groups {
+            if assignment.sides != 5 && assignment.sides != 6 {
+                return Err(format!(
+                    "radial sector group has unsupported side count {}",
+                    assignment.sides
+                ));
+            }
+            if assignment.sector >= assignment.sides {
+                return Err(format!(
+                    "radial sector {} is outside the 0..{} range",
+                    assignment.sector, assignment.sides
+                ));
+            }
+            if !sectors.insert((assignment.sides, assignment.sector)) {
+                return Err(format!(
+                    "radial sector {} for a {}-sided cell is assigned more than once",
+                    assignment.sector, assignment.sides
+                ));
+            }
+            if !group_ids.insert((assignment.sides, assignment.face_group_id)) {
+                return Err(format!(
+                    "face group {} is assigned to multiple radial sectors for {}-sided cells",
+                    assignment.face_group_id, assignment.sides
+                ));
+            }
+        }
+        if self.mode == VariantMode::Radial {
+            for sides in [5, 6] {
+                if (0..sides).any(|sector| !sectors.contains(&(sides, sector))) {
+                    return Err(format!(
+                        "radial variants require a face group for every sector of {sides}-sided cells"
+                    ));
+                }
+            }
+        }
+
+        let mut mirror_keys = HashSet::new();
+        for pair in &self.mirror_pairs {
+            if !valid_state_key(&pair.source_key) || !valid_state_key(&pair.reflected_key) {
+                return Err("mirror pairs must use valid state keys".to_string());
+            }
+            if pair.source_key == pair.reflected_key
+                || !mirror_keys.insert(pair.reflected_key.as_str())
+            {
+                return Err(format!(
+                    "invalid or duplicate reflected state key '{}'",
+                    pair.reflected_key
+                ));
+            }
+        }
+
+        let mut names = HashSet::new();
+        let mut condition_keys = HashSet::new();
+        let mut custom_state_keys = HashSet::new();
+        for pattern in &self.custom_patterns {
+            if pattern.name.trim().is_empty() || !valid_state_key(&pattern.condition_key) {
+                return Err("custom patterns require a name and valid condition key".to_string());
+            }
+            if !valid_state_key(&pattern.state_key) {
+                return Err(format!(
+                    "custom pattern '{}' has invalid state key '{}'",
+                    pattern.name, pattern.state_key
+                ));
+            }
+            if !names.insert(pattern.name.trim().to_lowercase())
+                || !condition_keys.insert(pattern.condition_key.as_str())
+                || !custom_state_keys.insert(pattern.state_key.as_str())
+            {
+                return Err(format!(
+                    "custom pattern '{}' duplicates a name, condition, or state key",
+                    pattern.name
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+fn valid_state_key(key: &str) -> bool {
+    !key.is_empty()
+        && key
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
 }
 
 pub const OBJECT_DEFINITIONS: &[ObjectDefinition] = &[
@@ -231,6 +429,91 @@ impl EditableMesh {
         self.indices.len() / 3
     }
 
+    pub fn extract_faces(&self, face_indices: &[usize]) -> Result<Self, String> {
+        if self.indices.len() % 3 != 0 {
+            return Err("mesh index count is not divisible by three".to_string());
+        }
+        let mut selected = vec![false; self.face_count()];
+        for &face in face_indices {
+            let Some(slot) = selected.get_mut(face) else {
+                return Err(format!("face {face} is out of range"));
+            };
+            *slot = true;
+        }
+        if !selected.iter().any(|&value| value) {
+            return Err("select at least one face to extract".to_string());
+        }
+        let mut vertex_remap = vec![None; self.vertices.len()];
+        let mut vertices = Vec::new();
+        let mut indices = Vec::new();
+        for (face, include) in selected.into_iter().enumerate() {
+            if !include {
+                continue;
+            }
+            for &old_index in &self.indices[face * 3..face * 3 + 3] {
+                let old_index = old_index as usize;
+                let vertex = self
+                    .vertices
+                    .get(old_index)
+                    .ok_or_else(|| format!("mesh index {old_index} is out of range"))?;
+                let new_index = match vertex_remap[old_index] {
+                    Some(index) => index,
+                    None => {
+                        let index = u32::try_from(vertices.len())
+                            .map_err(|_| "mesh has too many vertices to edit".to_string())?;
+                        vertices.push(*vertex);
+                        vertex_remap[old_index] = Some(index);
+                        index
+                    }
+                };
+                indices.push(new_index);
+            }
+        }
+        Ok(Self { vertices, indices })
+    }
+
+    pub fn append(&mut self, other: &Self) -> Result<(), String> {
+        let offset = u32::try_from(self.vertices.len())
+            .map_err(|_| "mesh has too many vertices to edit".to_string())?;
+        let vertices_len = self
+            .vertices
+            .len()
+            .checked_add(other.vertices.len())
+            .ok_or_else(|| "combined mesh vertex count overflow".to_string())?;
+        if vertices_len > u32::MAX as usize {
+            return Err("combined mesh has too many vertices to edit".to_string());
+        }
+        let mut indices = Vec::with_capacity(other.indices.len());
+        for &index in &other.indices {
+            if index as usize >= other.vertices.len() {
+                return Err(format!("mesh index {index} is out of range"));
+            }
+            indices.push(
+                index
+                    .checked_add(offset)
+                    .ok_or_else(|| "combined mesh index overflow".to_string())?,
+            );
+        }
+        self.vertices.extend_from_slice(&other.vertices);
+        self.indices.extend(indices);
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub fn reflected_longitudinal(&self) -> Result<Self, String> {
+        if self.indices.len() % 3 != 0 {
+            return Err("mesh index count is not divisible by three".to_string());
+        }
+        let mut mesh = self.clone();
+        for vertex in &mut mesh.vertices {
+            vertex.position.z = -vertex.position.z;
+        }
+        for triangle in mesh.indices.chunks_exact_mut(3) {
+            triangle.swap(1, 2);
+        }
+        Ok(mesh)
+    }
+
     pub fn remove_faces(&mut self, removed_faces: &[usize]) -> Result<Vec<Option<usize>>, String> {
         let face_count = self.face_count();
         if self.indices.len() % 3 != 0 {
@@ -351,6 +634,21 @@ pub struct FaceGroup {
     pub id: u64,
     pub name: String,
     pub faces: Vec<usize>,
+    #[serde(default)]
+    pub parent_id: Option<u64>,
+    #[serde(default)]
+    pub program: FaceGroupProgram,
+}
+
+fn extract_or_empty(mesh: &EditableMesh, faces: &[usize]) -> Result<EditableMesh, String> {
+    if faces.is_empty() {
+        Ok(EditableMesh {
+            vertices: Vec::new(),
+            indices: Vec::new(),
+        })
+    } else {
+        mesh.extract_faces(faces)
+    }
 }
 
 impl FaceMetadata {
@@ -393,7 +691,97 @@ impl FaceMetadata {
                 }
             }
         }
-        self.groups.retain(|group| !group.faces.is_empty());
+        let parent_ids = self
+            .groups
+            .iter()
+            .filter_map(|group| group.parent_id)
+            .collect::<HashSet<_>>();
+        self.groups.retain(|group| {
+            !group.faces.is_empty()
+                || group.program != FaceGroupProgram::Geometry
+                || parent_ids.contains(&group.id)
+        });
+        for group in &self.groups {
+            if let Some(parent_id) = group.parent_id {
+                let parent = self
+                    .groups
+                    .iter()
+                    .find(|candidate| candidate.id == parent_id)
+                    .ok_or_else(|| {
+                        format!("face group '{}' has missing parent {parent_id}", group.name)
+                    })?;
+                match group.program {
+                    FaceGroupProgram::RadialRepeat => {
+                        return Err(format!(
+                            "radial group '{}' cannot have a parent",
+                            group.name
+                        ));
+                    }
+                    FaceGroupProgram::IfNeighbor(_) => {
+                        if parent.program != FaceGroupProgram::RadialRepeat {
+                            return Err(format!(
+                                "condition group '{}' must be inside a radial group",
+                                group.name
+                            ));
+                        }
+                    }
+                    FaceGroupProgram::Geometry => {}
+                }
+            } else if let FaceGroupProgram::IfNeighbor(_) = group.program {
+                return Err(format!(
+                    "condition group '{}' must be inside a radial group",
+                    group.name
+                ));
+            }
+            let mut ancestors = HashSet::new();
+            let mut parent_id = group.parent_id;
+            while let Some(id) = parent_id {
+                if id == group.id || !ancestors.insert(id) {
+                    return Err(format!("face group hierarchy contains a cycle at {id}"));
+                }
+                parent_id = self
+                    .groups
+                    .iter()
+                    .find(|candidate| candidate.id == id)
+                    .and_then(|parent| parent.parent_id);
+            }
+        }
+        let radial_groups = self
+            .groups
+            .iter()
+            .filter(|group| group.program == FaceGroupProgram::RadialRepeat)
+            .collect::<Vec<_>>();
+        if radial_groups.len() > 1 {
+            return Err("only one radial-repeat group is supported per model".to_string());
+        }
+        if let Some(radial_group) = radial_groups.first() {
+            let condition_list = self
+                .groups
+                .iter()
+                .filter_map(|group| match (group.parent_id, group.program) {
+                    (Some(parent_id), FaceGroupProgram::IfNeighbor(condition))
+                        if parent_id == radial_group.id =>
+                    {
+                        Some(condition)
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            let conditions = condition_list.iter().copied().collect::<HashSet<_>>();
+            if condition_list.len() != 3
+                || conditions
+                    != HashSet::from([
+                        RadialNeighborState::Empty,
+                        RadialNeighborState::Route,
+                        RadialNeighborState::OtherBuilding,
+                    ])
+            {
+                return Err(format!(
+                    "radial group '{}' requires one child for each neighbor condition",
+                    radial_group.name
+                ));
+            }
+        }
         let minimum_next_id = self
             .groups
             .iter()
@@ -408,9 +796,83 @@ impl FaceMetadata {
         self.groups.iter().find(|group| group.id == id)
     }
 
+    pub fn radial_main_group_id(&self) -> Option<u64> {
+        self.groups
+            .iter()
+            .find(|group| group.program == FaceGroupProgram::RadialRepeat)
+            .map(|group| group.id)
+    }
+
+    pub fn faces_for_group(&self, group_id: u64) -> Option<Vec<usize>> {
+        let group = self.group(group_id)?;
+        Some(self.descendant_faces(group_id, group.program != FaceGroupProgram::RadialRepeat))
+    }
+
+    pub fn radial_sector_mesh(
+        &self,
+        mesh: &EditableMesh,
+        condition: RadialNeighborState,
+    ) -> Result<Option<EditableMesh>, String> {
+        let Some(main_id) = self.radial_main_group_id() else {
+            return Ok(None);
+        };
+        let main_faces = self.descendant_faces(main_id, false);
+        let condition_id = self.groups.iter().find_map(|group| {
+            (group.parent_id == Some(main_id)
+                && group.program == FaceGroupProgram::IfNeighbor(condition))
+            .then_some(group.id)
+        });
+        let Some(condition_id) = condition_id else {
+            return Ok(None);
+        };
+        let condition_faces = self.descendant_faces(condition_id, true);
+        let mut composed = extract_or_empty(mesh, &main_faces)?;
+        composed.append(&extract_or_empty(mesh, &condition_faces)?)?;
+        Ok(Some(composed))
+    }
+
+    fn descendant_faces(&self, root_id: u64, include_root_condition: bool) -> Vec<usize> {
+        let mut faces = Vec::new();
+        let mut pending = vec![root_id];
+        while let Some(group_id) = pending.pop() {
+            let Some(group) = self.group(group_id) else {
+                continue;
+            };
+            faces.extend(group.faces.iter().copied());
+            for child in self
+                .groups
+                .iter()
+                .filter(|child| child.parent_id == Some(group_id))
+            {
+                if !matches!(child.program, FaceGroupProgram::IfNeighbor(_))
+                    || include_root_condition
+                {
+                    pending.push(child.id);
+                }
+            }
+        }
+        faces.sort_unstable();
+        faces.dedup();
+        faces
+    }
+
+    #[cfg(test)]
     pub fn create_group(&mut self, faces: &[usize]) -> Result<u64, String> {
+        self.create_group_under(faces, None)
+    }
+
+    pub fn create_group_under(
+        &mut self,
+        faces: &[usize],
+        parent_id: Option<u64>,
+    ) -> Result<u64, String> {
         if faces.is_empty() {
             return Err("select one or more faces before adding a group".to_string());
+        }
+        if let Some(parent_id) = parent_id
+            && !self.groups.iter().any(|group| group.id == parent_id)
+        {
+            return Err(format!("parent face group {parent_id} does not exist"));
         }
         let mut selected = faces.to_vec();
         selected.sort_unstable();
@@ -418,21 +880,131 @@ impl FaceMetadata {
         if let Some(&face) = selected.iter().find(|&&face| face >= self.face_names.len()) {
             return Err(format!("face {face} is out of range"));
         }
-        let id = self.next_group_id.max(1);
-        self.next_group_id = id
-            .checked_add(1)
-            .ok_or_else(|| "face group id limit reached".to_string())?;
+        let id = self.allocate_group_id()?;
         let selected_faces = selected.iter().copied().collect::<HashSet<_>>();
         for group in &mut self.groups {
             group.faces.retain(|face| !selected_faces.contains(face));
         }
-        self.groups.retain(|group| !group.faces.is_empty());
+        self.retain_nonempty_geometry_groups();
         self.groups.push(FaceGroup {
             id,
             name: format!("Group {id}"),
             faces: selected,
+            parent_id,
+            program: FaceGroupProgram::Geometry,
         });
         Ok(id)
+    }
+
+    pub fn ensure_radial_program(&mut self) -> Result<bool, String> {
+        if let Some(main_id) = self
+            .groups
+            .iter()
+            .find(|group| group.program == FaceGroupProgram::RadialRepeat)
+            .map(|group| group.id)
+        {
+            let mut changed = false;
+            for group in &mut self.groups {
+                if group.id != main_id && group.parent_id.is_none() {
+                    group.parent_id = Some(main_id);
+                    changed = true;
+                }
+            }
+            for (condition, name) in [
+                (RadialNeighborState::Empty, "If neighbor is empty"),
+                (RadialNeighborState::Route, "If neighbor is another route"),
+                (
+                    RadialNeighborState::OtherBuilding,
+                    "If neighbor is another building",
+                ),
+            ] {
+                if self.groups.iter().any(|group| {
+                    group.parent_id == Some(main_id)
+                        && group.program == FaceGroupProgram::IfNeighbor(condition)
+                }) {
+                    continue;
+                }
+                let id = self.allocate_group_id()?;
+                self.groups.push(FaceGroup {
+                    id,
+                    name: name.to_string(),
+                    faces: Vec::new(),
+                    parent_id: Some(main_id),
+                    program: FaceGroupProgram::IfNeighbor(condition),
+                });
+                changed = true;
+            }
+            self.validate(self.face_names.len())?;
+            return Ok(changed);
+        }
+
+        let main_id = self.allocate_group_id()?;
+        let grouped_faces = self
+            .groups
+            .iter()
+            .flat_map(|group| group.faces.iter().copied())
+            .collect::<HashSet<_>>();
+        let ungrouped_faces = (0..self.face_names.len())
+            .filter(|face| !grouped_faces.contains(face))
+            .collect::<Vec<_>>();
+        let top_level_ids = self
+            .groups
+            .iter()
+            .filter(|group| group.parent_id.is_none())
+            .map(|group| group.id)
+            .collect::<HashSet<_>>();
+        for group in &mut self.groups {
+            if top_level_ids.contains(&group.id) {
+                group.parent_id = Some(main_id);
+            }
+        }
+        self.groups.push(FaceGroup {
+            id: main_id,
+            name: "Main".to_string(),
+            faces: ungrouped_faces,
+            parent_id: None,
+            program: FaceGroupProgram::RadialRepeat,
+        });
+        for (condition, name) in [
+            (RadialNeighborState::Empty, "If neighbor is empty"),
+            (RadialNeighborState::Route, "If neighbor is another route"),
+            (
+                RadialNeighborState::OtherBuilding,
+                "If neighbor is another building",
+            ),
+        ] {
+            let id = self.allocate_group_id()?;
+            self.groups.push(FaceGroup {
+                id,
+                name: name.to_string(),
+                faces: Vec::new(),
+                parent_id: Some(main_id),
+                program: FaceGroupProgram::IfNeighbor(condition),
+            });
+        }
+        self.validate(self.face_names.len())?;
+        Ok(true)
+    }
+
+    fn allocate_group_id(&mut self) -> Result<u64, String> {
+        let id = self.next_group_id.max(1);
+        self.next_group_id = id
+            .checked_add(1)
+            .ok_or_else(|| "face group id limit reached".to_string())?;
+        Ok(id)
+    }
+
+    fn retain_nonempty_geometry_groups(&mut self) {
+        let parent_ids = self
+            .groups
+            .iter()
+            .filter_map(|group| group.parent_id)
+            .collect::<HashSet<_>>();
+        self.groups.retain(|group| {
+            !group.faces.is_empty()
+                || group.program != FaceGroupProgram::Geometry
+                || parent_ids.contains(&group.id)
+        });
     }
 
     pub fn assign_faces_to_group(&mut self, faces: &[usize], group_id: u64) -> Result<(), String> {
@@ -451,8 +1023,7 @@ impl FaceMetadata {
                 group.faces.retain(|face| !selected_faces.contains(face));
             }
         }
-        self.groups
-            .retain(|group| group.id == group_id || !group.faces.is_empty());
+        self.retain_nonempty_geometry_groups();
         let target = self
             .groups
             .iter_mut()
@@ -487,6 +1058,9 @@ impl FaceMetadata {
             .iter_mut()
             .find(|group| group.id == group_id)
             .ok_or_else(|| format!("face group {group_id} does not exist"))?;
+        if group.program != FaceGroupProgram::Geometry {
+            return Err("model program groups cannot be renamed".to_string());
+        }
         group.name = name;
         Ok(())
     }
@@ -497,6 +1071,17 @@ impl FaceMetadata {
             .iter()
             .position(|group| group.id == group_id)
             .ok_or_else(|| format!("face group {group_id} does not exist"))?;
+        let group = &self.groups[index];
+        if group.program != FaceGroupProgram::Geometry
+            || self
+                .groups
+                .iter()
+                .any(|child| child.parent_id == Some(group_id))
+        {
+            return Err(
+                "model program groups and groups with children cannot be deleted".to_string(),
+            );
+        }
         Ok(self.groups.remove(index).faces)
     }
 
@@ -525,7 +1110,7 @@ impl FaceMetadata {
             group.faces.sort_unstable();
             group.faces.dedup();
         }
-        self.groups.retain(|group| !group.faces.is_empty());
+        self.retain_nonempty_geometry_groups();
     }
 
     pub fn inherit_group_for_extrusion(
@@ -558,6 +1143,8 @@ pub struct CatalogEntry {
     pub error: Option<String>,
     pub states: Vec<CatalogState>,
     pub states_error: Option<String>,
+    pub variant_config: VariantConfig,
+    pub variant_config_error: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -580,6 +1167,7 @@ impl ObjectCatalog {
             .iter()
             .copied()
             .map(|definition| {
+                let states_directory = object_states_directory(&definition);
                 let (mesh, error) = match load_glb(Path::new(definition.path)) {
                     Ok(mesh) => (Some(mesh), None),
                     Err(error) => (None, Some(error)),
@@ -588,7 +1176,8 @@ impl ObjectCatalog {
                     Some(mesh) => load_face_metadata(Path::new(definition.path), mesh.face_count()),
                     None => (FaceMetadata::default(), None),
                 };
-                let (states, states_error) = load_states(definition.states_path);
+                let (states, states_error) = load_states(&states_directory);
+                let (variant_config, variant_config_error) = load_variant_config(&states_directory);
                 CatalogEntry {
                     definition,
                     mesh,
@@ -597,6 +1186,8 @@ impl ObjectCatalog {
                     error,
                     states,
                     states_error,
+                    variant_config,
+                    variant_config_error,
                 }
             })
             .collect();
@@ -634,17 +1225,6 @@ impl ObjectCatalog {
             .as_ref()
     }
 
-    pub fn get_state_mut(&mut self, id: ObjectId, key: &str) -> Option<&mut EditableMesh> {
-        self.entries
-            .iter_mut()
-            .find(|entry| entry.definition.id == id)?
-            .states
-            .iter_mut()
-            .find(|state| state.key == key)?
-            .mesh
-            .as_mut()
-    }
-
     pub fn metadata(&self, id: ObjectId, state_key: Option<&str>) -> Option<&FaceMetadata> {
         let entry = self
             .entries
@@ -679,6 +1259,29 @@ impl ObjectCatalog {
         }
     }
 
+    pub fn custom_state_key(&self, id: ObjectId, condition_key: &str) -> Option<&str> {
+        let entry = self
+            .entries
+            .iter()
+            .find(|entry| entry.definition.id == id)?;
+        if entry.variant_config.mode != VariantMode::Custom {
+            return None;
+        }
+        entry
+            .variant_config
+            .custom_patterns
+            .iter()
+            .find(|pattern| pattern.condition_key == condition_key)
+            .map(|pattern| pattern.state_key.as_str())
+    }
+
+    pub fn variant_config(&self, id: ObjectId) -> Option<&VariantConfig> {
+        self.entries
+            .iter()
+            .find(|entry| entry.definition.id == id)
+            .map(|entry| &entry.variant_config)
+    }
+
     pub fn save(&mut self, id: ObjectId, mesh: EditableMesh) -> Result<(), String> {
         let metadata = self
             .metadata(id, None)
@@ -708,71 +1311,55 @@ impl ObjectCatalog {
         entry.error = None;
         Ok(())
     }
-
-    pub fn save_state(
-        &mut self,
-        id: ObjectId,
-        key: &str,
-        mesh: EditableMesh,
-    ) -> Result<(), String> {
-        let metadata = self
-            .metadata(id, Some(key))
-            .cloned()
-            .unwrap_or_else(|| FaceMetadata::for_face_count(mesh.face_count()));
-        self.save_state_with_metadata(id, key, mesh, metadata)
-    }
-
-    pub fn save_state_with_metadata(
-        &mut self,
-        id: ObjectId,
-        key: &str,
-        mesh: EditableMesh,
-        mut metadata: FaceMetadata,
-    ) -> Result<(), String> {
-        if key.is_empty()
-            || !key
-                .bytes()
-                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
-        {
-            return Err(format!("invalid state key '{key}'"));
-        }
-        let entry = self
-            .entries
-            .iter_mut()
-            .find(|entry| entry.definition.id == id)
-            .ok_or_else(|| format!("unknown object id {id:?}"))?;
-        let states_dir = entry
-            .definition
-            .states_path
-            .ok_or_else(|| format!("object {id:?} has no state assets"))?;
-        let directory = Path::new(states_dir);
-        fs::create_dir_all(directory)
-            .map_err(|error| format!("{}: {error}", directory.display()))?;
-        let path = directory.join(format!("{key}.glb"));
-        metadata.validate(mesh.face_count())?;
-        save_glb(&path, &mesh)?;
-        save_face_metadata(&path, &metadata)?;
-        if let Some(state) = entry.states.iter_mut().find(|state| state.key == key) {
-            state.mesh = Some(mesh);
-            state.metadata = metadata;
-            state.metadata_error = None;
-            state.error = None;
-        } else {
-            entry.states.push(CatalogState {
-                key: key.to_string(),
-                mesh: Some(mesh),
-                metadata,
-                metadata_error: None,
-                error: None,
-            });
-            entry.states.sort_by(|left, right| left.key.cmp(&right.key));
-        }
-        Ok(())
-    }
 }
 
 fn face_metadata_path(mesh_path: &Path) -> std::path::PathBuf {
     mesh_path.with_extension("cad.json")
+}
+
+fn object_states_directory(definition: &ObjectDefinition) -> PathBuf {
+    definition
+        .states_path
+        .map(PathBuf::from)
+        .unwrap_or_else(|| Path::new(definition.path).with_extension("states"))
+}
+
+fn variant_config_path(states_directory: &Path) -> PathBuf {
+    states_directory.join("variant_rules.json")
+}
+
+fn load_variant_config(states_directory: &Path) -> (VariantConfig, Option<String>) {
+    let path = variant_config_path(states_directory);
+    let bytes = match fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return (VariantConfig::default(), None);
+        }
+        Err(error) => {
+            return (
+                VariantConfig::default(),
+                Some(format!("{}: {error}", path.display())),
+            );
+        }
+    };
+    match serde_json::from_slice::<VariantConfig>(&bytes)
+        .map_err(|error| format!("{}: {error}", path.display()))
+        .and_then(|config| {
+            config.validate()?;
+            Ok(config)
+        }) {
+        Ok(config) => (config, None),
+        Err(error) => (VariantConfig::default(), Some(error)),
+    }
+}
+
+#[cfg(test)]
+fn save_variant_config(states_directory: &Path, config: &VariantConfig) -> Result<(), String> {
+    let path = variant_config_path(states_directory);
+    fs::create_dir_all(states_directory)
+        .map_err(|error| format!("{}: {error}", states_directory.display()))?;
+    let json = serde_json::to_vec_pretty(config).map_err(|error| error.to_string())?;
+    fs::write(&path, json).map_err(|error| format!("{}: {error}", path.display()))
 }
 
 fn load_face_metadata(mesh_path: &Path, face_count: usize) -> (FaceMetadata, Option<String>) {
@@ -810,11 +1397,7 @@ fn save_face_metadata(mesh_path: &Path, metadata: &FaceMetadata) -> Result<(), S
     fs::write(&path, json).map_err(|error| format!("{}: {error}", path.display()))
 }
 
-fn load_states(states_path: Option<&str>) -> (Vec<CatalogState>, Option<String>) {
-    let Some(states_path) = states_path else {
-        return (Vec::new(), None);
-    };
-    let directory = Path::new(states_path);
+fn load_states(directory: &Path) -> (Vec<CatalogState>, Option<String>) {
     let mut states = Vec::new();
     let variants_path = directory.join("variants.glb");
     if variants_path.exists() {
@@ -1450,6 +2033,104 @@ mod tests {
     }
 
     #[test]
+    fn extracting_and_composing_face_groups_compacts_and_offsets_indices() {
+        let white = Color::from_rgba(255, 255, 255, 255);
+        let vertex = |position| Vertex::new2(position, Vec2::ZERO, white);
+        let mesh = EditableMesh {
+            vertices: vec![
+                vertex(Vec3::ZERO),
+                vertex(Vec3::X),
+                vertex(Vec3::Y),
+                vertex(Vec3::Z),
+            ],
+            indices: vec![0, 1, 2, 0, 2, 3],
+        };
+        let mut composed = mesh.extract_faces(&[0]).unwrap();
+        let second = mesh.extract_faces(&[1]).unwrap();
+        composed.append(&second).unwrap();
+
+        assert_eq!(composed.vertices.len(), 6);
+        assert_eq!(composed.indices, vec![0, 1, 2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn reflected_belt_state_swaps_sides_and_preserves_winding() {
+        let key = "f1-b2-s01";
+        let reflected_key = reflected_belt_state_key(key).unwrap();
+        assert_eq!(reflected_key, "f6-b5-s08");
+        assert_eq!(reflected_belt_state_key(&reflected_key).unwrap(), key);
+
+        let white = Color::from_rgba(255, 255, 255, 255);
+        let mesh = EditableMesh {
+            vertices: vec![
+                Vertex::new2(Vec3::ZERO, Vec2::ZERO, white),
+                Vertex::new2(vec3(1.0, 0.0, 2.0), Vec2::ZERO, white),
+                Vertex::new2(vec3(0.0, 1.0, -1.0), Vec2::ZERO, white),
+            ],
+            indices: vec![0, 1, 2],
+        };
+        let reflected = mesh.reflected_longitudinal().unwrap();
+        assert_eq!(
+            reflected.vertices[1].position.z,
+            -mesh.vertices[1].position.z
+        );
+        assert_eq!(reflected.indices, vec![0, 2, 1]);
+        assert_eq!(reflected_belt_state_key("f0-b0-s00").unwrap(), "f0-b0-s00");
+    }
+
+    #[test]
+    fn variant_configuration_round_trips_and_checks_radial_slots() {
+        let directory =
+            std::env::temp_dir().join(format!("gridgame-variant-rules-{}", std::process::id()));
+        let mut config = VariantConfig {
+            mode: VariantMode::Radial,
+            ..VariantConfig::default()
+        };
+        for sides in [5, 6] {
+            for sector in 0..sides {
+                config.radial_sector_groups.push(RadialSectorGroup {
+                    sides,
+                    sector,
+                    face_group_id: sector as u64 + 1,
+                });
+            }
+        }
+        config.validate().unwrap();
+        save_variant_config(&directory, &config).unwrap();
+        let (loaded, error) = load_variant_config(&directory);
+
+        assert!(error.is_none());
+        assert_eq!(loaded, config);
+        fs::remove_file(variant_config_path(&directory)).unwrap();
+        fs::remove_dir(directory).unwrap();
+    }
+
+    #[test]
+    fn custom_variants_require_exact_condition_key_match() {
+        let mut catalog = ObjectCatalog::load();
+        let entry = catalog
+            .entries
+            .iter_mut()
+            .find(|entry| entry.definition.id == ObjectId::PlanetRoute)
+            .unwrap();
+        entry.variant_config.mode = VariantMode::Custom;
+        entry.variant_config.custom_patterns = vec![CustomVariantPattern {
+            name: "Straight route".to_string(),
+            condition_key: "p6-002200".to_string(),
+            state_key: "custom-straight-route".to_string(),
+        }];
+
+        assert_eq!(
+            catalog.custom_state_key(ObjectId::PlanetRoute, "p6-002200"),
+            Some("custom-straight-route")
+        );
+        assert_eq!(
+            catalog.custom_state_key(ObjectId::PlanetRoute, "p6-002201"),
+            None
+        );
+    }
+
+    #[test]
     fn face_groups_move_members_and_can_be_renamed() {
         let mut metadata = FaceMetadata::for_face_count(4);
         let first = metadata.create_group(&[0, 1]).unwrap();
@@ -1460,6 +2141,88 @@ mod tests {
         assert_eq!(metadata.group(first).unwrap().faces, vec![0]);
         assert_eq!(metadata.group(second).unwrap().name, "Trim");
         assert_eq!(metadata.group(second).unwrap().faces, vec![1, 2]);
+    }
+
+    #[test]
+    fn legacy_face_groups_load_as_unparented_geometry_groups() {
+        let group: FaceGroup =
+            serde_json::from_str(r#"{"id":7,"name":"Existing","faces":[0]}"#).unwrap();
+
+        assert_eq!(group.parent_id, None);
+        assert_eq!(group.program, FaceGroupProgram::Geometry);
+    }
+
+    #[test]
+    fn radial_program_repeats_main_geometry_and_adds_matching_condition_geometry() {
+        let vertex = |x| {
+            Vertex::new2(
+                vec3(x, 0.0, 0.0),
+                Vec2::ZERO,
+                Color::from_rgba(80, 120, 160, 255),
+            )
+        };
+        let mesh = EditableMesh {
+            vertices: vec![
+                vertex(0.0),
+                vertex(1.0),
+                vertex(2.0),
+                vertex(3.0),
+                vertex(4.0),
+                vertex(5.0),
+                vertex(6.0),
+                vertex(7.0),
+                vertex(8.0),
+            ],
+            indices: vec![0, 1, 2, 3, 4, 5, 6, 7, 8],
+        };
+        let mut metadata = FaceMetadata::for_face_count(3);
+        let existing_group = metadata.create_group(&[0]).unwrap();
+        assert!(metadata.ensure_radial_program().unwrap());
+        let main_id = metadata.radial_main_group_id().unwrap();
+        let route_group = metadata
+            .groups
+            .iter()
+            .find(|group| {
+                group.parent_id == Some(main_id)
+                    && group.program == FaceGroupProgram::IfNeighbor(RadialNeighborState::Route)
+            })
+            .unwrap()
+            .id;
+        metadata.assign_faces_to_group(&[1], route_group).unwrap();
+        metadata.validate(3).unwrap();
+
+        assert_eq!(
+            metadata.group(existing_group).unwrap().parent_id,
+            Some(main_id)
+        );
+        assert_eq!(metadata.faces_for_group(main_id), Some(vec![0, 2]));
+        assert_eq!(metadata.faces_for_group(route_group), Some(vec![1]));
+        assert_eq!(
+            metadata
+                .radial_sector_mesh(&mesh, RadialNeighborState::Empty)
+                .unwrap()
+                .unwrap()
+                .face_count(),
+            2
+        );
+        assert_eq!(
+            metadata
+                .radial_sector_mesh(&mesh, RadialNeighborState::Route)
+                .unwrap()
+                .unwrap()
+                .face_count(),
+            3
+        );
+        assert_eq!(
+            metadata
+                .radial_sector_mesh(&mesh, RadialNeighborState::OtherBuilding)
+                .unwrap()
+                .unwrap()
+                .face_count(),
+            2
+        );
+        assert!(metadata.remove_group(main_id).is_err());
+        assert!(metadata.remove_group(route_group).is_err());
     }
 
     #[test]
@@ -1486,6 +2249,7 @@ mod tests {
         let mut metadata = FaceMetadata::for_face_count(3);
         metadata.rename_face(1, "door".to_string()).unwrap();
         metadata.create_group(&[0, 2]).unwrap();
+        metadata.ensure_radial_program().unwrap();
 
         save_face_metadata(&mesh_path, &metadata).unwrap();
         let (loaded, error) = load_face_metadata(&mesh_path, 3);

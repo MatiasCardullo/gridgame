@@ -59,6 +59,16 @@ struct KnifeStart {
     face: usize,
 }
 
+#[derive(Clone, Debug)]
+struct PrimitivePlacement {
+    primitive: MeshPrimitive,
+    center: Option<Vec3>,
+    dimensions: String,
+    input_focused: bool,
+    input_selected: bool,
+    dimension_index: usize,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SidebarItem {
     Group(u64),
@@ -83,6 +93,12 @@ pub struct CadSceneState {
     group_config_dialog: Option<GroupConfigDialog>,
     knife_active: bool,
     knife_start: Option<KnifeStart>,
+    primitive_placement: Option<PrimitivePlacement>,
+    grid_snap: bool,
+    grid_spacing: f32,
+    interaction_preview: bool,
+    preview_seed: u64,
+    preview_neighbors: [RadialNeighborState; 6],
     original_mesh: Option<EditableMesh>,
     original_metadata: Option<FaceMetadata>,
     undo_stack: Vec<EditSnapshot>,
@@ -114,6 +130,12 @@ impl Default for CadSceneState {
             group_config_dialog: None,
             knife_active: false,
             knife_start: None,
+            primitive_placement: None,
+            grid_snap: false,
+            grid_spacing: 0.5,
+            interaction_preview: false,
+            preview_seed: 1,
+            preview_neighbors: [RadialNeighborState::Empty; 6],
             original_mesh: None,
             original_metadata: None,
             undo_stack: Vec::new(),
@@ -166,6 +188,146 @@ fn mesh_center_and_scale(mesh: &EditableMesh) -> (Vec3, f32) {
 fn preview_mesh(mesh: &EditableMesh) -> EditableMesh {
     let (center, scale) = mesh_center_and_scale(mesh);
     mesh.transformed(|position| (position - center) * scale)
+}
+
+fn construction_plane_hit(origin: Vec3, direction: Vec3) -> Option<Vec3> {
+    if direction.y.abs() <= 1e-6 {
+        return None;
+    }
+    let distance = -origin.y / direction.y;
+    (distance >= 0.0).then(|| origin + direction * distance)
+}
+
+fn display_to_model_point(mesh: &EditableMesh, point: Vec3) -> Vec3 {
+    let (center, scale) = mesh_center_and_scale(mesh);
+    point / scale + center
+}
+
+fn model_to_display_point(mesh: &EditableMesh, point: Vec3) -> Vec3 {
+    let (center, scale) = mesh_center_and_scale(mesh);
+    (point - center) * scale
+}
+
+fn snap_model_point(point: Vec3, spacing: f32) -> Vec3 {
+    let spacing = spacing.max(0.001);
+    vec3(
+        (point.x / spacing).round() * spacing,
+        point.y,
+        (point.z / spacing).round() * spacing,
+    )
+}
+
+fn primitive_dimension_count(primitive: MeshPrimitive) -> usize {
+    match primitive {
+        MeshPrimitive::Cube | MeshPrimitive::Sphere => 1,
+        MeshPrimitive::Plane | MeshPrimitive::Cylinder => 2,
+    }
+}
+
+fn primitive_default_dimensions(primitive: MeshPrimitive) -> &'static str {
+    match primitive {
+        MeshPrimitive::Cube => "1",
+        MeshPrimitive::Plane => "1, 1",
+        MeshPrimitive::Sphere => "0.5",
+        MeshPrimitive::Cylinder => "0.5, 1",
+    }
+}
+
+fn parse_dimension_values(primitive: MeshPrimitive, text: &str) -> Result<Vec<f32>, String> {
+    let count = primitive_dimension_count(primitive);
+    let values = text
+        .split(|character: char| character == ',' || character.is_whitespace())
+        .filter(|value| !value.is_empty())
+        .map(|value| {
+            value
+                .parse::<f32>()
+                .map_err(|_| format!("Invalid dimension '{value}'"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if values.len() != count {
+        return Err(match primitive {
+            MeshPrimitive::Cube => "Enter one cube edge length".to_string(),
+            MeshPrimitive::Plane => {
+                "Enter plane width and length, separated by a comma".to_string()
+            }
+            MeshPrimitive::Sphere => "Enter one sphere radius".to_string(),
+            MeshPrimitive::Cylinder => {
+                "Enter cylinder radius and height, separated by a comma".to_string()
+            }
+        });
+    }
+    if values
+        .iter()
+        .any(|value| !value.is_finite() || *value <= 0.0 || *value > 1000.0)
+    {
+        return Err("Dimensions must be finite, greater than 0, and at most 1000".to_string());
+    }
+    Ok(values)
+}
+
+fn parse_primitive_dimensions(primitive: MeshPrimitive, text: &str) -> Result<Vec3, String> {
+    let values = parse_dimension_values(primitive, text)?;
+    Ok(match primitive {
+        MeshPrimitive::Cube => vec3(values[0], values[0], values[0]),
+        MeshPrimitive::Plane => vec3(values[0], 1.0, values[1]),
+        MeshPrimitive::Sphere => vec3(values[0] * 2.0, values[0] * 2.0, values[0] * 2.0),
+        MeshPrimitive::Cylinder => vec3(values[0] * 2.0, values[1], values[0] * 2.0),
+    })
+}
+
+fn adjust_placement_dimension(
+    placement: &mut PrimitivePlacement,
+    delta: f32,
+) -> Result<(), String> {
+    let mut values = parse_dimension_values(placement.primitive, &placement.dimensions)?;
+    let mut tokens = placement
+        .dimensions
+        .split(|character: char| character == ',' || character.is_whitespace())
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    let index = placement.dimension_index.min(values.len() - 1);
+    values[index] = (values[index] + delta).clamp(0.01, 1000.0);
+    let adjusted = format!("{:.2}", values[index]);
+    tokens[index] = adjusted
+        .trim_end_matches('0')
+        .trim_end_matches('.')
+        .to_string();
+    placement.dimensions = tokens.join(", ");
+    placement.input_focused = true;
+    placement.input_selected = false;
+    Ok(())
+}
+
+fn select_placement_dimension(placement: &mut PrimitivePlacement, direction: i32) {
+    let count = primitive_dimension_count(placement.primitive);
+    if count > 1 {
+        placement.dimension_index =
+            (placement.dimension_index as i32 + direction).rem_euclid(count as i32) as usize;
+    }
+    placement.input_focused = true;
+    placement.input_selected = false;
+}
+
+fn placement_dimension_label(placement: &PrimitivePlacement) -> &'static str {
+    match (placement.primitive, placement.dimension_index) {
+        (MeshPrimitive::Cube, _) => "edge length",
+        (MeshPrimitive::Plane, 0) => "width",
+        (MeshPrimitive::Plane, _) => "length",
+        (MeshPrimitive::Sphere, _) => "radius",
+        (MeshPrimitive::Cylinder, 0) => "radius",
+        (MeshPrimitive::Cylinder, _) => "height",
+    }
+}
+
+fn dimensions_from_click(primitive: MeshPrimitive, center: Vec3, point: Vec3) -> Vec3 {
+    let diameter = (vec2(point.x - center.x, point.z - center.z).length() * 2.0).max(0.001);
+    match primitive {
+        MeshPrimitive::Cube | MeshPrimitive::Sphere | MeshPrimitive::Cylinder => {
+            vec3(diameter, diameter, diameter)
+        }
+        MeshPrimitive::Plane => vec3(diameter, 1.0, diameter),
+    }
 }
 
 fn mesh_ray_hit(origin: Vec3, direction: Vec3, mesh: &EditableMesh) -> Option<usize> {
@@ -377,16 +539,94 @@ fn draw_view_controls(ctx: &FrameContext, state: &CadSceneState, panel: Rect) {
             ctx.font_sm,
             ctx.colors_rt.text_secondary,
         );
-    }
-    if let Some(error) = &state.error {
-        draw_text(
-            error,
-            panel.x + 12.0,
-            panel.y + panel.h - 18.0,
-            ctx.font_sm,
-            Color::from_rgba(255, 110, 110, 255),
+        let snap_rect = grid_snap_rect(panel);
+        let spacing_minus = grid_spacing_minus_rect(panel);
+        let spacing_plus = grid_spacing_plus_rect(panel);
+        let preview_rect = interaction_preview_rect(panel);
+        let _ = button(
+            ctx,
+            snap_rect,
+            if state.grid_snap {
+                "Snap: On"
+            } else {
+                "Snap: Off"
+            },
         );
+        let _ = button(
+            ctx,
+            spacing_minus,
+            &format!("Grid: {:.2} (-)", state.grid_spacing),
+        );
+        let _ = button(ctx, spacing_plus, "+");
+        let _ = button(
+            ctx,
+            preview_rect,
+            if state.interaction_preview {
+                "Mesh View"
+            } else {
+                "Interaction Preview"
+            },
+        );
+        if state.interaction_preview {
+            let _ = button(ctx, preview_shuffle_rect(panel), "Shuffle neighbors");
+            let neighbors = state
+                .preview_neighbors
+                .iter()
+                .map(|state| match state {
+                    RadialNeighborState::Empty => "Empty",
+                    RadialNeighborState::Route => "Route",
+                    RadialNeighborState::OtherBuilding => "Building",
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            draw_text(
+                &neighbors,
+                panel.x + 12.0,
+                panel.y + panel.h - 7.0,
+                ctx.font_sm,
+                ctx.colors_rt.text_secondary,
+            );
+        }
     }
+}
+
+fn grid_snap_rect(panel: Rect) -> Rect {
+    Rect::new(panel.x + 12.0, panel.y + 166.0, panel.w - 24.0, 27.0)
+}
+
+fn grid_spacing_minus_rect(panel: Rect) -> Rect {
+    Rect::new(panel.x + 12.0, panel.y + 196.0, panel.w - 56.0, 27.0)
+}
+
+fn grid_spacing_plus_rect(panel: Rect) -> Rect {
+    Rect::new(panel.x + panel.w - 38.0, panel.y + 196.0, 26.0, 27.0)
+}
+
+fn interaction_preview_rect(panel: Rect) -> Rect {
+    Rect::new(panel.x + 12.0, panel.y + 226.0, panel.w - 24.0, 27.0)
+}
+
+fn preview_shuffle_rect(panel: Rect) -> Rect {
+    Rect::new(panel.x + 12.0, panel.y + 256.0, panel.w - 24.0, 27.0)
+}
+
+fn placement_panel_rect(viewport: Rect) -> Rect {
+    Rect::new(viewport.x + 12.0, viewport.y + 12.0, 330.0, 150.0)
+}
+
+fn placement_input_rect(viewport: Rect) -> Rect {
+    let panel = placement_panel_rect(viewport);
+    Rect::new(panel.x + 12.0, panel.y + 86.0, panel.w - 24.0, 26.0)
+}
+
+fn placement_create_rect(viewport: Rect) -> Rect {
+    let panel = placement_panel_rect(viewport);
+    Rect::new(panel.x + 12.0, panel.y + 117.0, 145.0, 26.0)
+}
+
+fn placement_cancel_rect(viewport: Rect) -> Rect {
+    let panel = placement_panel_rect(viewport);
+    Rect::new(panel.x + 173.0, panel.y + 117.0, 145.0, 26.0)
 }
 
 fn button(ctx: &FrameContext, rect: Rect, label: &str) -> bool {
@@ -592,6 +832,8 @@ fn close_editor(state: &mut CadSceneState) {
     state.group_config_dialog = None;
     state.knife_active = false;
     state.knife_start = None;
+    state.primitive_placement = None;
+    state.interaction_preview = false;
     state.face_scroll = 0;
     state.undo_stack.clear();
     state.redo_stack.clear();
@@ -613,6 +855,8 @@ fn switch_to_object(state: &mut CadSceneState, id: ObjectId) {
     state.group_config_dialog = None;
     state.knife_active = false;
     state.knife_start = None;
+    state.primitive_placement = None;
+    state.interaction_preview = false;
     state.undo_stack.clear();
     state.redo_stack.clear();
     state.face_scroll = 0;
@@ -880,25 +1124,36 @@ fn add_primitive(
     catalog: &mut ObjectCatalog,
     state: &mut CadSceneState,
     primitive: MeshPrimitive,
+    center: Vec3,
+    dimensions: Vec3,
 ) -> Result<(), String> {
     let snapshot = capture_snapshot(catalog, state)?;
-    let shape = EditableMesh::primitive(primitive);
+    let shape = EditableMesh::primitive(primitive).transformed(|position| {
+        center
+            + vec3(
+                position.x * dimensions.x,
+                position.y * dimensions.y,
+                position.z * dimensions.z,
+            )
+    });
     let first_face = snapshot.mesh.face_count();
     let face_count = shape.face_count();
-    selected_mesh_mut(catalog, state)
-        .ok_or_else(|| "Selected object is unavailable".to_string())?
-        .append(&shape)?;
-    let metadata = selected_metadata_mut(catalog, state)
-        .ok_or_else(|| "Selected face metadata is unavailable".to_string())?;
+    let mut mesh = snapshot.mesh.clone();
+    mesh.append(&shape)?;
+    let mut metadata = snapshot.metadata.clone();
     metadata.face_names.resize(first_face + face_count, None);
-    if let Some(group_id) = state
+    let parent_id = state
         .selected_group
-        .or_else(|| metadata.radial_main_group_id())
-    {
-        metadata.assign_new_faces_to_group(first_face, face_count, group_id)?;
-    }
+        .or_else(|| metadata.radial_main_group_id());
+    let faces = (first_face..first_face + face_count).collect::<Vec<_>>();
+    let group_id = metadata.create_group_under(&faces, parent_id)?;
+    metadata.rename_group(group_id, primitive_group_name(primitive).to_string())?;
+    *selected_mesh_mut(catalog, state)
+        .ok_or_else(|| "Selected object is unavailable".to_string())? = mesh;
+    *selected_metadata_mut(catalog, state)
+        .ok_or_else(|| "Selected face metadata is unavailable".to_string())? = metadata;
     state.selection_mode = SelectionMode::Face;
-    state.selected_faces = (first_face..first_face + face_count).collect();
+    state.selected_faces = faces;
     state.selected_vertices.clear();
     state.selected_edges.clear();
     state.selected_group = None;
@@ -906,6 +1161,244 @@ fn add_primitive(
     state.dirty = true;
     state.error = None;
     Ok(())
+}
+
+fn primitive_group_name(primitive: MeshPrimitive) -> &'static str {
+    match primitive {
+        MeshPrimitive::Cube => "Cube",
+        MeshPrimitive::Plane => "Plane",
+        MeshPrimitive::Sphere => "Sphere",
+        MeshPrimitive::Cylinder => "Cylinder",
+    }
+}
+
+fn start_primitive_placement(state: &mut CadSceneState, primitive: MeshPrimitive) {
+    state.primitive_placement = Some(PrimitivePlacement {
+        primitive,
+        center: None,
+        dimensions: primitive_default_dimensions(primitive).to_string(),
+        input_focused: false,
+        input_selected: false,
+        dimension_index: 0,
+    });
+    state.error = None;
+}
+
+fn confirm_primitive_placement(catalog: &mut ObjectCatalog, state: &mut CadSceneState) {
+    let Some(placement) = state.primitive_placement.clone() else {
+        return;
+    };
+    let Some(center) = placement.center else {
+        state.error = Some("Click the grid to place the primitive center first".to_string());
+        return;
+    };
+    let dimensions = match parse_primitive_dimensions(placement.primitive, &placement.dimensions) {
+        Ok(dimensions) => dimensions,
+        Err(error) => {
+            state.error = Some(error);
+            return;
+        }
+    };
+    match add_primitive(catalog, state, placement.primitive, center, dimensions) {
+        Ok(()) => state.primitive_placement = None,
+        Err(error) => state.error = Some(error),
+    }
+}
+
+fn shuffle_preview_neighbors(state: &mut CadSceneState, catalog: &ObjectCatalog) {
+    state.preview_seed = state.preview_seed.wrapping_add(1).max(1);
+    state.preview_neighbors = selected_metadata(catalog, state)
+        .map(|metadata| random_preview_neighbors(metadata, state.preview_seed))
+        .unwrap_or_else(|| random_preview_neighbors(&FaceMetadata::default(), state.preview_seed));
+}
+
+fn random_preview_neighbors(metadata: &FaceMetadata, seed: u64) -> [RadialNeighborState; 6] {
+    let mut choices = metadata
+        .groups
+        .iter()
+        .filter_map(|group| match group.program {
+            FaceGroupProgram::IfNeighbor(condition) => Some(condition),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    if choices.is_empty() {
+        choices.extend([
+            RadialNeighborState::Empty,
+            RadialNeighborState::Route,
+            RadialNeighborState::OtherBuilding,
+        ]);
+    }
+    let mut random = seed.max(1);
+    std::array::from_fn(|_| {
+        random ^= random << 13;
+        random ^= random >> 7;
+        random ^= random << 17;
+        choices[(random as usize) % choices.len()]
+    })
+}
+
+fn rotate_mesh_y(mesh: &EditableMesh, angle: f32) -> EditableMesh {
+    let (sin, cos) = angle.sin_cos();
+    mesh.transformed(|point| {
+        vec3(
+            point.x * cos - point.z * sin,
+            point.y,
+            point.x * sin + point.z * cos,
+        )
+    })
+}
+
+fn interaction_preview_mesh(
+    catalog: &ObjectCatalog,
+    state: &CadSceneState,
+) -> Result<EditableMesh, String> {
+    let base_mesh = selected_mesh(catalog, state)
+        .ok_or_else(|| "Selected object is unavailable".to_string())?;
+    let Some(metadata) = selected_metadata(catalog, state) else {
+        return Ok(base_mesh.clone());
+    };
+    compose_conditioned_preview(base_mesh, metadata, &state.preview_neighbors)
+}
+
+fn compose_conditioned_preview(
+    base_mesh: &EditableMesh,
+    metadata: &FaceMetadata,
+    neighbors: &[RadialNeighborState; 6],
+) -> Result<EditableMesh, String> {
+    if metadata.radial_main_group_id().is_none() {
+        return Ok(base_mesh.clone());
+    }
+    let mut composite = EditableMesh {
+        vertices: Vec::new(),
+        indices: Vec::new(),
+    };
+    for (sector, condition) in neighbors.iter().copied().enumerate() {
+        let sector_mesh = metadata
+            .radial_sector_mesh(base_mesh, condition)?
+            .ok_or_else(|| "Configured radial group could not be previewed".to_string())?;
+        composite.append(&rotate_mesh_y(
+            &sector_mesh,
+            std::f32::consts::TAU * sector as f32 / 6.0,
+        ))?;
+    }
+    Ok(composite)
+}
+
+fn preview_neighbor_object(
+    catalog: &ObjectCatalog,
+    selected: ObjectId,
+    seed: u64,
+    neighbor_index: usize,
+) -> Option<ObjectId> {
+    let candidates = catalog
+        .entries()
+        .iter()
+        .filter(|entry| {
+            entry.definition.category != ObjectCategory::Units
+                && entry.definition.id != selected
+                && entry.definition.id != ObjectId::PlanetRoute
+                && entry.mesh.is_some()
+        })
+        .map(|entry| entry.definition.id)
+        .collect::<Vec<_>>();
+    if candidates.is_empty() {
+        return None;
+    }
+    let index = seed.wrapping_add((neighbor_index as u64).wrapping_mul(0x9E37_79B9)) as usize
+        % candidates.len();
+    Some(candidates[index])
+}
+
+fn hex_cell_center(index: usize, radius: f32, origin: Vec3) -> Vec3 {
+    let angle = std::f32::consts::TAU * index as f32 / 6.0 + std::f32::consts::FRAC_PI_6;
+    origin
+        + vec3(
+            angle.cos() * radius * 3.0_f32.sqrt(),
+            0.0,
+            angle.sin() * radius * 3.0_f32.sqrt(),
+        )
+}
+
+fn draw_hex_outline(center: Vec3, radius: f32, color: Color) {
+    for corner in 0..6 {
+        let angle_a = std::f32::consts::TAU * corner as f32 / 6.0;
+        let angle_b = std::f32::consts::TAU * (corner + 1) as f32 / 6.0;
+        let a = center + vec3(angle_a.cos() * radius, 0.0, angle_a.sin() * radius);
+        let b = center + vec3(angle_b.cos() * radius, 0.0, angle_b.sin() * radius);
+        draw_line_3d(a, b, color);
+    }
+}
+
+fn draw_preview_object(mesh: &EditableMesh, center: Vec3, scale: f32) -> Result<(), String> {
+    let normalized = preview_mesh(mesh);
+    let min_y = normalized
+        .vertices
+        .iter()
+        .map(|vertex| vertex.position.y)
+        .reduce(f32::min)
+        .unwrap_or(0.0);
+    normalized
+        .transformed(|position| position * scale + center + vec3(0.0, -min_y * scale + 0.02, 0.0))
+        .render()
+}
+
+fn preview_camera(state: &CadSceneState) -> Camera3D {
+    let mut camera = object_camera(state);
+    let direction = (camera.position - camera.target).normalize_or_zero();
+    let distance = (state.distance * 1.8).max(5.5);
+    camera.position = camera.target + direction * distance;
+    camera
+}
+
+fn draw_interaction_preview(catalog: &ObjectCatalog, state: &CadSceneState) -> Result<(), String> {
+    let camera = preview_camera(state);
+    set_camera(&camera);
+    let result = (|| {
+        let origin = state.target;
+        const CELL_RADIUS: f32 = 0.9;
+        draw_hex_outline(origin, CELL_RADIUS, Color::from_rgba(255, 225, 90, 255));
+        for index in 0..6 {
+            let center = hex_cell_center(index, CELL_RADIUS, origin);
+            draw_hex_outline(center, CELL_RADIUS, Color::from_rgba(115, 145, 165, 255));
+        }
+
+        let center_mesh = interaction_preview_mesh(catalog, state)?;
+        draw_preview_object(&center_mesh, origin, 0.28)?;
+        for (index, condition) in state.preview_neighbors.iter().copied().enumerate() {
+            let object_id = match condition {
+                RadialNeighborState::Empty => None,
+                RadialNeighborState::Route => Some(ObjectId::PlanetRoute),
+                RadialNeighborState::OtherBuilding => {
+                    preview_neighbor_object(catalog, state.selected, state.preview_seed, index)
+                }
+            };
+            let Some(mesh) = object_id.and_then(|id| catalog.get(id)) else {
+                continue;
+            };
+            draw_preview_object(mesh, hex_cell_center(index, CELL_RADIUS, origin), 0.24)?;
+        }
+        Ok(())
+    })();
+    set_default_camera();
+    result
+}
+
+fn draw_square_grid(model_center: Vec3, scale: f32, spacing: f32) {
+    let spacing = spacing.max(0.001);
+    let half_count = (4.0 / (spacing * scale)).ceil().clamp(1.0, 60.0) as i32;
+    let extent = half_count as f32 * spacing;
+    let color = Color::from_rgba(150, 175, 190, 75);
+    for line in -half_count..=half_count {
+        let coordinate = line as f32 * spacing;
+        let x = (coordinate - model_center.x) * scale;
+        let z = (coordinate - model_center.z) * scale;
+        let min_x = (-extent - model_center.x) * scale;
+        let max_x = (extent - model_center.x) * scale;
+        let min_z = (-extent - model_center.z) * scale;
+        let max_z = (extent - model_center.z) * scale;
+        draw_line_3d(vec3(x, 0.0, min_z), vec3(x, 0.0, max_z), color);
+        draw_line_3d(vec3(min_x, 0.0, z), vec3(max_x, 0.0, z), color);
+    }
 }
 
 fn perform_knife_cut(
@@ -1245,9 +1738,25 @@ pub fn run(
         screen_width() - SIDEBAR_WIDTH,
         screen_height() - TOOLBAR_HEIGHT,
     );
-    let view_panel = Rect::new(screen_width() - 205.0, 18.0, 190.0, 155.0);
+    let view_panel = Rect::new(
+        screen_width() - 205.0,
+        18.0,
+        190.0,
+        if state.editing {
+            if state.interaction_preview {
+                318.0
+            } else {
+                288.0
+            }
+        } else {
+            155.0
+        },
+    );
     if is_key_pressed(KeyCode::Escape) {
-        if state.knife_active {
+        if state.primitive_placement.is_some() {
+            state.primitive_placement = None;
+            state.error = None;
+        } else if state.knife_active {
             state.knife_active = false;
             state.knife_start = None;
             state.error = None;
@@ -1268,7 +1777,65 @@ pub fn run(
             return;
         }
     }
-    let mut modal_open = state.exit_confirmation_open || state.group_config_dialog.is_some();
+    let mut modal_open = state.exit_confirmation_open
+        || state.group_config_dialog.is_some()
+        || state.primitive_placement.is_some();
+    if !state.exit_confirmation_open
+        && state.group_config_dialog.is_none()
+        && state.rename_dialog.is_none()
+        && let Some(placement) = state
+            .primitive_placement
+            .as_mut()
+            .filter(|placement| placement.center.is_some())
+    {
+        if placement.input_focused {
+            while let Some(character) = get_char_pressed() {
+                if character.is_ascii_digit() || matches!(character, '.' | ',' | ' ') {
+                    if placement.input_selected {
+                        placement.dimensions.clear();
+                        placement.input_selected = false;
+                    }
+                    if placement.dimensions.len() < 32 {
+                        placement.dimensions.push(character);
+                    }
+                }
+            }
+            if is_key_pressed(KeyCode::Backspace) {
+                if placement.input_selected {
+                    placement.dimensions.clear();
+                    placement.input_selected = false;
+                } else {
+                    placement.dimensions.pop();
+                }
+            }
+            if is_key_pressed(KeyCode::Left) {
+                select_placement_dimension(placement, -1);
+            } else if is_key_pressed(KeyCode::Right) {
+                select_placement_dimension(placement, 1);
+            }
+            let step = if is_key_down(KeyCode::LeftShift) || is_key_down(KeyCode::RightShift) {
+                0.01
+            } else {
+                0.1
+            };
+            let adjustment = if is_key_pressed(KeyCode::Up) {
+                Some(step)
+            } else if is_key_pressed(KeyCode::Down) {
+                Some(-step)
+            } else {
+                None
+            };
+            if let Some(delta) = adjustment {
+                match adjust_placement_dimension(placement, delta) {
+                    Ok(()) => state.error = None,
+                    Err(error) => state.error = Some(error),
+                }
+            }
+        }
+        if is_key_pressed(KeyCode::Enter) {
+            confirm_primitive_placement(catalog, state);
+        }
+    }
     if !modal_open && let Some(dialog) = state.rename_dialog.as_mut() {
         while let Some(character) = get_char_pressed() {
             if !character.is_control() && dialog.text.chars().count() < 64 {
@@ -1305,7 +1872,57 @@ pub fn run(
     }
     let mut ui_capturing = sidebar.contains(ctx.mouse)
         || toolbar.contains(ctx.mouse)
-        || view_panel.contains(ctx.mouse);
+        || view_panel.contains(ctx.mouse)
+        || state
+            .primitive_placement
+            .as_ref()
+            .is_some_and(|placement| placement.center.is_some())
+            && placement_panel_rect(viewport).contains(ctx.mouse);
+    if !modal_open && !rename_dialog_open && state.editing {
+        if button(
+            ctx,
+            grid_snap_rect(view_panel),
+            if state.grid_snap {
+                "Snap: On"
+            } else {
+                "Snap: Off"
+            },
+        ) {
+            state.grid_snap = !state.grid_snap;
+        }
+        if button(
+            ctx,
+            grid_spacing_minus_rect(view_panel),
+            &format!("Grid: {:.2} (-)", state.grid_spacing),
+        ) {
+            state.grid_spacing = (state.grid_spacing - 0.1).max(0.1);
+        }
+        if button(ctx, grid_spacing_plus_rect(view_panel), "+") {
+            state.grid_spacing = (state.grid_spacing + 0.1).min(10.0);
+        }
+        if button(
+            ctx,
+            interaction_preview_rect(view_panel),
+            if state.interaction_preview {
+                "Mesh View"
+            } else {
+                "Interaction Preview"
+            },
+        ) {
+            state.interaction_preview = !state.interaction_preview;
+            if state.interaction_preview {
+                shuffle_preview_neighbors(state, catalog);
+            }
+        }
+        if state.interaction_preview
+            && button(ctx, preview_shuffle_rect(view_panel), "Shuffle neighbors")
+        {
+            shuffle_preview_neighbors(state, catalog);
+        }
+        if state.grid_spacing != 0.5 {
+            state.grid_spacing = (state.grid_spacing * 100.0).round() / 100.0;
+        }
+    }
     let mut category_y = 68.0;
     if !state.editing {
         for category in [
@@ -1539,12 +2156,30 @@ pub fn run(
                 && !rename_dialog_open
                 && button(ctx, Rect::new(x, 12.0, 72.0, 34.0), label)
             {
-                if let Err(error) = add_primitive(catalog, state, primitive) {
-                    state.error = Some(error);
-                }
+                start_primitive_placement(state, primitive);
+                modal_open = true;
             }
             x += 76.0;
         }
+    }
+    if let Some(placement) = state.primitive_placement.as_ref()
+        && placement.center.is_some()
+    {
+        if placement_input_rect(viewport).contains(ctx.mouse)
+            && is_mouse_button_pressed(MouseButton::Left)
+            && let Some(placement) = state.primitive_placement.as_mut()
+        {
+            placement.input_focused = true;
+            placement.input_selected = true;
+        }
+        if button(ctx, placement_create_rect(viewport), "Create") {
+            confirm_primitive_placement(catalog, state);
+        }
+        if button(ctx, placement_cancel_rect(viewport), "Cancel") {
+            state.primitive_placement = None;
+            state.error = None;
+        }
+        ui_capturing |= placement_panel_rect(viewport).contains(ctx.mouse);
     }
     if state.editing {
         let add_group = Rect::new(12.0, 66.0, 108.0, 30.0);
@@ -1731,8 +2366,9 @@ pub fn run(
         && Rect::new(SIDEBAR_WIDTH, action_y - 4.0, screen_width(), 40.0).contains(ctx.mouse);
 
     let camera = object_camera(state);
-    let viewport_active =
-        !modal_open && !rename_dialog_open && viewport.contains(ctx.mouse) && !ui_capturing;
+    let editor_modal_open =
+        state.exit_confirmation_open || state.group_config_dialog.is_some() || rename_dialog_open;
+    let viewport_active = !editor_modal_open && viewport.contains(ctx.mouse) && !ui_capturing;
     if viewport_active && is_mouse_button_down(MouseButton::Right) {
         let delta = ctx.mouse - state.last_mouse;
         state.yaw -= delta.x * 0.008;
@@ -1753,62 +2389,132 @@ pub fn run(
         }
     }
     state.last_mouse = ctx.mouse;
-    let camera = object_camera(state);
+    let camera = if state.interaction_preview {
+        preview_camera(state)
+    } else {
+        object_camera(state)
+    };
 
     let current_mesh = selected_mesh(catalog, state).cloned();
     let preview = current_mesh.as_ref().map(preview_mesh);
-    set_camera(&camera);
-    if let Some(mesh) = preview.as_ref() {
-        if let Err(error) = mesh.render() {
+    if state.interaction_preview {
+        if let Err(error) = draw_interaction_preview(catalog, state) {
             state.error = Some(error);
         }
-        if state.editing {
-            for &index in &state.selected_vertices {
-                if let Some(vertex) = mesh.vertices.get(index) {
-                    draw_cube(
-                        vertex.position,
-                        vec3(0.07, 0.07, 0.07),
-                        None,
-                        Color::from_rgba(255, 235, 60, 255),
-                    );
-                }
+    } else {
+        set_camera(&camera);
+        if state.editing
+            && let Some(mesh) = current_mesh.as_ref()
+        {
+            let (model_center, scale) = mesh_center_and_scale(mesh);
+            draw_square_grid(model_center, scale, state.grid_spacing);
+        }
+        if let Some(mesh) = preview.as_ref() {
+            if let Err(error) = mesh.render() {
+                state.error = Some(error);
             }
-            for &(a, b) in &state.selected_edges {
-                if let (Some(a), Some(b)) = (mesh.vertices.get(a), mesh.vertices.get(b)) {
-                    draw_line_3d(a.position, b.position, Color::from_rgba(80, 235, 240, 255));
+            if state.editing {
+                for &index in &state.selected_vertices {
+                    if let Some(vertex) = mesh.vertices.get(index) {
+                        draw_cube(
+                            vertex.position,
+                            vec3(0.07, 0.07, 0.07),
+                            None,
+                            Color::from_rgba(255, 235, 60, 255),
+                        );
+                    }
                 }
-            }
-            for &face in &state.selected_faces {
-                let start = face * 3;
-                if let Some(indices) = mesh.indices.get(start..start + 3) {
-                    let points = indices
-                        .iter()
-                        .filter_map(|&index| mesh.vertices.get(index as usize))
-                        .map(|vertex| vertex.position)
-                        .collect::<Vec<_>>();
-                    if points.len() == 3 {
-                        for edge in 0..3 {
-                            draw_line_3d(
-                                points[edge],
-                                points[(edge + 1) % 3],
-                                Color::from_rgba(255, 235, 60, 255),
+                for &(a, b) in &state.selected_edges {
+                    if let (Some(a), Some(b)) = (mesh.vertices.get(a), mesh.vertices.get(b)) {
+                        draw_line_3d(a.position, b.position, Color::from_rgba(80, 235, 240, 255));
+                    }
+                }
+                for &face in &state.selected_faces {
+                    let start = face * 3;
+                    if let Some(indices) = mesh.indices.get(start..start + 3) {
+                        let points = indices
+                            .iter()
+                            .filter_map(|&index| mesh.vertices.get(index as usize))
+                            .map(|vertex| vertex.position)
+                            .collect::<Vec<_>>();
+                        if points.len() == 3 {
+                            for edge in 0..3 {
+                                draw_line_3d(
+                                    points[edge],
+                                    points[(edge + 1) % 3],
+                                    Color::from_rgba(255, 235, 60, 255),
+                                );
+                            }
+                        }
+                        if let Some(start) = state.knife_start {
+                            draw_sphere(
+                                start.point,
+                                0.035,
+                                None,
+                                Color::from_rgba(255, 90, 90, 255),
                             );
                         }
                     }
-                    if let Some(start) = state.knife_start {
-                        draw_sphere(start.point, 0.035, None, Color::from_rgba(255, 90, 90, 255));
-                    }
+                }
+            }
+            if let (Some(placement), Some(base_mesh)) =
+                (state.primitive_placement.as_ref(), current_mesh.as_ref())
+                && let Some(center) = placement.center
+                && let Ok(dimensions) =
+                    parse_primitive_dimensions(placement.primitive, &placement.dimensions)
+            {
+                let ghost = EditableMesh::primitive(placement.primitive).transformed(|position| {
+                    let model_position = center
+                        + vec3(
+                            position.x * dimensions.x,
+                            position.y * dimensions.y,
+                            position.z * dimensions.z,
+                        );
+                    model_to_display_point(base_mesh, model_position)
+                });
+                if let Err(error) = ghost.render() {
+                    state.error = Some(error);
                 }
             }
         }
+        set_default_camera();
     }
-    set_default_camera();
 
-    if viewport_active && state.editing && is_mouse_button_pressed(MouseButton::Left) {
+    if viewport_active
+        && state.editing
+        && !state.interaction_preview
+        && is_mouse_button_pressed(MouseButton::Left)
+    {
         if let (Some((origin, direction)), Some(mesh)) =
             (mouse_ray(&camera, ctx.mouse), preview.as_ref())
         {
-            if state.knife_active {
+            if let Some(placement) = state.primitive_placement.clone() {
+                if let Some(display_point) = construction_plane_hit(origin, direction) {
+                    let mut model_point = display_to_model_point(
+                        current_mesh.as_ref().unwrap_or(mesh),
+                        display_point,
+                    );
+                    if state.grid_snap {
+                        model_point = snap_model_point(model_point, state.grid_spacing);
+                    }
+                    if let Some(center) = placement.center {
+                        let dimensions =
+                            dimensions_from_click(placement.primitive, center, model_point);
+                        match add_primitive(catalog, state, placement.primitive, center, dimensions)
+                        {
+                            Ok(()) => state.primitive_placement = None,
+                            Err(error) => state.error = Some(error),
+                        }
+                    } else if let Some(active) = state.primitive_placement.as_mut() {
+                        active.center = Some(model_point);
+                        active.input_focused = true;
+                        active.input_selected = true;
+                        state.error = None;
+                    }
+                } else {
+                    state.error = Some("The click did not intersect the construction plane".into());
+                }
+            } else if state.knife_active {
                 let hit = mesh_ray_hit_point(origin, direction, mesh, Some(&state.selected_faces));
                 match (state.knife_start, hit) {
                     (None, Some((_, face, point))) => {
@@ -2075,6 +2781,15 @@ pub fn run(
         );
     }
     draw_view_controls(ctx, state, view_panel);
+    if let Some(error) = &state.error {
+        draw_text(
+            error,
+            SIDEBAR_WIDTH + 12.0,
+            screen_height() - 18.0,
+            ctx.font_sm,
+            Color::from_rgba(255, 110, 110, 255),
+        );
+    }
     if state.dirty {
         draw_text(
             "Unsaved mesh edits",
@@ -2246,6 +2961,94 @@ pub fn run(
             );
         }
     }
+    if let Some(placement) = state.primitive_placement.as_ref() {
+        if placement.center.is_some() {
+            let panel = placement_panel_rect(viewport);
+            draw_rectangle(panel.x, panel.y, panel.w, panel.h, ctx.colors_rt.panel_bg);
+            draw_rectangle_lines(
+                panel.x,
+                panel.y,
+                panel.w,
+                panel.h,
+                1.0,
+                ctx.colors_rt.panel_border,
+            );
+            let name = match placement.primitive {
+                MeshPrimitive::Cube => "Cube",
+                MeshPrimitive::Plane => "Plane",
+                MeshPrimitive::Sphere => "Sphere",
+                MeshPrimitive::Cylinder => "Cylinder",
+            };
+            draw_text(
+                "Click viewport for size, or type values",
+                panel.x + 12.0,
+                panel.y + 20.0,
+                ctx.font_sm,
+                ctx.colors_rt.text_primary,
+            );
+            draw_text(
+                &format!(
+                    "{name}: {} active (model units)",
+                    placement_dimension_label(placement)
+                ),
+                panel.x + 12.0,
+                panel.y + 42.0,
+                ctx.font_sm,
+                ctx.colors_rt.text_secondary,
+            );
+            draw_text(
+                "Up/Down: +/-0.1; Shift: +/-0.01",
+                panel.x + 12.0,
+                panel.y + 62.0,
+                ctx.font_sm,
+                ctx.colors_rt.text_secondary,
+            );
+            draw_text(
+                "Left/Right: select dimension",
+                panel.x + 12.0,
+                panel.y + 80.0,
+                ctx.font_sm,
+                ctx.colors_rt.text_secondary,
+            );
+            let input = placement_input_rect(viewport);
+            draw_rectangle(
+                input.x,
+                input.y,
+                input.w,
+                input.h,
+                if placement.input_selected {
+                    Color::from_rgba(55, 91, 156, 255)
+                } else {
+                    ctx.colors_rt.button_base
+                },
+            );
+            draw_rectangle_lines(
+                input.x,
+                input.y,
+                input.w,
+                input.h,
+                1.0,
+                ctx.colors_rt.button_border,
+            );
+            draw_text(
+                &placement.dimensions,
+                input.x + 8.0,
+                input.y + input.h * 0.5 + ctx.font_sm * 0.35,
+                ctx.font_sm,
+                WHITE,
+            );
+            let _ = button(ctx, placement_create_rect(viewport), "Create");
+            let _ = button(ctx, placement_cancel_rect(viewport), "Cancel");
+        } else {
+            draw_text(
+                "Click the square grid to place the primitive center. Esc cancels.",
+                SIDEBAR_WIDTH + 18.0,
+                screen_height() - 24.0,
+                ctx.font_sm,
+                ctx.colors_rt.text_primary,
+            );
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2265,6 +3068,208 @@ mod tests {
             zoom_distance(CAMERA_MAX_DISTANCE, -100.0),
             CAMERA_MAX_DISTANCE
         );
+    }
+
+    #[test]
+    fn placement_dimensions_parse_local_primitive_measurements() {
+        assert_eq!(
+            parse_primitive_dimensions(MeshPrimitive::Cube, "2.5").unwrap(),
+            vec3(2.5, 2.5, 2.5)
+        );
+        assert_eq!(
+            parse_primitive_dimensions(MeshPrimitive::Plane, "3, 4").unwrap(),
+            vec3(3.0, 1.0, 4.0)
+        );
+        assert_eq!(
+            parse_primitive_dimensions(MeshPrimitive::Sphere, "0.75").unwrap(),
+            vec3(1.5, 1.5, 1.5)
+        );
+        assert_eq!(
+            parse_primitive_dimensions(MeshPrimitive::Cylinder, "0.5, 2").unwrap(),
+            vec3(1.0, 2.0, 1.0)
+        );
+        assert!(parse_primitive_dimensions(MeshPrimitive::Cylinder, "0.5").is_err());
+        assert!(parse_primitive_dimensions(MeshPrimitive::Cube, "NaN").is_err());
+    }
+
+    #[test]
+    fn arrow_adjustment_uses_requested_steps_and_selects_multi_value_fields() {
+        let mut placement = PrimitivePlacement {
+            primitive: MeshPrimitive::Cylinder,
+            center: Some(Vec3::ZERO),
+            dimensions: "0.5, 1".to_string(),
+            input_focused: true,
+            input_selected: false,
+            dimension_index: 0,
+        };
+        adjust_placement_dimension(&mut placement, 0.1).unwrap();
+        assert_eq!(placement.dimensions, "0.6, 1");
+        adjust_placement_dimension(&mut placement, -0.01).unwrap();
+        assert_eq!(placement.dimensions, "0.59, 1");
+        select_placement_dimension(&mut placement, 1);
+        assert_eq!(placement_dimension_label(&placement), "height");
+        adjust_placement_dimension(&mut placement, 0.01).unwrap();
+        assert_eq!(placement.dimensions, "0.59, 1.01");
+        select_placement_dimension(&mut placement, -1);
+        assert_eq!(placement_dimension_label(&placement), "radius");
+    }
+
+    #[test]
+    fn grid_snapping_and_construction_plane_intersection_are_stable() {
+        assert_eq!(
+            snap_model_point(vec3(0.26, 3.0, -0.74), 0.5),
+            vec3(0.5, 3.0, -0.5)
+        );
+        let mesh = EditableMesh::primitive(MeshPrimitive::Cube)
+            .transformed(|point| point + vec3(3.0, 2.0, -4.0));
+        let model_point = vec3(3.25, 2.4, -3.5);
+        let displayed = model_to_display_point(&mesh, model_point);
+        assert!((display_to_model_point(&mesh, displayed) - model_point).length() < 1e-5);
+        assert_eq!(
+            construction_plane_hit(vec3(0.0, 2.0, 0.0), vec3(0.0, -1.0, 0.0)),
+            Some(Vec3::ZERO)
+        );
+        assert_eq!(construction_plane_hit(vec3(0.0, 2.0, 0.0), Vec3::X), None);
+        assert_eq!(
+            dimensions_from_click(MeshPrimitive::Sphere, Vec3::ZERO, Vec3::X),
+            vec3(2.0, 2.0, 2.0)
+        );
+    }
+
+    #[test]
+    fn interaction_preview_randomizes_only_configured_neighbor_conditions() {
+        let mut metadata = FaceMetadata::for_face_count(3);
+        let main = metadata.create_group(&[0]).unwrap();
+        metadata
+            .set_group_program(main, FaceGroupProgram::RadialRepeat)
+            .unwrap();
+        let empty = metadata.create_group_under(&[1], Some(main)).unwrap();
+        metadata
+            .set_group_program(
+                empty,
+                FaceGroupProgram::IfNeighbor(RadialNeighborState::Empty),
+            )
+            .unwrap();
+        let route = metadata.create_group_under(&[2], Some(main)).unwrap();
+        metadata
+            .set_group_program(
+                route,
+                FaceGroupProgram::IfNeighbor(RadialNeighborState::Route),
+            )
+            .unwrap();
+
+        for seed in 1..16 {
+            assert!(
+                random_preview_neighbors(&metadata, seed)
+                    .iter()
+                    .all(|state| matches!(
+                        state,
+                        RadialNeighborState::Empty | RadialNeighborState::Route
+                    ))
+            );
+        }
+    }
+
+    #[test]
+    fn pending_primitive_is_added_only_after_explicit_confirmation() {
+        let mut catalog = ObjectCatalog::load();
+        let mut state = CadSceneState::default();
+        let original_faces = catalog.get(state.selected).unwrap().face_count();
+        start_primitive_placement(&mut state, MeshPrimitive::Cube);
+        assert_eq!(
+            catalog.get(state.selected).unwrap().face_count(),
+            original_faces
+        );
+        confirm_primitive_placement(&mut catalog, &mut state);
+        assert_eq!(
+            catalog.get(state.selected).unwrap().face_count(),
+            original_faces
+        );
+
+        let placement = state.primitive_placement.as_mut().unwrap();
+        placement.center = Some(vec3(2.0, 0.0, -1.0));
+        placement.dimensions = "2".to_string();
+        confirm_primitive_placement(&mut catalog, &mut state);
+
+        assert!(state.primitive_placement.is_none());
+        assert_eq!(
+            catalog.get(state.selected).unwrap().face_count(),
+            original_faces + 12
+        );
+        let inserted_faces = (original_faces..original_faces + 12).collect::<Vec<_>>();
+        let primitive_group = catalog
+            .metadata(state.selected, None)
+            .unwrap()
+            .groups
+            .iter()
+            .find(|group| group.faces == inserted_faces)
+            .unwrap();
+        assert_eq!(primitive_group.name, "Cube");
+        assert!(state.dirty);
+        assert!(undo(&mut catalog, &mut state).unwrap());
+        assert_eq!(
+            catalog.get(state.selected).unwrap().face_count(),
+            original_faces
+        );
+        assert!(
+            catalog
+                .metadata(state.selected, None)
+                .unwrap()
+                .groups
+                .iter()
+                .all(|group| group.faces != inserted_faces)
+        );
+    }
+
+    #[test]
+    fn interaction_preview_composes_the_neighbor_branch_for_each_sector() {
+        let color = Color::from_rgba(255, 255, 255, 255);
+        let mut vertices = Vec::new();
+        for offset in [0.0, 2.0, 4.0] {
+            vertices.extend([
+                Vertex::new2(vec3(offset, 0.0, 0.0), Vec2::ZERO, color),
+                Vertex::new2(vec3(offset + 1.0, 0.0, 0.0), Vec2::ZERO, color),
+                Vertex::new2(vec3(offset, 1.0, 0.0), Vec2::ZERO, color),
+            ]);
+        }
+        let mesh = EditableMesh {
+            vertices,
+            indices: vec![0, 1, 2, 3, 4, 5, 6, 7, 8],
+        };
+        let mut metadata = FaceMetadata::for_face_count(3);
+        let main = metadata.create_group(&[0]).unwrap();
+        metadata
+            .set_group_program(main, FaceGroupProgram::RadialRepeat)
+            .unwrap();
+        let empty = metadata.create_group_under(&[1], Some(main)).unwrap();
+        metadata
+            .set_group_program(
+                empty,
+                FaceGroupProgram::IfNeighbor(RadialNeighborState::Empty),
+            )
+            .unwrap();
+        let route = metadata.create_group_under(&[2], Some(main)).unwrap();
+        metadata
+            .set_group_program(
+                route,
+                FaceGroupProgram::IfNeighbor(RadialNeighborState::Route),
+            )
+            .unwrap();
+
+        let preview = compose_conditioned_preview(
+            &mesh,
+            &metadata,
+            &[
+                RadialNeighborState::Empty,
+                RadialNeighborState::Route,
+                RadialNeighborState::OtherBuilding,
+                RadialNeighborState::Empty,
+                RadialNeighborState::Route,
+                RadialNeighborState::OtherBuilding,
+            ],
+        )
+        .unwrap();
+        assert_eq!(preview.face_count(), 10);
     }
 
     #[test]
@@ -2350,6 +3355,15 @@ mod tests {
             selected_group: Some(1),
             selected_vertices: vec![0],
             dirty: false,
+            interaction_preview: true,
+            primitive_placement: Some(PrimitivePlacement {
+                primitive: MeshPrimitive::Cube,
+                center: Some(Vec3::ZERO),
+                dimensions: "1".to_string(),
+                input_focused: true,
+                input_selected: false,
+                dimension_index: 0,
+            }),
             ..CadSceneState::default()
         };
 
@@ -2364,6 +3378,8 @@ mod tests {
         assert!(state.selected_group.is_none());
         assert!(state.selected_vertices.is_empty());
         assert!(state.undo_stack.is_empty());
+        assert!(!state.interaction_preview);
+        assert!(state.primitive_placement.is_none());
     }
 
     #[test]

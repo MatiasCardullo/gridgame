@@ -1200,22 +1200,6 @@ impl FaceMetadata {
         Ok(id)
     }
 
-    pub fn assign_new_faces_to_group(
-        &mut self,
-        first_face: usize,
-        face_count: usize,
-        group_id: u64,
-    ) -> Result<(), String> {
-        let last_face = first_face
-            .checked_add(face_count)
-            .ok_or_else(|| "face range overflow".to_string())?;
-        if last_face > self.face_names.len() {
-            return Err("new face range is outside the mesh".to_string());
-        }
-        let faces = (first_face..last_face).collect::<Vec<_>>();
-        self.assign_faces_to_group(&faces, group_id)
-    }
-
     fn allocate_group_id(&mut self) -> Result<u64, String> {
         let id = self.next_group_id.max(1);
         self.next_group_id = id

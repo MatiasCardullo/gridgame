@@ -385,7 +385,63 @@ pub struct EditableMesh {
     pub indices: Vec<u32>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MeshPrimitive {
+    Cube,
+    Plane,
+    Sphere,
+    Cylinder,
+}
+
 impl EditableMesh {
+    pub fn primitive(primitive: MeshPrimitive) -> Self {
+        let color = Color::from_rgba(205, 190, 160, 255);
+        match primitive {
+            MeshPrimitive::Cube => {
+                let vertices = [
+                    vec3(-0.5, -0.5, -0.5),
+                    vec3(0.5, -0.5, -0.5),
+                    vec3(0.5, 0.5, -0.5),
+                    vec3(-0.5, 0.5, -0.5),
+                    vec3(-0.5, -0.5, 0.5),
+                    vec3(0.5, -0.5, 0.5),
+                    vec3(0.5, 0.5, 0.5),
+                    vec3(-0.5, 0.5, 0.5),
+                ];
+                Self::from_positions_and_indices(
+                    &vertices,
+                    &[
+                        0, 2, 1, 0, 3, 2, 4, 5, 6, 4, 6, 7, 0, 1, 5, 0, 5, 4, 3, 7, 6, 3, 6, 2, 0,
+                        4, 7, 0, 7, 3, 1, 2, 6, 1, 6, 5,
+                    ],
+                    color,
+                )
+            }
+            MeshPrimitive::Plane => Self::from_positions_and_indices(
+                &[
+                    vec3(-0.5, 0.0, -0.5),
+                    vec3(0.5, 0.0, -0.5),
+                    vec3(0.5, 0.0, 0.5),
+                    vec3(-0.5, 0.0, 0.5),
+                ],
+                &[0, 2, 1, 0, 3, 2],
+                color,
+            ),
+            MeshPrimitive::Sphere => Self::sphere_primitive(color),
+            MeshPrimitive::Cylinder => Self::cylinder_primitive(color),
+        }
+    }
+
+    fn from_positions_and_indices(positions: &[Vec3], indices: &[u32], color: Color) -> Self {
+        Self {
+            vertices: positions
+                .iter()
+                .map(|&position| Vertex::new2(position, Vec2::ZERO, color))
+                .collect(),
+            indices: indices.to_vec(),
+        }
+    }
+
     pub fn render(&self) -> Result<(), String> {
         if self.vertices.len() > u16::MAX as usize + 1 {
             return Err(format!(
@@ -415,6 +471,165 @@ impl EditableMesh {
         };
         draw_mesh(&mesh);
         Ok(())
+    }
+
+    fn clip_triangle(
+        triangle: &[Vertex],
+        plane_point: Vec3,
+        plane_normal: Vec3,
+        keep_positive: bool,
+    ) -> Vec<Vertex> {
+        let signed = |vertex: Vertex| (vertex.position - plane_point).dot(plane_normal);
+        let inside = |distance: f32| {
+            if keep_positive {
+                distance >= -1e-6
+            } else {
+                distance <= 1e-6
+            }
+        };
+        let mut output = Vec::new();
+        for index in 0..triangle.len() {
+            let current = triangle[index];
+            let next = triangle[(index + 1) % triangle.len()];
+            let current_distance = signed(current);
+            let next_distance = signed(next);
+            let current_inside = inside(current_distance);
+            let next_inside = inside(next_distance);
+            if current_inside && next_inside {
+                output.push(next);
+            } else if current_inside && !next_inside {
+                output.push(Self::interpolate_vertex(
+                    current,
+                    next,
+                    current_distance,
+                    next_distance,
+                ));
+            } else if !current_inside && next_inside {
+                output.push(Self::interpolate_vertex(
+                    current,
+                    next,
+                    current_distance,
+                    next_distance,
+                ));
+                output.push(next);
+            }
+        }
+        output.dedup_by(|left, right| (left.position - right.position).length_squared() <= 1e-12);
+        output
+    }
+
+    fn interpolate_vertex(
+        start: Vertex,
+        end: Vertex,
+        start_distance: f32,
+        end_distance: f32,
+    ) -> Vertex {
+        let t = (start_distance / (start_distance - end_distance)).clamp(0.0, 1.0);
+        let color: [u8; 4] = std::array::from_fn(|index| {
+            (start.color[index] as f32 + (end.color[index] as f32 - start.color[index] as f32) * t)
+                .round() as u8
+        });
+        Vertex::new2(
+            start.position.lerp(end.position, t),
+            start.uv.lerp(end.uv, t),
+            Color::from_rgba(color[0], color[1], color[2], color[3]),
+        )
+    }
+
+    fn append_polygon(mesh: &mut EditableMesh, polygon: &[Vertex]) -> Result<(), String> {
+        if polygon.len() < 3 {
+            return Ok(());
+        }
+        let first = u32::try_from(mesh.vertices.len())
+            .map_err(|_| "mesh has too many vertices to edit".to_string())?;
+        mesh.vertices.extend_from_slice(polygon);
+        for corner in 1..polygon.len() - 1 {
+            let b = first
+                .checked_add(corner as u32)
+                .ok_or_else(|| "mesh index overflow".to_string())?;
+            let c = b
+                .checked_add(1)
+                .ok_or_else(|| "mesh index overflow".to_string())?;
+            mesh.indices.extend_from_slice(&[first, b, c]);
+        }
+        Ok(())
+    }
+
+    fn sphere_primitive(color: Color) -> EditableMesh {
+        const SEGMENTS: usize = 16;
+        const RINGS: usize = 8;
+        let mut positions = Vec::with_capacity(2 + (RINGS - 1) * SEGMENTS);
+        positions.push(vec3(0.0, 0.5, 0.0));
+        for ring in 1..RINGS {
+            let latitude =
+                std::f32::consts::FRAC_PI_2 - std::f32::consts::PI * ring as f32 / RINGS as f32;
+            let ring_radius = latitude.cos() * 0.5;
+            let y = latitude.sin() * 0.5;
+            for segment in 0..SEGMENTS {
+                let longitude = std::f32::consts::TAU * segment as f32 / SEGMENTS as f32;
+                positions.push(vec3(
+                    ring_radius * longitude.cos(),
+                    y,
+                    ring_radius * longitude.sin(),
+                ));
+            }
+        }
+        let bottom = positions.len() as u32;
+        positions.push(vec3(0.0, -0.5, 0.0));
+        let mut indices = Vec::new();
+        for segment in 0..SEGMENTS {
+            let next = (segment + 1) % SEGMENTS;
+            indices.extend_from_slice(&[0, 1 + segment as u32, 1 + next as u32]);
+        }
+        for ring in 0..RINGS - 2 {
+            let upper = 1 + ring * SEGMENTS;
+            let lower = upper + SEGMENTS;
+            for segment in 0..SEGMENTS {
+                let next = (segment + 1) % SEGMENTS;
+                let a = (upper + segment) as u32;
+                let b = (upper + next) as u32;
+                let c = (lower + next) as u32;
+                let d = (lower + segment) as u32;
+                indices.extend_from_slice(&[a, d, b, b, d, c]);
+            }
+        }
+        let last_ring = 1 + (RINGS - 2) * SEGMENTS;
+        for segment in 0..SEGMENTS {
+            let next = (segment + 1) % SEGMENTS;
+            indices.extend_from_slice(&[
+                bottom,
+                (last_ring + next) as u32,
+                (last_ring + segment) as u32,
+            ]);
+        }
+        EditableMesh::from_positions_and_indices(&positions, &indices, color)
+    }
+
+    fn cylinder_primitive(color: Color) -> EditableMesh {
+        const SEGMENTS: usize = 16;
+        let mut positions = Vec::with_capacity(SEGMENTS * 2 + 2);
+        for y in [-0.5, 0.5] {
+            for segment in 0..SEGMENTS {
+                let angle = std::f32::consts::TAU * segment as f32 / SEGMENTS as f32;
+                positions.push(vec3(angle.cos() * 0.5, y, angle.sin() * 0.5));
+            }
+        }
+        let bottom_center = positions.len() as u32;
+        positions.push(vec3(0.0, -0.5, 0.0));
+        let top_center = positions.len() as u32;
+        positions.push(vec3(0.0, 0.5, 0.0));
+        let mut indices = Vec::with_capacity(SEGMENTS * 12);
+        for segment in 0..SEGMENTS {
+            let next = (segment + 1) % SEGMENTS;
+            let bottom = segment as u32;
+            let bottom_next = next as u32;
+            let top = (SEGMENTS + segment) as u32;
+            let top_next = (SEGMENTS + next) as u32;
+            indices.extend_from_slice(&[bottom, bottom_next, top_next, bottom, top_next, top]);
+            indices.extend_from_slice(&[bottom_center, bottom_next, bottom]);
+            indices.extend_from_slice(&[top_center, top, top_next]);
+        }
+        EditableMesh::from_positions_and_indices(&positions, &indices, color)
     }
 
     pub fn transformed(&self, mut transform: impl FnMut(Vec3) -> Vec3) -> Self {
@@ -574,6 +789,71 @@ impl EditableMesh {
         Ok(face_remap)
     }
 
+    pub fn cut_faces_by_plane(
+        &mut self,
+        selected_faces: &[usize],
+        plane_point: Vec3,
+        plane_normal: Vec3,
+    ) -> Result<Vec<Vec<usize>>, String> {
+        if self.indices.len() % 3 != 0 {
+            return Err("mesh index count is not divisible by three".to_string());
+        }
+        let normal = plane_normal.normalize_or_zero();
+        if normal.length_squared() <= f32::EPSILON {
+            return Err("cut plane must have a non-zero normal".to_string());
+        }
+        if selected_faces.is_empty() {
+            return Err("select one or more faces before cutting".to_string());
+        }
+        let mut selected = vec![false; self.face_count()];
+        for &face in selected_faces {
+            let Some(slot) = selected.get_mut(face) else {
+                return Err(format!("face {face} is out of range"));
+            };
+            *slot = true;
+        }
+        let mut mesh = Self {
+            vertices: self.vertices.clone(),
+            indices: Vec::with_capacity(self.indices.len()),
+        };
+        let mut face_map = vec![Vec::new(); self.face_count()];
+        let mut split_count = 0;
+        for (face_index, should_cut) in selected.into_iter().enumerate() {
+            let source_indices = &self.indices[face_index * 3..face_index * 3 + 3];
+            let source_vertices = source_indices
+                .iter()
+                .map(|&index| {
+                    self.vertices
+                        .get(index as usize)
+                        .copied()
+                        .ok_or_else(|| format!("mesh index {index} is out of range"))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let mut positive = Vec::new();
+            let mut negative = Vec::new();
+            if should_cut {
+                positive = Self::clip_triangle(&source_vertices, plane_point, normal, true);
+                negative = Self::clip_triangle(&source_vertices, plane_point, normal, false);
+            }
+            let is_split = should_cut && positive.len() >= 3 && negative.len() >= 3;
+            let first_face = mesh.indices.len() / 3;
+            if is_split {
+                Self::append_polygon(&mut mesh, &positive)?;
+                Self::append_polygon(&mut mesh, &negative)?;
+                split_count += 1;
+            } else {
+                mesh.indices.extend_from_slice(source_indices);
+            }
+            let new_face_count = mesh.indices.len() / 3 - first_face;
+            face_map[face_index] = (first_face..first_face + new_face_count).collect();
+        }
+        if split_count == 0 {
+            return Err("cut line did not cross any selected face".to_string());
+        }
+        *self = mesh;
+        Ok(face_map)
+    }
+
     pub fn extrude_face(&mut self, face_index: usize, distance: f32) -> Result<(), String> {
         let start = face_index
             .checked_mul(3)
@@ -652,7 +932,7 @@ fn extract_or_empty(mesh: &EditableMesh, faces: &[usize]) -> Result<EditableMesh
 }
 
 impl FaceMetadata {
-    fn for_face_count(face_count: usize) -> Self {
+    pub fn for_face_count(face_count: usize) -> Self {
         Self {
             face_names: vec![None; face_count],
             groups: Vec::new(),
@@ -767,17 +1047,13 @@ impl FaceMetadata {
                     _ => None,
                 })
                 .collect::<Vec<_>>();
-            let conditions = condition_list.iter().copied().collect::<HashSet<_>>();
-            if condition_list.len() != 3
-                || conditions
-                    != HashSet::from([
-                        RadialNeighborState::Empty,
-                        RadialNeighborState::Route,
-                        RadialNeighborState::OtherBuilding,
-                    ])
+            let mut conditions = HashSet::new();
+            if condition_list
+                .iter()
+                .any(|condition| !conditions.insert(*condition))
             {
                 return Err(format!(
-                    "radial group '{}' requires one child for each neighbor condition",
+                    "radial group '{}' has duplicate neighbor-condition children",
                     radial_group.name
                 ));
             }
@@ -822,13 +1098,41 @@ impl FaceMetadata {
                 && group.program == FaceGroupProgram::IfNeighbor(condition))
             .then_some(group.id)
         });
-        let Some(condition_id) = condition_id else {
-            return Ok(None);
-        };
-        let condition_faces = self.descendant_faces(condition_id, true);
         let mut composed = extract_or_empty(mesh, &main_faces)?;
-        composed.append(&extract_or_empty(mesh, &condition_faces)?)?;
+        if let Some(condition_id) = condition_id {
+            let condition_faces = self.descendant_faces(condition_id, true);
+            composed.append(&extract_or_empty(mesh, &condition_faces)?)?;
+        }
         Ok(Some(composed))
+    }
+
+    pub fn set_group_program(
+        &mut self,
+        group_id: u64,
+        program: FaceGroupProgram,
+    ) -> Result<(), String> {
+        let group_index = self
+            .groups
+            .iter()
+            .position(|group| group.id == group_id)
+            .ok_or_else(|| format!("face group {group_id} does not exist"))?;
+        if matches!(program, FaceGroupProgram::IfNeighbor(_))
+            && self.groups[group_index].parent_id.is_none()
+        {
+            return Err("neighbor conditions must be nested inside a Radial Repeat group".into());
+        }
+        if program == FaceGroupProgram::RadialRepeat
+            && self.groups.iter().any(|other| {
+                other.id != group_id && other.program == FaceGroupProgram::RadialRepeat
+            })
+        {
+            return Err("only one Radial Repeat group is supported per model".into());
+        }
+        let mut candidate = self.clone();
+        candidate.groups[group_index].program = program;
+        candidate.validate(candidate.face_names.len())?;
+        *self = candidate;
+        Ok(())
     }
 
     fn descendant_faces(&self, root_id: u64, include_root_condition: bool) -> Vec<usize> {
@@ -896,94 +1200,20 @@ impl FaceMetadata {
         Ok(id)
     }
 
-    pub fn ensure_radial_program(&mut self) -> Result<bool, String> {
-        if let Some(main_id) = self
-            .groups
-            .iter()
-            .find(|group| group.program == FaceGroupProgram::RadialRepeat)
-            .map(|group| group.id)
-        {
-            let mut changed = false;
-            for group in &mut self.groups {
-                if group.id != main_id && group.parent_id.is_none() {
-                    group.parent_id = Some(main_id);
-                    changed = true;
-                }
-            }
-            for (condition, name) in [
-                (RadialNeighborState::Empty, "If neighbor is empty"),
-                (RadialNeighborState::Route, "If neighbor is another route"),
-                (
-                    RadialNeighborState::OtherBuilding,
-                    "If neighbor is another building",
-                ),
-            ] {
-                if self.groups.iter().any(|group| {
-                    group.parent_id == Some(main_id)
-                        && group.program == FaceGroupProgram::IfNeighbor(condition)
-                }) {
-                    continue;
-                }
-                let id = self.allocate_group_id()?;
-                self.groups.push(FaceGroup {
-                    id,
-                    name: name.to_string(),
-                    faces: Vec::new(),
-                    parent_id: Some(main_id),
-                    program: FaceGroupProgram::IfNeighbor(condition),
-                });
-                changed = true;
-            }
-            self.validate(self.face_names.len())?;
-            return Ok(changed);
+    pub fn assign_new_faces_to_group(
+        &mut self,
+        first_face: usize,
+        face_count: usize,
+        group_id: u64,
+    ) -> Result<(), String> {
+        let last_face = first_face
+            .checked_add(face_count)
+            .ok_or_else(|| "face range overflow".to_string())?;
+        if last_face > self.face_names.len() {
+            return Err("new face range is outside the mesh".to_string());
         }
-
-        let main_id = self.allocate_group_id()?;
-        let grouped_faces = self
-            .groups
-            .iter()
-            .flat_map(|group| group.faces.iter().copied())
-            .collect::<HashSet<_>>();
-        let ungrouped_faces = (0..self.face_names.len())
-            .filter(|face| !grouped_faces.contains(face))
-            .collect::<Vec<_>>();
-        let top_level_ids = self
-            .groups
-            .iter()
-            .filter(|group| group.parent_id.is_none())
-            .map(|group| group.id)
-            .collect::<HashSet<_>>();
-        for group in &mut self.groups {
-            if top_level_ids.contains(&group.id) {
-                group.parent_id = Some(main_id);
-            }
-        }
-        self.groups.push(FaceGroup {
-            id: main_id,
-            name: "Main".to_string(),
-            faces: ungrouped_faces,
-            parent_id: None,
-            program: FaceGroupProgram::RadialRepeat,
-        });
-        for (condition, name) in [
-            (RadialNeighborState::Empty, "If neighbor is empty"),
-            (RadialNeighborState::Route, "If neighbor is another route"),
-            (
-                RadialNeighborState::OtherBuilding,
-                "If neighbor is another building",
-            ),
-        ] {
-            let id = self.allocate_group_id()?;
-            self.groups.push(FaceGroup {
-                id,
-                name: name.to_string(),
-                faces: Vec::new(),
-                parent_id: Some(main_id),
-                program: FaceGroupProgram::IfNeighbor(condition),
-            });
-        }
-        self.validate(self.face_names.len())?;
-        Ok(true)
+        let faces = (first_face..last_face).collect::<Vec<_>>();
+        self.assign_faces_to_group(&faces, group_id)
     }
 
     fn allocate_group_id(&mut self) -> Result<u64, String> {
@@ -1106,6 +1336,36 @@ impl FaceMetadata {
                 .faces
                 .iter()
                 .filter_map(|&face| face_remap.get(face).and_then(|mapped| *mapped))
+                .collect();
+            group.faces.sort_unstable();
+            group.faces.dedup();
+        }
+        self.retain_nonempty_geometry_groups();
+    }
+
+    pub fn remap_after_face_split(&mut self, face_map: &[Vec<usize>]) {
+        let new_face_count = face_map
+            .iter()
+            .flatten()
+            .copied()
+            .max()
+            .map_or(0, |maximum| maximum + 1);
+        let old_names = std::mem::take(&mut self.face_names);
+        self.face_names = vec![None; new_face_count];
+        for (old_face, new_faces) in face_map.iter().enumerate() {
+            if let Some(name) = old_names.get(old_face).cloned().flatten() {
+                for &new_face in new_faces {
+                    if let Some(slot) = self.face_names.get_mut(new_face) {
+                        *slot = Some(name.clone());
+                    }
+                }
+            }
+        }
+        for group in &mut self.groups {
+            group.faces = group
+                .faces
+                .iter()
+                .flat_map(|&face| face_map.get(face).into_iter().flatten().copied())
                 .collect();
             group.faces.sort_unstable();
             group.faces.dedup();
@@ -2162,40 +2422,31 @@ mod tests {
             )
         };
         let mesh = EditableMesh {
-            vertices: vec![
-                vertex(0.0),
-                vertex(1.0),
-                vertex(2.0),
-                vertex(3.0),
-                vertex(4.0),
-                vertex(5.0),
-                vertex(6.0),
-                vertex(7.0),
-                vertex(8.0),
-            ],
-            indices: vec![0, 1, 2, 3, 4, 5, 6, 7, 8],
+            vertices: (0..12).map(|index| vertex(index as f32)).collect(),
+            indices: vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11],
         };
-        let mut metadata = FaceMetadata::for_face_count(3);
-        let existing_group = metadata.create_group(&[0]).unwrap();
-        assert!(metadata.ensure_radial_program().unwrap());
-        let main_id = metadata.radial_main_group_id().unwrap();
-        let route_group = metadata
-            .groups
-            .iter()
-            .find(|group| {
-                group.parent_id == Some(main_id)
-                    && group.program == FaceGroupProgram::IfNeighbor(RadialNeighborState::Route)
-            })
-            .unwrap()
-            .id;
-        metadata.assign_faces_to_group(&[1], route_group).unwrap();
-        metadata.validate(3).unwrap();
+        let mut metadata = FaceMetadata::for_face_count(4);
+        let main_id = metadata.create_group(&[0]).unwrap();
+        metadata
+            .set_group_program(main_id, FaceGroupProgram::RadialRepeat)
+            .unwrap();
+        let route_group = metadata.create_group_under(&[1], Some(main_id)).unwrap();
+        metadata
+            .set_group_program(
+                route_group,
+                FaceGroupProgram::IfNeighbor(RadialNeighborState::Route),
+            )
+            .unwrap();
+        let other_group = metadata.create_group_under(&[2], Some(main_id)).unwrap();
+        metadata
+            .set_group_program(
+                other_group,
+                FaceGroupProgram::IfNeighbor(RadialNeighborState::OtherBuilding),
+            )
+            .unwrap();
+        metadata.validate(4).unwrap();
 
-        assert_eq!(
-            metadata.group(existing_group).unwrap().parent_id,
-            Some(main_id)
-        );
-        assert_eq!(metadata.faces_for_group(main_id), Some(vec![0, 2]));
+        assert_eq!(metadata.faces_for_group(main_id), Some(vec![0]));
         assert_eq!(metadata.faces_for_group(route_group), Some(vec![1]));
         assert_eq!(
             metadata
@@ -2203,7 +2454,7 @@ mod tests {
                 .unwrap()
                 .unwrap()
                 .face_count(),
-            2
+            1
         );
         assert_eq!(
             metadata
@@ -2211,7 +2462,7 @@ mod tests {
                 .unwrap()
                 .unwrap()
                 .face_count(),
-            3
+            2
         );
         assert_eq!(
             metadata
@@ -2221,8 +2472,124 @@ mod tests {
                 .face_count(),
             2
         );
+        assert!(
+            metadata
+                .radial_sector_mesh(&mesh, RadialNeighborState::Empty)
+                .unwrap()
+                .is_some()
+        );
         assert!(metadata.remove_group(main_id).is_err());
         assert!(metadata.remove_group(route_group).is_err());
+    }
+
+    #[test]
+    fn group_programs_are_configured_incrementally_and_reject_duplicate_conditions() {
+        let mut metadata = FaceMetadata::for_face_count(3);
+        let main = metadata.create_group(&[0]).unwrap();
+        let condition = metadata.create_group_under(&[1], Some(main)).unwrap();
+
+        assert_eq!(
+            metadata.group(condition).unwrap().program,
+            FaceGroupProgram::Geometry
+        );
+        assert!(
+            metadata
+                .set_group_program(
+                    condition,
+                    FaceGroupProgram::IfNeighbor(RadialNeighborState::Empty)
+                )
+                .is_err()
+        );
+        metadata
+            .set_group_program(main, FaceGroupProgram::RadialRepeat)
+            .unwrap();
+        metadata
+            .set_group_program(
+                condition,
+                FaceGroupProgram::IfNeighbor(RadialNeighborState::Empty),
+            )
+            .unwrap();
+        let duplicate = metadata.create_group_under(&[2], Some(main)).unwrap();
+        assert!(
+            metadata
+                .set_group_program(
+                    duplicate,
+                    FaceGroupProgram::IfNeighbor(RadialNeighborState::Empty)
+                )
+                .is_err()
+        );
+        assert_eq!(
+            metadata.group(duplicate).unwrap().program,
+            FaceGroupProgram::Geometry
+        );
+    }
+
+    #[test]
+    fn primitive_meshes_have_valid_non_degenerate_triangles() {
+        for (primitive, expected_faces) in [
+            (MeshPrimitive::Cube, 12),
+            (MeshPrimitive::Plane, 2),
+            (MeshPrimitive::Sphere, 224),
+            (MeshPrimitive::Cylinder, 64),
+        ] {
+            let mesh = EditableMesh::primitive(primitive);
+            assert_eq!(mesh.face_count(), expected_faces);
+            assert!(
+                mesh.indices
+                    .iter()
+                    .all(|&index| (index as usize) < mesh.vertices.len())
+            );
+            for triangle in mesh.indices.chunks_exact(3) {
+                let a = mesh.vertices[triangle[0] as usize].position;
+                let b = mesh.vertices[triangle[1] as usize].position;
+                let c = mesh.vertices[triangle[2] as usize].position;
+                assert!((b - a).cross(c - a).length_squared() > 1e-10);
+            }
+        }
+    }
+
+    #[test]
+    fn knife_cut_splits_selected_triangles_and_remaps_face_groups() {
+        let white = Color::from_rgba(255, 255, 255, 255);
+        let mesh = EditableMesh {
+            vertices: vec![
+                Vertex::new2(Vec3::ZERO, Vec2::ZERO, white),
+                Vertex::new2(Vec3::X, Vec2::ZERO, white),
+                Vertex::new2(Vec3::Y, Vec2::ZERO, white),
+                Vertex::new2(vec3(2.0, 0.0, 0.0), Vec2::ZERO, white),
+                Vertex::new2(vec3(3.0, 0.0, 0.0), Vec2::ZERO, white),
+                Vertex::new2(vec3(2.0, 1.0, 0.0), Vec2::ZERO, white),
+            ],
+            indices: vec![0, 1, 2, 3, 4, 5],
+        };
+        let mut mesh = mesh;
+        let mut metadata = FaceMetadata::for_face_count(2);
+        metadata.rename_face(0, "cut face".to_string()).unwrap();
+        let group = metadata.create_group(&[0, 1]).unwrap();
+
+        let face_map = mesh
+            .cut_faces_by_plane(&[0], vec3(0.5, 0.0, 0.0), vec3(1.0, 1.0, 0.0))
+            .unwrap();
+        metadata.remap_after_face_split(&face_map);
+
+        assert_eq!(face_map[0], vec![0, 1, 2]);
+        assert_eq!(face_map[1], vec![3]);
+        assert_eq!(mesh.face_count(), 4);
+        assert_eq!(metadata.group(group).unwrap().faces, vec![0, 1, 2, 3]);
+        assert_eq!(
+            metadata.face_names,
+            vec![
+                Some("cut face".to_string()),
+                Some("cut face".to_string()),
+                Some("cut face".to_string()),
+                None,
+            ]
+        );
+        assert!(
+            mesh.indices
+                .iter()
+                .all(|&index| (index as usize) < mesh.vertices.len())
+        );
     }
 
     #[test]
@@ -2249,7 +2616,6 @@ mod tests {
         let mut metadata = FaceMetadata::for_face_count(3);
         metadata.rename_face(1, "door".to_string()).unwrap();
         metadata.create_group(&[0, 2]).unwrap();
-        metadata.ensure_radial_program().unwrap();
 
         save_face_metadata(&mesh_path, &metadata).unwrap();
         let (loaded, error) = load_face_metadata(&mesh_path, 3);

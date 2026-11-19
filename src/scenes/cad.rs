@@ -3,7 +3,8 @@ use std::collections::HashSet;
 use macroquad::prelude::*;
 
 use crate::core::object_assets::{
-    EditableMesh, FaceGroupProgram, FaceMetadata, ObjectCatalog, ObjectCategory, ObjectId,
+    EditableMesh, FaceGroupProgram, FaceMetadata, MeshPrimitive, ObjectCatalog, ObjectCategory,
+    ObjectId, RadialNeighborState,
 };
 use crate::core::ui::ui_button;
 use crate::core::{FrameContext, Scene};
@@ -19,6 +20,7 @@ const FACE_ROW_HEIGHT: f32 = 26.0;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SelectionMode {
     Vertex,
+    Edge,
     Face,
 }
 
@@ -34,6 +36,12 @@ struct RenameDialog {
     text: String,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct GroupConfigDialog {
+    group_id: u64,
+    program: FaceGroupProgram,
+}
+
 #[derive(Clone, Debug)]
 struct EditSnapshot {
     mesh: EditableMesh,
@@ -41,7 +49,14 @@ struct EditSnapshot {
     selected_faces: Vec<usize>,
     selected_group: Option<u64>,
     selected_vertices: Vec<usize>,
+    selected_edges: Vec<(usize, usize)>,
     selection_mode: SelectionMode,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct KnifeStart {
+    point: Vec3,
+    face: usize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -62,8 +77,12 @@ pub struct CadSceneState {
     selected_faces: Vec<usize>,
     selected_group: Option<u64>,
     selected_vertices: Vec<usize>,
+    selected_edges: Vec<(usize, usize)>,
     dragged_faces: Option<Vec<usize>>,
     rename_dialog: Option<RenameDialog>,
+    group_config_dialog: Option<GroupConfigDialog>,
+    knife_active: bool,
+    knife_start: Option<KnifeStart>,
     original_mesh: Option<EditableMesh>,
     original_metadata: Option<FaceMetadata>,
     undo_stack: Vec<EditSnapshot>,
@@ -89,8 +108,12 @@ impl Default for CadSceneState {
             selected_faces: Vec::new(),
             selected_group: None,
             selected_vertices: Vec::new(),
+            selected_edges: Vec::new(),
             dragged_faces: None,
             rename_dialog: None,
+            group_config_dialog: None,
+            knife_active: false,
+            knife_start: None,
             original_mesh: None,
             original_metadata: None,
             undo_stack: Vec::new(),
@@ -146,8 +169,20 @@ fn preview_mesh(mesh: &EditableMesh) -> EditableMesh {
 }
 
 fn mesh_ray_hit(origin: Vec3, direction: Vec3, mesh: &EditableMesh) -> Option<usize> {
-    let mut closest: Option<(f32, usize)> = None;
+    mesh_ray_hit_point(origin, direction, mesh, None).map(|(_, face, _)| face)
+}
+
+fn mesh_ray_hit_point(
+    origin: Vec3,
+    direction: Vec3,
+    mesh: &EditableMesh,
+    allowed_faces: Option<&[usize]>,
+) -> Option<(f32, usize, Vec3)> {
+    let mut closest: Option<(f32, usize, Vec3)> = None;
     for face in 0..mesh.face_count() {
+        if allowed_faces.is_some_and(|faces| !faces.contains(&face)) {
+            continue;
+        }
         let start = face * 3;
         let [ia, ib, ic] = [
             mesh.indices[start] as usize,
@@ -180,11 +215,11 @@ fn mesh_ray_hit(origin: Vec3, direction: Vec3, mesh: &EditableMesh) -> Option<us
             continue;
         }
         let distance = edge_2.dot(q) * inverse;
-        if distance > 0.0 && closest.map(|(best, _)| distance < best).unwrap_or(true) {
-            closest = Some((distance, face));
+        if distance > 0.0 && closest.map(|(best, _, _)| distance < best).unwrap_or(true) {
+            closest = Some((distance, face, origin + direction * distance));
         }
     }
-    closest.map(|(_, face)| face)
+    closest
 }
 
 fn mouse_ray(camera: &Camera3D, mouse: Vec2) -> Option<(Vec3, Vec3)> {
@@ -225,6 +260,47 @@ fn pick_vertex(camera: &Camera3D, mouse: Vec2, mesh: &EditableMesh) -> Option<us
         }
     }
     closest.map(|(_, index)| index)
+}
+
+fn point_segment_distance(point: Vec2, start: Vec2, end: Vec2) -> f32 {
+    let segment = end - start;
+    let length_squared = segment.length_squared();
+    if length_squared <= f32::EPSILON {
+        return point.distance(start);
+    }
+    let t = ((point - start).dot(segment) / length_squared).clamp(0.0, 1.0);
+    point.distance(start + segment * t)
+}
+
+fn pick_edge(camera: &Camera3D, mouse: Vec2, mesh: &EditableMesh) -> Option<(usize, usize)> {
+    let mut closest: Option<(f32, (usize, usize))> = None;
+    let mut visited = HashSet::new();
+    for triangle in mesh.indices.chunks_exact(3) {
+        for side in 0..3 {
+            let a = triangle[side] as usize;
+            let b = triangle[(side + 1) % 3] as usize;
+            let key = if a < b { (a, b) } else { (b, a) };
+            if !visited.insert(key) {
+                continue;
+            }
+            let [Some(a_vertex), Some(b_vertex)] =
+                [mesh.vertices.get(key.0), mesh.vertices.get(key.1)]
+            else {
+                continue;
+            };
+            let [Some(a_screen), Some(b_screen)] = [
+                project_to_screen(camera, a_vertex.position),
+                project_to_screen(camera, b_vertex.position),
+            ] else {
+                continue;
+            };
+            let distance = point_segment_distance(mouse, a_screen, b_screen);
+            if distance < 12.0 && closest.map(|(best, _)| distance < best).unwrap_or(true) {
+                closest = Some((distance, key));
+            }
+        }
+    }
+    closest.map(|(_, edge)| edge)
 }
 
 fn draw_view_controls(ctx: &FrameContext, state: &CadSceneState, panel: Rect) {
@@ -278,6 +354,7 @@ fn draw_view_controls(ctx: &FrameContext, state: &CadSceneState, panel: Rect) {
         y += 24.0;
         let selection = match state.selection_mode {
             SelectionMode::Vertex => "Vertex selection",
+            SelectionMode::Edge => "Edge selection",
             SelectionMode::Face => "Face selection",
         };
         draw_text(
@@ -290,6 +367,7 @@ fn draw_view_controls(ctx: &FrameContext, state: &CadSceneState, panel: Rect) {
         y += 21.0;
         let selected = match state.selection_mode {
             SelectionMode::Vertex => state.selected_vertices.len(),
+            SelectionMode::Edge => state.selected_edges.len(),
             SelectionMode::Face => state.selected_faces.len(),
         };
         draw_text(
@@ -402,6 +480,7 @@ fn capture_snapshot(
         selected_faces: state.selected_faces.clone(),
         selected_group: state.selected_group,
         selected_vertices: state.selected_vertices.clone(),
+        selected_edges: state.selected_edges.clone(),
         selection_mode: state.selection_mode,
     })
 }
@@ -418,6 +497,7 @@ fn restore_snapshot(
     state.selected_faces = snapshot.selected_faces;
     state.selected_group = snapshot.selected_group;
     state.selected_vertices = snapshot.selected_vertices;
+    state.selected_edges = snapshot.selected_edges;
     state.selection_mode = snapshot.selection_mode;
     Ok(())
 }
@@ -506,8 +586,12 @@ fn close_editor(state: &mut CadSceneState) {
     state.selected_group = None;
     state.selected_faces.clear();
     state.selected_vertices.clear();
+    state.selected_edges.clear();
     state.dragged_faces = None;
     state.rename_dialog = None;
+    state.group_config_dialog = None;
+    state.knife_active = false;
+    state.knife_start = None;
     state.face_scroll = 0;
     state.undo_stack.clear();
     state.redo_stack.clear();
@@ -523,8 +607,12 @@ fn switch_to_object(state: &mut CadSceneState, id: ObjectId) {
     state.selected_faces.clear();
     state.selected_group = None;
     state.selected_vertices.clear();
+    state.selected_edges.clear();
     state.dragged_faces = None;
     state.rename_dialog = None;
+    state.group_config_dialog = None;
+    state.knife_active = false;
+    state.knife_start = None;
     state.undo_stack.clear();
     state.redo_stack.clear();
     state.face_scroll = 0;
@@ -578,6 +666,24 @@ fn selected_indices(mesh: &EditableMesh, state: &CadSceneState) -> Vec<usize> {
                 .selected_vertices
                 .iter()
                 .filter_map(|&index| mesh.vertices.get(index).map(|vertex| vertex.position))
+                .collect::<Vec<_>>();
+            mesh.vertices
+                .iter()
+                .enumerate()
+                .filter_map(|(index, vertex)| {
+                    positions
+                        .iter()
+                        .any(|position| (*position - vertex.position).length_squared() <= 1e-8)
+                        .then_some(index)
+                })
+                .collect()
+        }
+        SelectionMode::Edge => {
+            let positions = state
+                .selected_edges
+                .iter()
+                .flat_map(|&(a, b)| [a, b])
+                .filter_map(|index| mesh.vertices.get(index).map(|vertex| vertex.position))
                 .collect::<Vec<_>>();
             mesh.vertices
                 .iter()
@@ -695,6 +801,7 @@ fn select_face(state: &mut CadSceneState, face: usize, extend: bool) {
     state.selection_mode = SelectionMode::Face;
     state.selected_group = None;
     state.selected_vertices.clear();
+    state.selected_edges.clear();
     if extend {
         if let Some(position) = state
             .selected_faces
@@ -711,6 +818,26 @@ fn select_face(state: &mut CadSceneState, face: usize, extend: bool) {
     }
 }
 
+fn select_edge(state: &mut CadSceneState, edge: (usize, usize), extend: bool) {
+    state.selection_mode = SelectionMode::Edge;
+    state.selected_group = None;
+    state.selected_faces.clear();
+    state.selected_vertices.clear();
+    if extend {
+        if let Some(position) = state
+            .selected_edges
+            .iter()
+            .position(|&selected| selected == edge)
+        {
+            state.selected_edges.remove(position);
+        } else {
+            state.selected_edges.push(edge);
+        }
+    } else {
+        state.selected_edges = vec![edge];
+    }
+}
+
 fn select_group(
     state: &mut CadSceneState,
     metadata: &FaceMetadata,
@@ -723,6 +850,7 @@ fn select_group(
     state.selected_group = Some(group_id);
     state.selected_faces = faces;
     state.selected_vertices.clear();
+    state.selected_edges.clear();
     Ok(())
 }
 
@@ -732,13 +860,7 @@ fn create_selected_group(
 ) -> Result<(), String> {
     let snapshot = capture_snapshot(catalog, state)?;
     let selected_faces = state.selected_faces.clone();
-    let parent_id = selected_metadata(catalog, state).and_then(|metadata| {
-        state.selected_group.or_else(|| {
-            (state.selected == ObjectId::PlanetRoute)
-                .then(|| metadata.radial_main_group_id())
-                .flatten()
-        })
-    });
+    let parent_id = state.selected_group;
     let group_id = selected_metadata_mut(catalog, state)
         .ok_or_else(|| "Selected face metadata is unavailable".to_string())?
         .create_group_under(&selected_faces, parent_id)?;
@@ -751,6 +873,100 @@ fn create_selected_group(
     state.selection_mode = SelectionMode::Face;
     push_undo(state, snapshot);
     state.dirty = true;
+    Ok(())
+}
+
+fn add_primitive(
+    catalog: &mut ObjectCatalog,
+    state: &mut CadSceneState,
+    primitive: MeshPrimitive,
+) -> Result<(), String> {
+    let snapshot = capture_snapshot(catalog, state)?;
+    let shape = EditableMesh::primitive(primitive);
+    let first_face = snapshot.mesh.face_count();
+    let face_count = shape.face_count();
+    selected_mesh_mut(catalog, state)
+        .ok_or_else(|| "Selected object is unavailable".to_string())?
+        .append(&shape)?;
+    let metadata = selected_metadata_mut(catalog, state)
+        .ok_or_else(|| "Selected face metadata is unavailable".to_string())?;
+    metadata.face_names.resize(first_face + face_count, None);
+    if let Some(group_id) = state
+        .selected_group
+        .or_else(|| metadata.radial_main_group_id())
+    {
+        metadata.assign_new_faces_to_group(first_face, face_count, group_id)?;
+    }
+    state.selection_mode = SelectionMode::Face;
+    state.selected_faces = (first_face..first_face + face_count).collect();
+    state.selected_vertices.clear();
+    state.selected_edges.clear();
+    state.selected_group = None;
+    push_undo(state, snapshot);
+    state.dirty = true;
+    state.error = None;
+    Ok(())
+}
+
+fn perform_knife_cut(
+    catalog: &mut ObjectCatalog,
+    state: &mut CadSceneState,
+    preview: &EditableMesh,
+    start: KnifeStart,
+    end: Vec3,
+) -> Result<(), String> {
+    let snapshot = capture_snapshot(catalog, state)?;
+    let triangle_start = start
+        .face
+        .checked_mul(3)
+        .ok_or_else(|| "face index overflow".to_string())?;
+    let indices = preview
+        .indices
+        .get(triangle_start..triangle_start + 3)
+        .ok_or_else(|| "selected face is unavailable".to_string())?;
+    let [a, b, c] = [
+        preview.vertices.get(indices[0] as usize),
+        preview.vertices.get(indices[1] as usize),
+        preview.vertices.get(indices[2] as usize),
+    ];
+    let [Some(a), Some(b), Some(c)] = [a, b, c] else {
+        return Err("selected face has invalid mesh indices".to_string());
+    };
+    let face_normal = (b.position - a.position)
+        .cross(c.position - a.position)
+        .normalize_or_zero();
+    let plane_normal = face_normal.cross(end - start.point).normalize_or_zero();
+    if plane_normal.length_squared() <= f32::EPSILON {
+        return Err("choose two distinct points on the selected face".to_string());
+    }
+    let (center, scale) = mesh_center_and_scale(&snapshot.mesh);
+    if scale <= f32::EPSILON {
+        return Err("model has no usable geometry".to_string());
+    }
+    let to_model_space = |point: Vec3| point / scale + center;
+    let plane_point = to_model_space(start.point);
+    let mut mesh = snapshot.mesh.clone();
+    let face_map = mesh.cut_faces_by_plane(&state.selected_faces, plane_point, plane_normal)?;
+    let mut metadata = snapshot.metadata.clone();
+    metadata.remap_after_face_split(&face_map);
+    let selected_faces = state
+        .selected_faces
+        .iter()
+        .filter_map(|&face| face_map.get(face))
+        .flatten()
+        .copied()
+        .collect::<Vec<_>>();
+    *selected_mesh_mut(catalog, state)
+        .ok_or_else(|| "Selected object is unavailable".to_string())? = mesh;
+    *selected_metadata_mut(catalog, state)
+        .ok_or_else(|| "Selected face metadata is unavailable".to_string())? = metadata;
+    state.selected_faces = selected_faces;
+    state.selected_group = None;
+    state.selected_vertices.clear();
+    state.selected_edges.clear();
+    push_undo(state, snapshot);
+    state.dirty = true;
+    state.error = None;
     Ok(())
 }
 
@@ -831,6 +1047,172 @@ fn apply_rename_dialog(
     Ok(())
 }
 
+fn apply_group_config_dialog(
+    catalog: &mut ObjectCatalog,
+    state: &mut CadSceneState,
+) -> Result<(), String> {
+    let dialog = state
+        .group_config_dialog
+        .ok_or_else(|| "No group configuration is open".to_string())?;
+    let snapshot = capture_snapshot(catalog, state)?;
+    selected_metadata_mut(catalog, state)
+        .ok_or_else(|| "Selected face metadata is unavailable".to_string())?
+        .set_group_program(dialog.group_id, dialog.program)?;
+    push_undo(state, snapshot);
+    state.dirty = true;
+    state.group_config_dialog = None;
+    Ok(())
+}
+
+fn draw_group_config_dialog(
+    ctx: &FrameContext,
+    catalog: &mut ObjectCatalog,
+    state: &mut CadSceneState,
+) {
+    let Some(mut dialog) = state.group_config_dialog else {
+        return;
+    };
+    draw_rectangle(
+        0.0,
+        0.0,
+        screen_width(),
+        screen_height(),
+        Color::from_rgba(0, 0, 0, 190),
+    );
+    let modal = Rect::new(
+        (screen_width() - 460.0) * 0.5,
+        (screen_height() - 330.0) * 0.5,
+        460.0,
+        330.0,
+    );
+    draw_rectangle(modal.x, modal.y, modal.w, modal.h, ctx.colors_rt.panel_bg);
+    draw_rectangle_lines(
+        modal.x,
+        modal.y,
+        modal.w,
+        modal.h,
+        1.5,
+        ctx.colors_rt.panel_border,
+    );
+    let group_name = selected_metadata(catalog, state)
+        .and_then(|metadata| metadata.group(dialog.group_id))
+        .map(|group| group.name.as_str())
+        .unwrap_or("Group");
+    draw_text(
+        &format!("Configure group: {group_name}"),
+        modal.x + 20.0,
+        modal.y + 38.0,
+        ctx.font_md,
+        ctx.colors_rt.text_primary,
+    );
+    draw_text(
+        "Program",
+        modal.x + 20.0,
+        modal.y + 76.0,
+        ctx.font_sm,
+        ctx.colors_rt.text_secondary,
+    );
+
+    for (index, (program, label)) in [
+        (FaceGroupProgram::Geometry, "Plain geometry"),
+        (FaceGroupProgram::RadialRepeat, "Radial Repeat"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let rect = Rect::new(
+            modal.x + 20.0 + index as f32 * 205.0,
+            modal.y + 88.0,
+            195.0,
+            36.0,
+        );
+        if button(ctx, rect, label) {
+            dialog.program = program;
+            state.error = None;
+        }
+        draw_rectangle_lines(
+            rect.x,
+            rect.y,
+            rect.w,
+            rect.h,
+            2.0,
+            if dialog.program == program {
+                Color::from_rgba(27, 119, 105, 255)
+            } else {
+                ctx.colors_rt.button_border
+            },
+        );
+    }
+    draw_text(
+        "If Neighbor",
+        modal.x + 20.0,
+        modal.y + 160.0,
+        ctx.font_sm,
+        ctx.colors_rt.text_secondary,
+    );
+    for (index, (condition, label)) in [
+        (RadialNeighborState::Empty, "Empty"),
+        (RadialNeighborState::Route, "Same building"),
+        (RadialNeighborState::OtherBuilding, "Other building"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let rect = Rect::new(
+            modal.x + 20.0 + index as f32 * 140.0,
+            modal.y + 172.0,
+            132.0,
+            36.0,
+        );
+        let program = FaceGroupProgram::IfNeighbor(condition);
+        if button(ctx, rect, label) {
+            dialog.program = program;
+            state.error = None;
+        }
+        draw_rectangle_lines(
+            rect.x,
+            rect.y,
+            rect.w,
+            rect.h,
+            2.0,
+            if dialog.program == program {
+                Color::from_rgba(27, 119, 105, 255)
+            } else {
+                ctx.colors_rt.button_border
+            },
+        );
+    }
+    state.group_config_dialog = Some(dialog);
+    let apply = button(
+        ctx,
+        Rect::new(modal.x + 240.0, modal.y + 265.0, 98.0, 36.0),
+        "Apply",
+    );
+    let cancel = button(
+        ctx,
+        Rect::new(modal.x + 350.0, modal.y + 265.0, 90.0, 36.0),
+        "Cancel",
+    );
+    if apply {
+        match apply_group_config_dialog(catalog, state) {
+            Ok(()) => state.error = None,
+            Err(error) => state.error = Some(error),
+        }
+    } else if cancel {
+        state.group_config_dialog = None;
+        state.error = None;
+    }
+    if let Some(error) = &state.error {
+        draw_text(
+            error,
+            modal.x + 20.0,
+            modal.y + modal.h - 12.0,
+            ctx.font_sm,
+            Color::from_rgba(255, 110, 110, 255),
+        );
+    }
+}
+
 fn undo_or_redo(catalog: &mut ObjectCatalog, state: &mut CadSceneState, is_undo: bool) {
     let result = if is_undo {
         undo(catalog, state)
@@ -865,7 +1247,13 @@ pub fn run(
     );
     let view_panel = Rect::new(screen_width() - 205.0, 18.0, 190.0, 155.0);
     if is_key_pressed(KeyCode::Escape) {
-        if state.rename_dialog.is_some() {
+        if state.knife_active {
+            state.knife_active = false;
+            state.knife_start = None;
+            state.error = None;
+        } else if state.group_config_dialog.is_some() {
+            state.group_config_dialog = None;
+        } else if state.rename_dialog.is_some() {
             state.rename_dialog = None;
         } else if state.exit_confirmation_open {
             state.exit_confirmation_open = false;
@@ -880,7 +1268,7 @@ pub fn run(
             return;
         }
     }
-    let modal_open = state.exit_confirmation_open;
+    let mut modal_open = state.exit_confirmation_open || state.group_config_dialog.is_some();
     if !modal_open && let Some(dialog) = state.rename_dialog.as_mut() {
         while let Some(character) = get_char_pressed() {
             if !character.is_control() && dialog.text.chars().count() < 64 {
@@ -994,10 +1382,30 @@ pub fn run(
             let rect = Rect::new(
                 12.0 + indent,
                 y,
-                SIDEBAR_WIDTH - 24.0 - indent,
+                SIDEBAR_WIDTH
+                    - 24.0
+                    - indent
+                    - usize::from(matches!(item, SidebarItem::Group(_))) as f32 * 42.0,
                 FACE_ROW_HEIGHT - 2.0,
             );
-            if !modal_open && !rename_dialog_open && list_row_clicked(rect, ctx.mouse) {
+            let configure_rect = Rect::new(SIDEBAR_WIDTH - 48.0, y, 36.0, FACE_ROW_HEIGHT - 2.0);
+            if !modal_open
+                && !rename_dialog_open
+                && matches!(item, SidebarItem::Group(_))
+                && list_row_clicked(configure_rect, ctx.mouse)
+            {
+                if let SidebarItem::Group(group_id) = item
+                    && let Some(group) = selected_metadata(catalog, state)
+                        .and_then(|metadata| metadata.group(group_id))
+                {
+                    state.group_config_dialog = Some(GroupConfigDialog {
+                        group_id,
+                        program: group.program,
+                    });
+                    modal_open = true;
+                    state.error = None;
+                }
+            } else if !modal_open && !rename_dialog_open && list_row_clicked(rect, ctx.mouse) {
                 match item {
                     SidebarItem::Group(group_id) => {
                         if let Some(metadata) = selected_metadata(catalog, state)
@@ -1062,15 +1470,6 @@ pub fn run(
                 state.undo_stack.clear();
                 state.redo_stack.clear();
                 state.error = None;
-                if state.selected == ObjectId::PlanetRoute {
-                    match selected_metadata_mut(catalog, state)
-                        .ok_or_else(|| "Selected face metadata is unavailable".to_string())
-                        .and_then(FaceMetadata::ensure_radial_program)
-                    {
-                        Ok(changed) => state.dirty = changed,
-                        Err(error) => state.error = Some(error),
-                    }
-                }
             } else {
                 state.error = selected_entry(catalog, state.selected)
                     .and_then(|entry| entry.metadata_error.clone().or_else(|| entry.error.clone()))
@@ -1088,6 +1487,18 @@ pub fn run(
         state.face_scroll = 0;
         state.selected_faces.clear();
         state.selected_group = None;
+        state.selected_edges.clear();
+        state.selected_vertices.clear();
+    }
+    x += 94.0;
+    if !modal_open
+        && !rename_dialog_open
+        && state.editing
+        && button(ctx, Rect::new(x, 12.0, 86.0, 34.0), "Edge")
+    {
+        state.selection_mode = SelectionMode::Edge;
+        state.selected_faces.clear();
+        state.selected_group = None;
         state.selected_vertices.clear();
     }
     x += 94.0;
@@ -1097,6 +1508,7 @@ pub fn run(
         && button(ctx, Rect::new(x, 12.0, 86.0, 34.0), "Face")
     {
         state.selection_mode = SelectionMode::Face;
+        state.selected_edges.clear();
         state.selected_vertices.clear();
     }
     x += 94.0;
@@ -1113,6 +1525,25 @@ pub fn run(
                 state.error = None;
             }
             Err(error) => state.error = Some(error),
+        }
+    }
+    x += 94.0;
+    if state.editing {
+        for (label, primitive) in [
+            ("Cube", MeshPrimitive::Cube),
+            ("Plane", MeshPrimitive::Plane),
+            ("Sphere", MeshPrimitive::Sphere),
+            ("Cylinder", MeshPrimitive::Cylinder),
+        ] {
+            if !modal_open
+                && !rename_dialog_open
+                && button(ctx, Rect::new(x, 12.0, 72.0, 34.0), label)
+            {
+                if let Err(error) = add_primitive(catalog, state, primitive) {
+                    state.error = Some(error);
+                }
+            }
+            x += 76.0;
         }
     }
     if state.editing {
@@ -1268,6 +1699,33 @@ pub fn run(
                 }
             }
         }
+        action_x += 88.0;
+        if !modal_open
+            && !rename_dialog_open
+            && button(
+                ctx,
+                Rect::new(action_x, action_y, 84.0, 30.0),
+                if state.knife_active {
+                    "Cancel Cut"
+                } else {
+                    "Knife"
+                },
+            )
+        {
+            if state.knife_active {
+                state.knife_active = false;
+                state.knife_start = None;
+                state.error = None;
+            } else if state.selected_faces.is_empty() {
+                state.error = Some("Select one or more faces before using Knife".to_string());
+            } else {
+                state.knife_active = true;
+                state.knife_start = None;
+                state.selection_mode = SelectionMode::Face;
+                state.selected_edges.clear();
+                state.error = None;
+            }
+        }
     }
     ui_capturing |= state.editing
         && Rect::new(SIDEBAR_WIDTH, action_y - 4.0, screen_width(), 40.0).contains(ctx.mouse);
@@ -1315,6 +1773,11 @@ pub fn run(
                     );
                 }
             }
+            for &(a, b) in &state.selected_edges {
+                if let (Some(a), Some(b)) = (mesh.vertices.get(a), mesh.vertices.get(b)) {
+                    draw_line_3d(a.position, b.position, Color::from_rgba(80, 235, 240, 255));
+                }
+            }
             for &face in &state.selected_faces {
                 let start = face * 3;
                 if let Some(indices) = mesh.indices.get(start..start + 3) {
@@ -1332,6 +1795,9 @@ pub fn run(
                             );
                         }
                     }
+                    if let Some(start) = state.knife_start {
+                        draw_sphere(start.point, 0.035, None, Color::from_rgba(255, 90, 90, 255));
+                    }
                 }
             }
         }
@@ -1342,39 +1808,73 @@ pub fn run(
         if let (Some((origin, direction)), Some(mesh)) =
             (mouse_ray(&camera, ctx.mouse), preview.as_ref())
         {
-            match state.selection_mode {
-                SelectionMode::Vertex => {
-                    if let Some(index) = pick_vertex(&camera, ctx.mouse, mesh) {
-                        if is_key_down(KeyCode::LeftShift) || is_key_down(KeyCode::RightShift) {
-                            if let Some(existing) = state
-                                .selected_vertices
-                                .iter()
-                                .position(|&selected| selected == index)
-                            {
-                                state.selected_vertices.remove(existing);
-                            } else {
-                                state.selected_vertices.push(index);
+            if state.knife_active {
+                let hit = mesh_ray_hit_point(origin, direction, mesh, Some(&state.selected_faces));
+                match (state.knife_start, hit) {
+                    (None, Some((_, face, point))) => {
+                        state.knife_start = Some(KnifeStart { point, face });
+                        state.error = None;
+                    }
+                    (Some(start), Some((_, face, point))) if face == start.face => {
+                        match perform_knife_cut(catalog, state, mesh, start, point) {
+                            Ok(()) => {
+                                state.knife_active = false;
+                                state.knife_start = None;
                             }
-                        } else {
-                            state.selected_vertices = vec![index];
+                            Err(error) => state.error = Some(error),
                         }
                     }
-                    state.selected_faces.clear();
-                    state.selected_group = None;
+                    (Some(_), Some(_)) => {
+                        state.error =
+                            Some("Both knife points must lie on the same selected face".into());
+                    }
+                    (_, None) => {
+                        state.error = Some("Knife points must land on the selected face(s)".into());
+                    }
                 }
-                SelectionMode::Face => {
-                    if let Some(face) = mesh_ray_hit(origin, direction, mesh) {
-                        let extend =
-                            is_key_down(KeyCode::LeftShift) || is_key_down(KeyCode::RightShift);
-                        select_face(state, face, extend);
-                    } else if !is_key_down(KeyCode::LeftShift) && !is_key_down(KeyCode::RightShift)
-                    {
+            } else {
+                let extend = is_key_down(KeyCode::LeftShift) || is_key_down(KeyCode::RightShift);
+                match state.selection_mode {
+                    SelectionMode::Vertex => {
+                        if let Some(index) = pick_vertex(&camera, ctx.mouse, mesh) {
+                            if extend {
+                                if let Some(existing) = state
+                                    .selected_vertices
+                                    .iter()
+                                    .position(|&selected| selected == index)
+                                {
+                                    state.selected_vertices.remove(existing);
+                                } else {
+                                    state.selected_vertices.push(index);
+                                }
+                            } else {
+                                state.selected_vertices = vec![index];
+                            }
+                        }
                         state.selected_faces.clear();
+                        state.selected_edges.clear();
                         state.selected_group = None;
+                    }
+                    SelectionMode::Edge => {
+                        if let Some(edge) = pick_edge(&camera, ctx.mouse, mesh) {
+                            select_edge(state, edge, extend);
+                        } else if !extend {
+                            state.selected_edges.clear();
+                        }
+                    }
+                    SelectionMode::Face => {
+                        if let Some(face) = mesh_ray_hit(origin, direction, mesh) {
+                            select_face(state, face, extend);
+                        } else if !extend {
+                            state.selected_faces.clear();
+                            state.selected_group = None;
+                        }
                     }
                 }
             }
-            state.error = None;
+            if !state.knife_active {
+                state.error = None;
+            }
         }
     }
 
@@ -1477,13 +1977,46 @@ pub fn run(
                     }
                 };
                 let indent = depth as f32 * 10.0 + if is_face && depth > 0 { 10.0 } else { 0.0 };
+                let is_group = matches!(item, SidebarItem::Group(_));
+                let configure_width = if is_group { 42.0 } else { 0.0 };
                 let rect = Rect::new(
                     12.0 + indent,
                     y,
-                    SIDEBAR_WIDTH - 24.0 - indent,
+                    SIDEBAR_WIDTH - 24.0 - indent - configure_width,
                     FACE_ROW_HEIGHT - 2.0,
                 );
                 draw_list_row(ctx, rect, &label, selected, color);
+                if is_group {
+                    let configure =
+                        Rect::new(rect.x + rect.w + 4.0, y, 38.0, FACE_ROW_HEIGHT - 2.0);
+                    let hovered = configure.contains(ctx.mouse);
+                    draw_rectangle(
+                        configure.x,
+                        configure.y,
+                        configure.w,
+                        configure.h,
+                        if hovered {
+                            ctx.colors_rt.button_hover
+                        } else {
+                            ctx.colors_rt.button_base
+                        },
+                    );
+                    draw_rectangle_lines(
+                        configure.x,
+                        configure.y,
+                        configure.w,
+                        configure.h,
+                        1.0,
+                        ctx.colors_rt.button_border,
+                    );
+                    draw_text(
+                        "Set",
+                        configure.x + 7.0,
+                        configure.y + configure.h * 0.5 + ctx.font_sm * 0.35,
+                        ctx.font_sm,
+                        WHITE,
+                    );
+                }
             }
         }
     } else {
@@ -1551,6 +2084,8 @@ pub fn run(
             Color::from_rgba(255, 220, 100, 255),
         );
     }
+
+    draw_group_config_dialog(ctx, catalog, state);
 
     if let Some(dialog) = &state.rename_dialog {
         draw_rectangle(
@@ -1734,39 +2269,43 @@ mod tests {
 
     #[test]
     fn radial_route_groups_appear_as_a_main_group_with_condition_children() {
-        let mut metadata = FaceMetadata::default();
-        metadata.ensure_radial_program().unwrap();
-
-        let main_id = metadata.radial_main_group_id().unwrap();
-        let items = sidebar_items(&metadata, 0);
-
-        assert_eq!(items.first(), Some(&SidebarItem::Group(main_id)));
-        let children = metadata
-            .groups
-            .iter()
-            .filter(|group| group.parent_id == Some(main_id))
-            .collect::<Vec<_>>();
-        assert_eq!(children.len(), 3);
-        let conditions = children
-            .iter()
-            .filter_map(|group| match group.program {
-                FaceGroupProgram::IfNeighbor(condition) => Some(condition),
-                _ => None,
-            })
-            .collect::<HashSet<_>>();
+        let mut metadata = FaceMetadata::for_face_count(3);
+        let main_id = metadata.create_group(&[0]).unwrap();
         assert_eq!(
-            conditions,
-            HashSet::from([
-                crate::core::object_assets::RadialNeighborState::Empty,
-                crate::core::object_assets::RadialNeighborState::Route,
-                crate::core::object_assets::RadialNeighborState::OtherBuilding,
-            ])
+            metadata.group(main_id).unwrap().program,
+            FaceGroupProgram::Geometry
         );
+        metadata
+            .set_group_program(main_id, FaceGroupProgram::RadialRepeat)
+            .unwrap();
+        let route_group = metadata.create_group_under(&[1], Some(main_id)).unwrap();
+        metadata
+            .set_group_program(
+                route_group,
+                FaceGroupProgram::IfNeighbor(RadialNeighborState::Route),
+            )
+            .unwrap();
+
+        let items = sidebar_items(&metadata, 3);
+        assert_eq!(items.first(), Some(&SidebarItem::Group(main_id)));
         assert_eq!(
             items,
-            std::iter::once(SidebarItem::Group(main_id))
-                .chain(children.iter().map(|group| SidebarItem::Group(group.id)))
-                .collect::<Vec<_>>()
+            [
+                SidebarItem::Group(main_id),
+                SidebarItem::Face {
+                    index: 0,
+                    group: Some(main_id),
+                },
+                SidebarItem::Group(route_group),
+                SidebarItem::Face {
+                    index: 1,
+                    group: Some(route_group),
+                },
+                SidebarItem::Face {
+                    index: 2,
+                    group: None,
+                },
+            ]
         );
     }
 

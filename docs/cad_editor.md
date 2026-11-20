@@ -9,7 +9,17 @@ the last saved version.
 
 - Right-drag to orbit, middle-drag to pan, and use the mouse wheel to zoom.
 - Choose vertex, edge, or face selection to select mesh elements.
-- The grid snap toggle and spacing buttons control placement snapping.
+- Choose **Move**, **Rotate**, or **Scale** on the transform toolbar. Drag the
+  colored axis handles around the selection; the white center handle moves freely.
+  Rotation uses colored rings, and scaling uses the cube handles. Release to
+  commit one undoable edit; press `Escape` during a drag to cancel it.
+- **Vertex Snap** is on by default for free Move drags. It snaps the selection
+  center to visible unselected vertices and highlights the snap target. Toggle it
+  in the view panel to move freely. Grid snap and spacing control primitive
+  placement.
+- **Value** opens a small, non-blocking XYZ input for exact translations,
+  rotations in degrees, or scale factors. Press `Enter` or **Apply** to commit;
+  close the input or press `Escape` to dismiss it.
 - Use the primitive placement tools to add geometry; confirm placement with
   `Enter` and cancel with `Escape`.
 - Use undo/redo while editing; save or discard to finish.

@@ -16,12 +16,54 @@ const CAMERA_MAX_DISTANCE: f32 = 100.0;
 const HISTORY_LIMIT: usize = 100;
 const FACE_LIST_TOP: f32 = 148.0;
 const FACE_ROW_HEIGHT: f32 = 26.0;
+const MAX_TRANSFORM_VALUE: f32 = 1_000_000.0;
+const MAX_SCALE_FACTOR: f32 = 1_000.0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SelectionMode {
     Vertex,
     Edge,
     Face,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TransformMode {
+    Move,
+    Rotate,
+    Scale,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TransformAxis {
+    All,
+    X,
+    Y,
+    Z,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct TransformCommand {
+    mode: TransformMode,
+    pivot: Vec3,
+    values: Vec3,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct GizmoDrag {
+    mode: TransformMode,
+    axis: TransformAxis,
+    pivot_model: Vec3,
+    pivot_display: Vec3,
+    plane_normal: Vec3,
+    handle_size: f32,
+    start_parameter: f32,
+    start_vector: Vec3,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct GizmoUpdate {
+    command: TransformCommand,
+    snap_target: Option<Vec3>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -90,6 +132,15 @@ pub struct CadSceneState {
     selected_edges: Vec<(usize, usize)>,
     dragged_faces: Option<Vec<usize>>,
     rename_dialog: Option<RenameDialog>,
+    transform_mode: TransformMode,
+    gizmo_drag: Option<GizmoDrag>,
+    gizmo_preview: Option<TransformCommand>,
+    gizmo_snap_target: Option<Vec3>,
+    numeric_transform_open: bool,
+    numeric_transform_focused: bool,
+    numeric_transform_selected: bool,
+    numeric_transform_values: String,
+    vertex_snap: bool,
     group_config_dialog: Option<GroupConfigDialog>,
     knife_active: bool,
     knife_start: Option<KnifeStart>,
@@ -128,6 +179,15 @@ impl Default for CadSceneState {
             selected_edges: Vec::new(),
             dragged_faces: None,
             rename_dialog: None,
+            transform_mode: TransformMode::Move,
+            gizmo_drag: None,
+            gizmo_preview: None,
+            gizmo_snap_target: None,
+            numeric_transform_open: false,
+            numeric_transform_focused: false,
+            numeric_transform_selected: false,
+            numeric_transform_values: "0, 0, 0".to_string(),
+            vertex_snap: true,
             group_config_dialog: None,
             knife_active: false,
             knife_start: None,
@@ -174,6 +234,506 @@ fn zoom_distance(distance: f32, wheel: f32) -> f32 {
     (distance * (-wheel * 0.01).exp()).clamp(CAMERA_MIN_DISTANCE, CAMERA_MAX_DISTANCE)
 }
 
+fn vec3_is_finite(value: Vec3) -> bool {
+    value.x.is_finite() && value.y.is_finite() && value.z.is_finite()
+}
+
+fn parse_vec3_input(text: &str, label: &str) -> Result<Vec3, String> {
+    let parts = if text.contains(',') {
+        text.split(',').collect::<Vec<_>>()
+    } else {
+        text.split_whitespace().collect::<Vec<_>>()
+    };
+    if parts.len() != 3 {
+        return Err(format!("Enter {label} as three X, Y, Z values"));
+    }
+    let values = parts
+        .into_iter()
+        .map(|value| {
+            let value = value.trim();
+            if value.is_empty() {
+                return Err(format!("Enter {label} as three X, Y, Z values"));
+            }
+            value
+                .parse::<f32>()
+                .map_err(|_| format!("Invalid {label} value '{value}'"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let value = vec3(values[0], values[1], values[2]);
+    if !vec3_is_finite(value) {
+        return Err(format!("{label} values must be finite"));
+    }
+    Ok(value)
+}
+
+fn parse_transform_values(mode: TransformMode, text: &str) -> Result<Vec3, String> {
+    let values = parse_vec3_input(text, "transform")?;
+    match mode {
+        TransformMode::Scale
+            if [values.x, values.y, values.z]
+                .iter()
+                .any(|value| *value <= 0.0 || *value > MAX_SCALE_FACTOR) =>
+        {
+            Err(format!(
+                "Scale factors must be greater than 0 and at most {MAX_SCALE_FACTOR}"
+            ))
+        }
+        TransformMode::Move | TransformMode::Rotate
+            if [values.x, values.y, values.z]
+                .iter()
+                .any(|value| value.abs() > MAX_TRANSFORM_VALUE) =>
+        {
+            Err(format!(
+                "Transform values must be between -{MAX_TRANSFORM_VALUE} and {MAX_TRANSFORM_VALUE}"
+            ))
+        }
+        _ => Ok(values),
+    }
+}
+
+fn constrained_transform_values(mode: TransformMode, axis: TransformAxis, values: Vec3) -> Vec3 {
+    let unchanged = if mode == TransformMode::Scale {
+        1.0
+    } else {
+        0.0
+    };
+    match axis {
+        TransformAxis::All => values,
+        TransformAxis::X => vec3(values.x, unchanged, unchanged),
+        TransformAxis::Y => vec3(unchanged, values.y, unchanged),
+        TransformAxis::Z => vec3(unchanged, unchanged, values.z),
+    }
+}
+
+fn transform_position(position: Vec3, command: TransformCommand) -> Vec3 {
+    match command.mode {
+        TransformMode::Move => position + command.values,
+        TransformMode::Rotate => {
+            let mut relative = position - command.pivot;
+            let radians = [
+                command.values.x.to_radians(),
+                command.values.y.to_radians(),
+                command.values.z.to_radians(),
+            ];
+            let (sin_x, cos_x) = radians[0].sin_cos();
+            relative = vec3(
+                relative.x,
+                relative.y * cos_x - relative.z * sin_x,
+                relative.y * sin_x + relative.z * cos_x,
+            );
+            let (sin_y, cos_y) = radians[1].sin_cos();
+            relative = vec3(
+                relative.x * cos_y + relative.z * sin_y,
+                relative.y,
+                -relative.x * sin_y + relative.z * cos_y,
+            );
+            let (sin_z, cos_z) = radians[2].sin_cos();
+            relative = vec3(
+                relative.x * cos_z - relative.y * sin_z,
+                relative.x * sin_z + relative.y * cos_z,
+                relative.z,
+            );
+            command.pivot + relative
+        }
+        TransformMode::Scale => {
+            let relative = position - command.pivot;
+            command.pivot
+                + vec3(
+                    relative.x * command.values.x,
+                    relative.y * command.values.y,
+                    relative.z * command.values.z,
+                )
+        }
+    }
+}
+
+fn apply_transform_to_indices(
+    mesh: &mut EditableMesh,
+    indices: &[usize],
+    command: TransformCommand,
+) -> Result<(), String> {
+    if indices.is_empty() {
+        return Err("Select vertices, edges, or faces before transforming".to_string());
+    }
+    if !vec3_is_finite(command.pivot) || !vec3_is_finite(command.values) {
+        return Err("Transform values must be finite".to_string());
+    }
+    if command.mode == TransformMode::Scale
+        && [command.values.x, command.values.y, command.values.z]
+            .iter()
+            .any(|value| *value <= 0.0 || *value > MAX_SCALE_FACTOR)
+    {
+        return Err("Scale factors must be greater than 0 and at most 1000".to_string());
+    }
+
+    let transformed = indices
+        .iter()
+        .map(|&index| {
+            let vertex = mesh
+                .vertices
+                .get(index)
+                .ok_or_else(|| format!("Selected vertex {index} is out of range"))?;
+            let position = transform_position(vertex.position, command);
+            if !vec3_is_finite(position) {
+                return Err("Transform would create non-finite vertex coordinates".to_string());
+            }
+            Ok((index, position))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+
+    for (index, position) in transformed {
+        mesh.vertices[index].position = position;
+    }
+    Ok(())
+}
+
+fn transform_has_effect(command: TransformCommand) -> bool {
+    match command.mode {
+        TransformMode::Move => command.values.length_squared() > 1e-8,
+        TransformMode::Rotate => command.values.length_squared() > 1e-8,
+        TransformMode::Scale => (command.values - Vec3::ONE).length_squared() > 1e-8,
+    }
+}
+
+fn axis_direction(axis: TransformAxis) -> Option<Vec3> {
+    match axis {
+        TransformAxis::All => None,
+        TransformAxis::X => Some(Vec3::X),
+        TransformAxis::Y => Some(Vec3::Y),
+        TransformAxis::Z => Some(Vec3::Z),
+    }
+}
+
+fn axis_color(axis: TransformAxis) -> Color {
+    match axis {
+        TransformAxis::X => Color::from_rgba(245, 80, 80, 255),
+        TransformAxis::Y => Color::from_rgba(90, 225, 125, 255),
+        TransformAxis::Z => Color::from_rgba(85, 155, 255, 255),
+        TransformAxis::All => WHITE,
+    }
+}
+
+fn axis_plane_basis(axis: TransformAxis) -> Option<(Vec3, Vec3)> {
+    match axis {
+        TransformAxis::X => Some((Vec3::Y, Vec3::Z)),
+        TransformAxis::Y => Some((Vec3::X, Vec3::Z)),
+        TransformAxis::Z => Some((Vec3::X, Vec3::Y)),
+        TransformAxis::All => None,
+    }
+}
+
+fn axis_screen_parameter(
+    camera: &Camera3D,
+    mouse: Vec2,
+    pivot: Vec3,
+    axis: TransformAxis,
+    handle_size: f32,
+) -> Option<f32> {
+    let direction = axis_direction(axis)?;
+    let start = project_to_screen(camera, pivot)?;
+    let end = project_to_screen(camera, pivot + direction * handle_size)?;
+    let projected_axis = end - start;
+    let projected_length = projected_axis.length();
+    if projected_length < 2.0 {
+        return None;
+    }
+    Some((mouse - start).dot(projected_axis / projected_length) * handle_size / projected_length)
+}
+
+fn pick_gizmo_axis(
+    camera: &Camera3D,
+    mouse: Vec2,
+    pivot: Vec3,
+    mode: TransformMode,
+    handle_size: f32,
+) -> Option<TransformAxis> {
+    if mode == TransformMode::Move
+        && project_to_screen(camera, pivot).is_some_and(|screen| screen.distance(mouse) < 12.0)
+    {
+        return Some(TransformAxis::All);
+    }
+    let mut closest = None;
+    let mut closest_distance = f32::INFINITY;
+    for axis in [TransformAxis::X, TransformAxis::Y, TransformAxis::Z] {
+        let Some(direction) = axis_direction(axis) else {
+            continue;
+        };
+        if mode == TransformMode::Rotate {
+            let Some((u, v)) = axis_plane_basis(axis) else {
+                continue;
+            };
+            let mut previous = None;
+            for step in 0..=48 {
+                let angle = std::f32::consts::TAU * step as f32 / 48.0;
+                let point = pivot + (u * angle.cos() + v * angle.sin()) * handle_size * 0.78;
+                let Some(screen) = project_to_screen(camera, point) else {
+                    previous = None;
+                    continue;
+                };
+                if let Some(start) = previous {
+                    let distance = point_segment_distance(mouse, start, screen);
+                    if distance < 10.0 && distance < closest_distance {
+                        closest = Some(axis);
+                        closest_distance = distance;
+                    }
+                }
+                previous = Some(screen);
+            }
+        } else {
+            let (Some(start), Some(end)) = (
+                project_to_screen(camera, pivot),
+                project_to_screen(camera, pivot + direction * handle_size),
+            ) else {
+                continue;
+            };
+            let distance = point_segment_distance(mouse, start, end);
+            if mouse.distance(start) > 10.0 && distance < 10.0 && distance < closest_distance {
+                closest = Some(axis);
+                closest_distance = distance;
+            }
+        }
+    }
+    closest
+}
+
+fn ray_plane_hit(origin: Vec3, direction: Vec3, point: Vec3, normal: Vec3) -> Option<Vec3> {
+    let denominator = direction.dot(normal);
+    if denominator.abs() < 1e-6 {
+        return None;
+    }
+    let distance = (point - origin).dot(normal) / denominator;
+    (distance >= 0.0).then(|| origin + direction * distance)
+}
+
+fn begin_gizmo_drag(
+    camera: &Camera3D,
+    mouse: Vec2,
+    mesh: &EditableMesh,
+    state: &CadSceneState,
+    mode: TransformMode,
+    handle_size: f32,
+) -> Option<GizmoDrag> {
+    let indices = selected_indices(mesh, state);
+    let pivot_model = selected_bounds_center(mesh, &indices).ok()?;
+    let pivot_display = model_to_display_point(mesh, pivot_model);
+    let axis = pick_gizmo_axis(camera, mouse, pivot_display, mode, handle_size)?;
+    if mode == TransformMode::Move && axis == TransformAxis::All {
+        let plane_normal = (camera.target - camera.position).normalize_or_zero();
+        let (origin, direction) = mouse_ray(camera, mouse)?;
+        let point = ray_plane_hit(origin, direction, pivot_display, plane_normal)?;
+        Some(GizmoDrag {
+            mode,
+            axis,
+            pivot_model,
+            pivot_display,
+            plane_normal,
+            handle_size,
+            start_parameter: 0.0,
+            start_vector: point - pivot_display,
+        })
+    } else if mode == TransformMode::Rotate {
+        let plane_normal = axis_direction(axis)?;
+        let (origin, direction) = mouse_ray(camera, mouse)?;
+        let point = ray_plane_hit(origin, direction, pivot_display, plane_normal)?;
+        let start_vector = point - pivot_display;
+        (start_vector.length_squared() > 1e-8).then_some(GizmoDrag {
+            mode,
+            axis,
+            pivot_model,
+            pivot_display,
+            plane_normal,
+            handle_size,
+            start_parameter: 0.0,
+            start_vector,
+        })
+    } else {
+        let start_parameter =
+            axis_screen_parameter(camera, mouse, pivot_display, axis, handle_size)?;
+        Some(GizmoDrag {
+            mode,
+            axis,
+            pivot_model,
+            pivot_display,
+            plane_normal: Vec3::ZERO,
+            handle_size,
+            start_parameter,
+            start_vector: Vec3::ZERO,
+        })
+    }
+}
+
+fn update_gizmo_drag(
+    camera: &Camera3D,
+    mouse: Vec2,
+    mesh: &EditableMesh,
+    state: &CadSceneState,
+    drag: GizmoDrag,
+) -> Option<GizmoUpdate> {
+    let values = match drag.mode {
+        TransformMode::Move => {
+            let (_, display_scale) = mesh_center_and_scale(mesh);
+            if drag.axis == TransformAxis::All {
+                let (origin, ray_direction) = mouse_ray(camera, mouse)?;
+                let point =
+                    ray_plane_hit(origin, ray_direction, drag.pivot_display, drag.plane_normal)?;
+                (point - drag.pivot_display - drag.start_vector) / display_scale
+            } else {
+                let direction = axis_direction(drag.axis)?;
+                let current = axis_screen_parameter(
+                    camera,
+                    mouse,
+                    drag.pivot_display,
+                    drag.axis,
+                    drag.handle_size,
+                )?;
+                direction * ((current - drag.start_parameter) / display_scale)
+            }
+        }
+        TransformMode::Scale => {
+            let direction = axis_direction(drag.axis)?;
+            let current = axis_screen_parameter(
+                camera,
+                mouse,
+                drag.pivot_display,
+                drag.axis,
+                drag.handle_size,
+            )?;
+            let factor = (1.0 + (current - drag.start_parameter) / drag.handle_size)
+                .clamp(0.01, MAX_SCALE_FACTOR);
+            Vec3::ONE + direction * (factor - 1.0)
+        }
+        TransformMode::Rotate => {
+            let direction = axis_direction(drag.axis)?;
+            let (origin, ray_direction) = mouse_ray(camera, mouse)?;
+            let point = ray_plane_hit(origin, ray_direction, drag.pivot_display, direction)?;
+            let current_vector = point - drag.pivot_display;
+            if current_vector.length_squared() <= 1e-8 {
+                return None;
+            }
+            let angle = direction
+                .dot(drag.start_vector.cross(current_vector))
+                .atan2(drag.start_vector.dot(current_vector))
+                .to_degrees();
+            direction * angle
+        }
+    };
+    let mut command = TransformCommand {
+        mode: drag.mode,
+        pivot: drag.pivot_model,
+        values,
+    };
+    let snap_target = if drag.mode == TransformMode::Move && drag.axis == TransformAxis::All {
+        let target = find_visible_vertex_snap(camera, mouse, mesh, state, command);
+        if let Some(target) = target {
+            command.values = target - drag.pivot_model;
+        }
+        target
+    } else {
+        None
+    };
+    Some(GizmoUpdate {
+        command,
+        snap_target,
+    })
+}
+
+fn find_visible_vertex_snap(
+    camera: &Camera3D,
+    mouse: Vec2,
+    mesh: &EditableMesh,
+    state: &CadSceneState,
+    command: TransformCommand,
+) -> Option<Vec3> {
+    if !state.vertex_snap {
+        return None;
+    }
+    let (origin, direction) = mouse_ray(camera, mouse)?;
+    let mut candidate = mesh.clone();
+    apply_transform_to_selection(&mut candidate, state, command).ok()?;
+    let display = preview_mesh_with_reference(&candidate, mesh);
+    let (hit_distance, _, _) = mesh_ray_hit_point(origin, direction, &display, None)?;
+
+    let selected_positions = selected_indices(mesh, state)
+        .into_iter()
+        .filter_map(|index| mesh.vertices.get(index).map(|vertex| vertex.position))
+        .collect::<Vec<_>>();
+    let mut closest = None;
+    let mut closest_screen_distance = 12.0;
+    for vertex in &mesh.vertices {
+        if selected_positions
+            .iter()
+            .any(|position| (*position - vertex.position).length_squared() <= 1e-8)
+        {
+            continue;
+        }
+        let target_display = model_to_display_point(mesh, vertex.position);
+        let Some(target_screen) = project_to_screen(camera, target_display) else {
+            continue;
+        };
+        let screen_distance = mouse.distance(target_screen);
+        let target_distance = (target_display - origin).dot(direction);
+        if screen_distance < closest_screen_distance
+            && (target_distance - hit_distance).abs() <= 0.08
+        {
+            closest = Some(vertex.position);
+            closest_screen_distance = screen_distance;
+        }
+    }
+    closest
+}
+
+fn gizmo_center_and_size(mesh: &EditableMesh, state: &CadSceneState) -> Option<(Vec3, f32)> {
+    let indices = selected_indices(mesh, state);
+    let center = selected_bounds_center(mesh, &indices).ok()?;
+    Some((
+        model_to_display_point(mesh, center),
+        (state.distance * 0.13).clamp(0.38, 0.85),
+    ))
+}
+
+fn draw_transform_gizmo(center: Vec3, mode: TransformMode, handle_size: f32) {
+    for axis in [TransformAxis::X, TransformAxis::Y, TransformAxis::Z] {
+        let direction = axis_direction(axis).unwrap_or(Vec3::ZERO);
+        let color = axis_color(axis);
+        if mode == TransformMode::Rotate {
+            let (u, v) = axis_plane_basis(axis).unwrap_or((Vec3::X, Vec3::Y));
+            let radius = handle_size * 0.78;
+            let mut previous = center + u * radius;
+            for step in 1..=48 {
+                let angle = std::f32::consts::TAU * step as f32 / 48.0;
+                let point = center + (u * angle.cos() + v * angle.sin()) * radius;
+                draw_line_3d(previous, point, color);
+                previous = point;
+            }
+        } else {
+            let endpoint = center + direction * handle_size;
+            draw_line_3d(center, endpoint, color);
+            let marker_size = handle_size * 0.09;
+            if mode == TransformMode::Scale {
+                draw_cube(
+                    endpoint,
+                    vec3(marker_size, marker_size, marker_size),
+                    None,
+                    color,
+                );
+            } else {
+                draw_sphere(endpoint, marker_size * 0.55, None, color);
+            }
+        }
+    }
+    draw_sphere(
+        center,
+        handle_size
+            * if mode == TransformMode::Move {
+                0.09
+            } else {
+                0.045
+            },
+        None,
+        Color::from_rgba(245, 245, 245, 255),
+    );
+}
+
 fn mesh_center_and_scale(mesh: &EditableMesh) -> (Vec3, f32) {
     let mut min = vec3(f32::INFINITY, f32::INFINITY, f32::INFINITY);
     let mut max = vec3(f32::NEG_INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY);
@@ -185,10 +745,6 @@ fn mesh_center_and_scale(mesh: &EditableMesh) -> (Vec3, f32) {
     let extent = max - min;
     let scale = 2.4 / extent.x.max(extent.y).max(extent.z).max(0.001);
     (center, scale)
-}
-
-fn preview_mesh(mesh: &EditableMesh) -> EditableMesh {
-    preview_mesh_with_reference(mesh, mesh)
 }
 
 fn preview_mesh_with_reference(mesh: &EditableMesh, reference: &EditableMesh) -> EditableMesh {
@@ -588,6 +1144,7 @@ fn draw_view_controls(
             ctx.colors_rt.text_secondary,
         );
         let snap_rect = grid_snap_rect(panel);
+        let vertex_snap_button = vertex_snap_rect(panel);
         let spacing_minus = grid_spacing_minus_rect(panel);
         let spacing_plus = grid_spacing_plus_rect(panel);
         let preview_rect = interaction_preview_rect(panel);
@@ -595,9 +1152,18 @@ fn draw_view_controls(
             ctx,
             snap_rect,
             if state.grid_snap {
-                "Snap: On"
+                "Grid: On"
             } else {
-                "Snap: Off"
+                "Grid: Off"
+            },
+        );
+        let _ = button(
+            ctx,
+            vertex_snap_button,
+            if state.vertex_snap {
+                "Vertex: On"
+            } else {
+                "Vertex: Off"
             },
         );
         let _ = button(
@@ -649,7 +1215,11 @@ fn draw_view_controls(
 }
 
 fn grid_snap_rect(panel: Rect) -> Rect {
-    Rect::new(panel.x + 12.0, panel.y + 166.0, panel.w - 24.0, 27.0)
+    Rect::new(panel.x + 12.0, panel.y + 166.0, 78.0, 27.0)
+}
+
+fn vertex_snap_rect(panel: Rect) -> Rect {
+    Rect::new(panel.x + 96.0, panel.y + 166.0, panel.w - 108.0, 27.0)
 }
 
 fn grid_spacing_minus_rect(panel: Rect) -> Rect {
@@ -891,6 +1461,12 @@ fn close_editor(state: &mut CadSceneState) {
     state.selected_edges.clear();
     state.dragged_faces = None;
     state.rename_dialog = None;
+    state.gizmo_drag = None;
+    state.gizmo_preview = None;
+    state.gizmo_snap_target = None;
+    state.numeric_transform_open = false;
+    state.numeric_transform_focused = false;
+    state.numeric_transform_selected = false;
     state.group_config_dialog = None;
     state.knife_active = false;
     state.knife_start = None;
@@ -915,6 +1491,12 @@ fn switch_to_object(state: &mut CadSceneState, id: ObjectId) {
     state.selected_edges.clear();
     state.dragged_faces = None;
     state.rename_dialog = None;
+    state.gizmo_drag = None;
+    state.gizmo_preview = None;
+    state.gizmo_snap_target = None;
+    state.numeric_transform_open = false;
+    state.numeric_transform_focused = false;
+    state.numeric_transform_selected = false;
     state.group_config_dialog = None;
     state.knife_active = false;
     state.knife_start = None;
@@ -927,44 +1509,6 @@ fn switch_to_object(state: &mut CadSceneState, id: ObjectId) {
     state.error = None;
     state.target = Vec3::ZERO;
     state.distance = 4.0;
-}
-
-fn move_selected(mesh: &mut EditableMesh, state: &CadSceneState, offset: Vec3) -> bool {
-    let indices = selected_indices(mesh, state);
-    if indices.is_empty() {
-        return false;
-    }
-    for index in indices {
-        if let Some(vertex) = mesh.vertices.get_mut(index) {
-            vertex.position += offset;
-        }
-    }
-    true
-}
-
-fn scale_selected(mesh: &mut EditableMesh, state: &CadSceneState, factor: f32) -> bool {
-    let indices = selected_indices(mesh, state);
-    if indices.is_empty() {
-        return false;
-    }
-    let points = indices
-        .iter()
-        .filter_map(|&index| mesh.vertices.get(index).map(|vertex| vertex.position))
-        .collect::<Vec<_>>();
-    if points.is_empty() {
-        return false;
-    }
-    let center = points
-        .iter()
-        .copied()
-        .fold(Vec3::ZERO, |sum, point| sum + point)
-        / points.len() as f32;
-    for index in indices {
-        if let Some(vertex) = mesh.vertices.get_mut(index) {
-            vertex.position = center + (vertex.position - center) * factor;
-        }
-    }
-    true
 }
 
 fn selected_indices(mesh: &EditableMesh, state: &CadSceneState) -> Vec<usize> {
@@ -1020,6 +1564,90 @@ fn selected_indices(mesh: &EditableMesh, state: &CadSceneState) -> Vec<usize> {
             indices
         }
     }
+}
+
+fn selected_bounds_center(mesh: &EditableMesh, indices: &[usize]) -> Result<Vec3, String> {
+    let mut min = vec3(f32::INFINITY, f32::INFINITY, f32::INFINITY);
+    let mut max = vec3(f32::NEG_INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY);
+    let mut found = false;
+    for &index in indices {
+        let vertex = mesh
+            .vertices
+            .get(index)
+            .ok_or_else(|| format!("Selected vertex {index} is out of range"))?;
+        min = min.min(vertex.position);
+        max = max.max(vertex.position);
+        found = true;
+    }
+    if !found {
+        return Err("Select vertices, edges, or faces before transforming".to_string());
+    }
+    Ok((min + max) * 0.5)
+}
+
+fn numeric_transform_command(
+    catalog: &ObjectCatalog,
+    state: &CadSceneState,
+) -> Result<TransformCommand, String> {
+    let mesh = selected_mesh(catalog, state)
+        .ok_or_else(|| "Selected object is unavailable".to_string())?;
+    let indices = selected_indices(mesh, state);
+    let pivot = selected_bounds_center(mesh, &indices)?;
+    let values = constrained_transform_values(
+        state.transform_mode,
+        TransformAxis::All,
+        parse_transform_values(state.transform_mode, &state.numeric_transform_values)?,
+    );
+    Ok(TransformCommand {
+        mode: state.transform_mode,
+        pivot,
+        values,
+    })
+}
+
+fn apply_transform_to_selection(
+    mesh: &mut EditableMesh,
+    state: &CadSceneState,
+    command: TransformCommand,
+) -> Result<(), String> {
+    let indices = selected_indices(mesh, state);
+    apply_transform_to_indices(mesh, &indices, command)
+}
+
+fn commit_transform_command(
+    catalog: &mut ObjectCatalog,
+    state: &mut CadSceneState,
+    command: TransformCommand,
+) -> Result<(), String> {
+    if !transform_has_effect(command) {
+        state.gizmo_preview = None;
+        state.gizmo_drag = None;
+        state.gizmo_snap_target = None;
+        return Ok(());
+    }
+    let snapshot = capture_snapshot(catalog, state)?;
+    let indices = selected_indices(&snapshot.mesh, state);
+    let mesh = selected_mesh_mut(catalog, state)
+        .ok_or_else(|| "Selected object is unavailable".to_string())?;
+    apply_transform_to_indices(mesh, &indices, command)?;
+    push_undo(state, snapshot);
+    state.dirty = true;
+    state.gizmo_preview = None;
+    state.gizmo_drag = None;
+    state.gizmo_snap_target = None;
+    Ok(())
+}
+
+fn apply_numeric_transform(
+    catalog: &mut ObjectCatalog,
+    state: &mut CadSceneState,
+) -> Result<(), String> {
+    let command = numeric_transform_command(catalog, state)?;
+    commit_transform_command(catalog, state, command)?;
+    state.numeric_transform_open = false;
+    state.numeric_transform_focused = false;
+    state.numeric_transform_selected = false;
+    Ok(())
 }
 
 fn sidebar_items(metadata: &FaceMetadata, face_count: usize) -> Vec<SidebarItem> {
@@ -1931,6 +2559,106 @@ fn draw_group_config_dialog(
     }
 }
 
+fn numeric_transform_panel_rect() -> Rect {
+    Rect::new(SIDEBAR_WIDTH + 12.0, TOOLBAR_HEIGHT + 48.0, 260.0, 108.0)
+}
+
+fn draw_numeric_transform_panel(
+    ctx: &FrameContext,
+    catalog: &mut ObjectCatalog,
+    state: &mut CadSceneState,
+) {
+    if !state.numeric_transform_open {
+        return;
+    }
+    let panel = numeric_transform_panel_rect();
+    draw_rectangle(panel.x, panel.y, panel.w, panel.h, ctx.colors_rt.panel_bg);
+    draw_rectangle_lines(
+        panel.x,
+        panel.y,
+        panel.w,
+        panel.h,
+        1.0,
+        ctx.colors_rt.panel_border,
+    );
+    let mode_label = match state.transform_mode {
+        TransformMode::Move => "Move by X, Y, Z",
+        TransformMode::Rotate => "Rotate by degrees X, Y, Z",
+        TransformMode::Scale => "Scale by X, Y, Z",
+    };
+    draw_text(
+        mode_label,
+        panel.x + 10.0,
+        panel.y + 21.0,
+        ctx.font_sm,
+        ctx.colors_rt.text_primary,
+    );
+    let input = Rect::new(panel.x + 10.0, panel.y + 28.0, panel.w - 20.0, 28.0);
+    draw_rectangle(
+        input.x,
+        input.y,
+        input.w,
+        input.h,
+        ctx.colors_rt.button_base,
+    );
+    draw_rectangle_lines(
+        input.x,
+        input.y,
+        input.w,
+        input.h,
+        1.0,
+        if state.numeric_transform_focused {
+            Color::from_rgba(27, 119, 105, 255)
+        } else {
+            ctx.colors_rt.button_border
+        },
+    );
+    if state.numeric_transform_selected {
+        draw_rectangle(
+            input.x + 6.0,
+            input.y + 5.0,
+            (state.numeric_transform_values.chars().count() as f32 * 9.0).min(input.w - 12.0),
+            input.h - 10.0,
+            Color::from_rgba(27, 119, 105, 90),
+        );
+    }
+    draw_text(
+        &state.numeric_transform_values,
+        input.x + 9.0,
+        input.y + 20.0,
+        ctx.font_sm,
+        ctx.colors_rt.text_primary,
+    );
+    if input.contains(ctx.mouse) && is_mouse_button_pressed(MouseButton::Left) {
+        state.numeric_transform_focused = true;
+        state.numeric_transform_selected = true;
+        state.error = None;
+    }
+    let button_y = panel.y + 66.0;
+    let apply_clicked = button(
+        ctx,
+        Rect::new(panel.x + 10.0, button_y, 110.0, 30.0),
+        "Apply",
+    );
+    let close_clicked = button(
+        ctx,
+        Rect::new(panel.x + 140.0, button_y, 110.0, 30.0),
+        "Close",
+    );
+    if apply_clicked {
+        match apply_numeric_transform(catalog, state) {
+            Ok(()) => {
+                state.error = None;
+            }
+            Err(error) => state.error = Some(error),
+        }
+    } else if close_clicked {
+        state.numeric_transform_open = false;
+        state.numeric_transform_focused = false;
+        state.numeric_transform_selected = false;
+        state.error = None;
+    }
+}
 fn undo_or_redo(catalog: &mut ObjectCatalog, state: &mut CadSceneState, is_undo: bool) {
     let result = if is_undo {
         undo(catalog, state)
@@ -1970,7 +2698,23 @@ pub fn run(
         if state.editing { 350.0 } else { 155.0 },
     );
     if is_key_pressed(KeyCode::Escape) {
-        if state.primitive_placement.is_some() {
+        if state.exit_confirmation_open {
+            state.exit_confirmation_open = false;
+        } else if state.group_config_dialog.is_some() {
+            state.group_config_dialog = None;
+        } else if state.rename_dialog.is_some() {
+            state.rename_dialog = None;
+        } else if state.numeric_transform_open {
+            state.numeric_transform_open = false;
+            state.numeric_transform_focused = false;
+            state.numeric_transform_selected = false;
+            state.error = None;
+        } else if state.gizmo_drag.is_some() {
+            state.gizmo_drag = None;
+            state.gizmo_preview = None;
+            state.gizmo_snap_target = None;
+            state.error = None;
+        } else if state.primitive_placement.is_some() {
             state.primitive_placement = None;
             state.error = None;
         } else if state.placing_radial_center {
@@ -1980,12 +2724,6 @@ pub fn run(
             state.knife_active = false;
             state.knife_start = None;
             state.error = None;
-        } else if state.group_config_dialog.is_some() {
-            state.group_config_dialog = None;
-        } else if state.rename_dialog.is_some() {
-            state.rename_dialog = None;
-        } else if state.exit_confirmation_open {
-            state.exit_confirmation_open = false;
         } else if state.editing {
             if state.dirty {
                 state.exit_confirmation_open = true;
@@ -2000,6 +2738,43 @@ pub fn run(
     let mut modal_open = state.exit_confirmation_open
         || state.group_config_dialog.is_some()
         || state.primitive_placement.is_some();
+    if !modal_open && state.numeric_transform_open && state.numeric_transform_focused {
+        let target = &mut state.numeric_transform_values;
+        let mut changed = false;
+        while let Some(character) = get_char_pressed() {
+            let allowed = character.is_ascii_digit() || matches!(character, '.' | ',' | ' ' | '-');
+            if allowed && (state.numeric_transform_selected || target.len() < 64) {
+                if state.numeric_transform_selected {
+                    target.clear();
+                }
+                target.push(character);
+                state.numeric_transform_selected = false;
+                changed = true;
+            }
+        }
+        if is_key_pressed(KeyCode::Backspace) && !target.is_empty() {
+            if state.numeric_transform_selected {
+                target.clear();
+            } else {
+                target.pop();
+            }
+            state.numeric_transform_selected = false;
+            changed = true;
+        }
+        if changed {
+            state.error = None;
+        }
+    }
+    if !modal_open
+        && state.numeric_transform_open
+        && state.numeric_transform_focused
+        && is_key_pressed(KeyCode::Enter)
+    {
+        match apply_numeric_transform(catalog, state) {
+            Ok(()) => state.error = None,
+            Err(error) => state.error = Some(error),
+        }
+    }
     if !state.exit_confirmation_open
         && state.group_config_dialog.is_none()
         && state.rename_dialog.is_none()
@@ -2109,6 +2884,17 @@ pub fn run(
             },
         ) {
             state.grid_snap = !state.grid_snap;
+        }
+        if button(
+            ctx,
+            vertex_snap_rect(view_panel),
+            if state.vertex_snap {
+                "Vertex: On"
+            } else {
+                "Vertex: Off"
+            },
+        ) {
+            state.vertex_snap = !state.vertex_snap;
         }
         if button(
             ctx,
@@ -2392,6 +3178,9 @@ pub fn run(
                 && !rename_dialog_open
                 && button(ctx, Rect::new(x, 12.0, 72.0, 34.0), label)
             {
+                state.numeric_transform_open = false;
+                state.numeric_transform_focused = false;
+                state.numeric_transform_selected = false;
                 start_primitive_placement(state, primitive);
                 modal_open = true;
             }
@@ -2463,71 +3252,49 @@ pub fn run(
     let mut action_x = SIDEBAR_WIDTH + 12.0;
     let action_y = 76.0;
     if state.editing {
-        for (label, offset) in [
-            ("-X", vec3(-0.1, 0.0, 0.0)),
-            ("+X", vec3(0.1, 0.0, 0.0)),
-            ("-Y", vec3(0.0, -0.1, 0.0)),
-            ("+Y", vec3(0.0, 0.1, 0.0)),
-            ("-Z", vec3(0.0, 0.0, -0.1)),
-            ("+Z", vec3(0.0, 0.0, 0.1)),
+        for (mode, label) in [
+            (TransformMode::Move, "Move"),
+            (TransformMode::Rotate, "Rotate"),
+            (TransformMode::Scale, "Scale"),
         ] {
-            if !modal_open
-                && !rename_dialog_open
-                && button(ctx, Rect::new(action_x, action_y, 46.0, 30.0), label)
-            {
-                match capture_snapshot(catalog, state) {
-                    Ok(snapshot) => {
-                        if let Some(mesh) = selected_mesh_mut(catalog, state) {
-                            if move_selected(mesh, state, offset) {
-                                push_undo(state, snapshot);
-                                state.dirty = true;
-                            } else {
-                                state.error = Some("Select a vertex or face first".to_string());
-                            }
-                        }
-                    }
-                    Err(error) => state.error = Some(error),
+            let rect = Rect::new(action_x, action_y, 72.0, 30.0);
+            if !modal_open && !rename_dialog_open && button(ctx, rect, label) {
+                state.transform_mode = mode;
+                state.numeric_transform_values = match mode {
+                    TransformMode::Scale => "1, 1, 1",
+                    TransformMode::Move | TransformMode::Rotate => "0, 0, 0",
                 }
+                .to_string();
+                state.numeric_transform_selected = state.numeric_transform_open;
+                state.error = None;
             }
-            action_x += 50.0;
+            draw_rectangle_lines(
+                rect.x,
+                rect.y,
+                rect.w,
+                rect.h,
+                2.0,
+                if state.transform_mode == mode {
+                    Color::from_rgba(27, 119, 105, 255)
+                } else {
+                    ctx.colors_rt.button_border
+                },
+            );
+            action_x += 76.0;
         }
-        action_x += 8.0;
         if !modal_open
             && !rename_dialog_open
-            && button(ctx, Rect::new(action_x, action_y, 72.0, 30.0), "Scale +")
+            && button(ctx, Rect::new(action_x, action_y, 72.0, 30.0), "Value")
         {
-            match capture_snapshot(catalog, state) {
-                Ok(snapshot) => {
-                    if let Some(mesh) = selected_mesh_mut(catalog, state) {
-                        if scale_selected(mesh, state, 1.1) {
-                            push_undo(state, snapshot);
-                            state.dirty = true;
-                        } else {
-                            state.error = Some("Select a vertex or face first".to_string());
-                        }
-                    }
-                }
-                Err(error) => state.error = Some(error),
+            state.numeric_transform_open = !state.numeric_transform_open;
+            state.numeric_transform_focused = state.numeric_transform_open;
+            state.numeric_transform_selected = state.numeric_transform_open;
+            state.numeric_transform_values = match state.transform_mode {
+                TransformMode::Scale => "1, 1, 1",
+                TransformMode::Move | TransformMode::Rotate => "0, 0, 0",
             }
-        }
-        action_x += 76.0;
-        if !modal_open
-            && !rename_dialog_open
-            && button(ctx, Rect::new(action_x, action_y, 72.0, 30.0), "Scale -")
-        {
-            match capture_snapshot(catalog, state) {
-                Ok(snapshot) => {
-                    if let Some(mesh) = selected_mesh_mut(catalog, state) {
-                        if scale_selected(mesh, state, 0.9) {
-                            push_undo(state, snapshot);
-                            state.dirty = true;
-                        } else {
-                            state.error = Some("Select a vertex or face first".to_string());
-                        }
-                    }
-                }
-                Err(error) => state.error = Some(error),
-            }
+            .to_string();
+            state.error = None;
         }
         action_x += 76.0;
         if !modal_open
@@ -2600,16 +3367,30 @@ pub fn run(
     }
     ui_capturing |= state.editing
         && Rect::new(SIDEBAR_WIDTH, action_y - 4.0, screen_width(), 40.0).contains(ctx.mouse);
+    ui_capturing |=
+        state.numeric_transform_open && numeric_transform_panel_rect().contains(ctx.mouse);
+    if state.numeric_transform_open
+        && is_mouse_button_pressed(MouseButton::Left)
+        && !numeric_transform_panel_rect().contains(ctx.mouse)
+        && !Rect::new(SIDEBAR_WIDTH, action_y - 4.0, screen_width(), 40.0).contains(ctx.mouse)
+    {
+        state.numeric_transform_focused = false;
+        state.numeric_transform_selected = false;
+    }
 
     let camera = object_camera(state);
     let editor_modal_open =
         state.exit_confirmation_open || state.group_config_dialog.is_some() || rename_dialog_open;
-    let viewport_active = !editor_modal_open && viewport.contains(ctx.mouse) && !ui_capturing;
-    if viewport_active && is_mouse_button_down(MouseButton::Right) {
+    let viewport_active = state.gizmo_drag.is_some()
+        || (!editor_modal_open && viewport.contains(ctx.mouse) && !ui_capturing);
+    if viewport_active && state.gizmo_drag.is_none() && is_mouse_button_down(MouseButton::Right) {
         let delta = ctx.mouse - state.last_mouse;
         state.yaw -= delta.x * 0.008;
         state.pitch = (state.pitch - delta.y * 0.006).clamp(-1.45, 1.45);
-    } else if viewport_active && is_mouse_button_down(MouseButton::Middle) {
+    } else if viewport_active
+        && state.gizmo_drag.is_none()
+        && is_mouse_button_down(MouseButton::Middle)
+    {
         let delta = ctx.mouse - state.last_mouse;
         let position = camera.position;
         let forward = (camera.target - position).normalize_or_zero();
@@ -2632,7 +3413,38 @@ pub fn run(
     };
 
     let current_mesh = selected_mesh(catalog, state).cloned();
-    let preview = current_mesh.as_ref().map(preview_mesh);
+    if let (Some(drag), Some(mesh)) = (state.gizmo_drag, current_mesh.as_ref()) {
+        if is_mouse_button_down(MouseButton::Left) || is_mouse_button_released(MouseButton::Left) {
+            let update = update_gizmo_drag(&camera, ctx.mouse, mesh, state, drag);
+            state.gizmo_preview = update.map(|update| update.command);
+            state.gizmo_snap_target = update.and_then(|update| update.snap_target);
+        }
+        if is_mouse_button_released(MouseButton::Left) {
+            if let Some(command) = state.gizmo_preview {
+                match commit_transform_command(catalog, state, command) {
+                    Ok(()) => state.error = None,
+                    Err(error) => {
+                        state.gizmo_drag = None;
+                        state.gizmo_preview = None;
+                        state.gizmo_snap_target = None;
+                        state.error = Some(error);
+                    }
+                }
+            } else {
+                state.gizmo_drag = None;
+                state.gizmo_snap_target = None;
+            }
+        }
+    }
+    let preview = current_mesh.as_ref().map(|mesh| {
+        let mut candidate = mesh.clone();
+        if let Some(command) = state.gizmo_preview
+            && let Err(error) = apply_transform_to_selection(&mut candidate, state, command)
+        {
+            state.error = Some(error);
+        }
+        preview_mesh_with_reference(&candidate, mesh)
+    });
     if state.interaction_preview {
         if let Err(error) = draw_interaction_preview(catalog, state) {
             state.error = Some(error);
@@ -2715,6 +3527,31 @@ pub fn run(
                                 Color::from_rgba(255, 90, 90, 255),
                             );
                         }
+                    }
+                }
+                if let Some(source_mesh) = current_mesh.as_ref()
+                    && let Some((mut center, handle_size)) =
+                        gizmo_center_and_size(source_mesh, state)
+                {
+                    if let Some(command) = state.gizmo_preview {
+                        let indices = selected_indices(source_mesh, state);
+                        if let Ok(pivot) = selected_bounds_center(source_mesh, &indices) {
+                            center = model_to_display_point(
+                                source_mesh,
+                                transform_position(pivot, command),
+                            );
+                        }
+                    }
+                    draw_transform_gizmo(center, state.transform_mode, handle_size);
+                    if let Some(target) = state.gizmo_snap_target {
+                        let snap_point = model_to_display_point(source_mesh, target);
+                        draw_line_3d(center, snap_point, Color::from_rgba(255, 220, 75, 220));
+                        draw_sphere(
+                            snap_point,
+                            handle_size * 0.075,
+                            None,
+                            Color::from_rgba(255, 220, 75, 255),
+                        );
                     }
                 }
             }
@@ -2830,6 +3667,21 @@ pub fn run(
                         state.error = Some("Knife points must land on the selected face(s)".into());
                     }
                 }
+            } else if let Some(source_mesh) = current_mesh.as_ref()
+                && let Some((_, handle_size)) = gizmo_center_and_size(source_mesh, state)
+                && let Some(drag) = begin_gizmo_drag(
+                    &camera,
+                    ctx.mouse,
+                    source_mesh,
+                    state,
+                    state.transform_mode,
+                    handle_size,
+                )
+            {
+                state.gizmo_drag = Some(drag);
+                state.gizmo_preview = None;
+                state.gizmo_snap_target = None;
+                state.error = None;
             } else {
                 let extend = is_key_down(KeyCode::LeftShift) || is_key_down(KeyCode::RightShift);
                 match state.selection_mode {
@@ -3080,6 +3932,15 @@ pub fn run(
         metadata.is_some_and(|metadata| metadata.radial_main_group_id().is_some()),
         metadata.and_then(|metadata| metadata.radial_pivot),
     );
+    if state.editing {
+        draw_text(
+            "Drag handles; Move center is free and snaps to vertices. Value opens exact XYZ input.",
+            SIDEBAR_WIDTH + 12.0,
+            action_y + 50.0,
+            ctx.font_sm,
+            ctx.colors_rt.text_secondary,
+        );
+    }
     if let Some(error) = &state.error {
         draw_text(
             error,
@@ -3100,6 +3961,7 @@ pub fn run(
     }
 
     draw_group_config_dialog(ctx, catalog, state);
+    draw_numeric_transform_panel(ctx, catalog, state);
 
     if let Some(dialog) = &state.rename_dialog {
         draw_rectangle(
@@ -3834,12 +4696,126 @@ mod tests {
             selected_vertices: vec![0],
             ..CadSceneState::default()
         };
+        let command = TransformCommand {
+            mode: TransformMode::Move,
+            pivot: Vec3::ZERO,
+            values: Vec3::Y,
+        };
 
         assert_eq!(selected_indices(&mesh, &state), vec![0, 1]);
-        assert!(move_selected(&mut mesh, &state, Vec3::Y));
+        apply_transform_to_selection(&mut mesh, &state, command).unwrap();
         assert_eq!(mesh.vertices[0].position, Vec3::Y);
         assert_eq!(mesh.vertices[1].position, Vec3::Y);
         assert_eq!(mesh.vertices[2].position, Vec3::X);
+    }
+
+    #[test]
+    fn transform_input_requires_three_finite_values() {
+        assert_eq!(
+            parse_transform_values(TransformMode::Move, "-1.5, 2, 0").unwrap(),
+            vec3(-1.5, 2.0, 0.0)
+        );
+        assert!(parse_transform_values(TransformMode::Move, "1, 2").is_err());
+        assert!(parse_transform_values(TransformMode::Move, "1,,2,3").is_err());
+        assert!(parse_transform_values(TransformMode::Move, "1, NaN, 0").is_err());
+        assert!(parse_transform_values(TransformMode::Scale, "1, 0, 1").is_err());
+    }
+
+    #[test]
+    fn transform_axis_constraint_leaves_other_axes_unchanged() {
+        assert_eq!(
+            constrained_transform_values(
+                TransformMode::Move,
+                TransformAxis::Y,
+                vec3(3.0, 4.0, 5.0)
+            ),
+            vec3(0.0, 4.0, 0.0)
+        );
+        assert_eq!(
+            constrained_transform_values(
+                TransformMode::Scale,
+                TransformAxis::X,
+                vec3(2.0, 3.0, 4.0)
+            ),
+            vec3(2.0, 1.0, 1.0)
+        );
+    }
+
+    #[test]
+    fn rotation_and_scale_use_pivot_and_only_affect_selected_vertices() {
+        let mut mesh = EditableMesh {
+            vertices: vec![
+                Vertex::new2(Vec3::X, Vec2::ZERO, WHITE),
+                Vertex::new2(Vec3::ZERO, Vec2::ZERO, WHITE),
+            ],
+            indices: vec![],
+        };
+        let state = CadSceneState {
+            selected_vertices: vec![0],
+            ..CadSceneState::default()
+        };
+
+        apply_transform_to_selection(
+            &mut mesh,
+            &state,
+            TransformCommand {
+                mode: TransformMode::Rotate,
+                pivot: Vec3::ZERO,
+                values: vec3(0.0, 0.0, 90.0),
+            },
+        )
+        .unwrap();
+        assert!((mesh.vertices[0].position - Vec3::Y).length() < 1e-5);
+        assert_eq!(mesh.vertices[1].position, Vec3::ZERO);
+
+        apply_transform_to_selection(
+            &mut mesh,
+            &state,
+            TransformCommand {
+                mode: TransformMode::Scale,
+                pivot: vec3(-1.0, 1.0, 0.0),
+                values: vec3(2.0, 1.0, 1.0),
+            },
+        )
+        .unwrap();
+        assert!((mesh.vertices[0].position - vec3(1.0, 1.0, 0.0)).length() < 1e-5);
+        assert_eq!(mesh.vertices[1].position, Vec3::ZERO);
+    }
+
+    #[test]
+    fn gizmo_preview_is_non_destructive_and_commit_is_undoable() {
+        let mut catalog = ObjectCatalog::load();
+        let original = catalog.get(ObjectId::PlanetBase).unwrap().vertices[0].position;
+        let mut state = CadSceneState {
+            selected_vertices: vec![0],
+            ..CadSceneState::default()
+        };
+        let source = selected_mesh(&catalog, &state).unwrap().clone();
+        let center = selected_bounds_center(&source, &selected_indices(&source, &state)).unwrap();
+        let command = TransformCommand {
+            mode: TransformMode::Move,
+            pivot: center,
+            values: Vec3::X,
+        };
+        let mut preview = source.clone();
+        apply_transform_to_selection(&mut preview, &state, command).unwrap();
+        state.gizmo_preview = Some(command);
+
+        assert_eq!(
+            catalog.get(ObjectId::PlanetBase).unwrap().vertices[0].position,
+            original
+        );
+
+        commit_transform_command(&mut catalog, &mut state, command).unwrap();
+        assert!(state.gizmo_preview.is_none());
+        assert_eq!(state.undo_stack.len(), 1);
+        let transformed = catalog.get(ObjectId::PlanetBase).unwrap().vertices[0].position;
+        assert_ne!(transformed, original);
+        assert!(undo(&mut catalog, &mut state).unwrap());
+        assert_eq!(
+            catalog.get(ObjectId::PlanetBase).unwrap().vertices[0].position,
+            original
+        );
     }
 
     #[test]
@@ -3917,11 +4893,16 @@ mod tests {
             ..CadSceneState::default()
         };
         let snapshot = capture_snapshot(&catalog, &state).unwrap();
-        assert!(move_selected(
+        apply_transform_to_selection(
             selected_mesh_mut(&mut catalog, &state).unwrap(),
             &state,
-            Vec3::X
-        ));
+            TransformCommand {
+                mode: TransformMode::Move,
+                pivot: Vec3::ZERO,
+                values: Vec3::X,
+            },
+        )
+        .unwrap();
         push_undo(&mut state, snapshot.clone());
 
         assert!(undo(&mut catalog, &mut state).unwrap());

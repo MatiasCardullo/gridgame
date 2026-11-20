@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use macroquad::prelude::*;
 
@@ -41,6 +41,84 @@ enum TransformAxis {
     Z,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum ObjectSnapKind {
+    Center,
+    Tangent,
+    Quadrant,
+    Intersection,
+    Endpoint,
+    Midpoint,
+    Perpendicular,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ObjectSnapSettings {
+    center: bool,
+    tangent: bool,
+    quadrant: bool,
+    intersection: bool,
+    endpoint: bool,
+    midpoint: bool,
+    perpendicular: bool,
+}
+
+impl Default for ObjectSnapSettings {
+    fn default() -> Self {
+        Self {
+            center: true,
+            tangent: true,
+            quadrant: true,
+            intersection: true,
+            endpoint: true,
+            midpoint: true,
+            perpendicular: true,
+        }
+    }
+}
+
+impl ObjectSnapSettings {
+    fn enabled(self, kind: ObjectSnapKind) -> bool {
+        match kind {
+            ObjectSnapKind::Center => self.center,
+            ObjectSnapKind::Tangent => self.tangent,
+            ObjectSnapKind::Quadrant => self.quadrant,
+            ObjectSnapKind::Intersection => self.intersection,
+            ObjectSnapKind::Endpoint => self.endpoint,
+            ObjectSnapKind::Midpoint => self.midpoint,
+            ObjectSnapKind::Perpendicular => self.perpendicular,
+        }
+    }
+
+    fn set(&mut self, kind: ObjectSnapKind, enabled: bool) {
+        match kind {
+            ObjectSnapKind::Center => self.center = enabled,
+            ObjectSnapKind::Tangent => self.tangent = enabled,
+            ObjectSnapKind::Quadrant => self.quadrant = enabled,
+            ObjectSnapKind::Intersection => self.intersection = enabled,
+            ObjectSnapKind::Endpoint => self.endpoint = enabled,
+            ObjectSnapKind::Midpoint => self.midpoint = enabled,
+            ObjectSnapKind::Perpendicular => self.perpendicular = enabled,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct ObjectSnapCandidate {
+    kind: ObjectSnapKind,
+    position: Vec3,
+}
+
+#[derive(Clone, Debug)]
+struct CircularLoop {
+    center: Vec3,
+    normal: Vec3,
+    u: Vec3,
+    v: Vec3,
+    radius: f32,
+    vertices: Vec<Vec3>,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct TransformCommand {
     mode: TransformMode,
@@ -63,7 +141,8 @@ struct GizmoDrag {
 #[derive(Clone, Copy, Debug)]
 struct GizmoUpdate {
     command: TransformCommand,
-    snap_target: Option<Vec3>,
+    snap_target: Option<ObjectSnapCandidate>,
+    polar_angle: Option<f32>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -135,12 +214,15 @@ pub struct CadSceneState {
     transform_mode: TransformMode,
     gizmo_drag: Option<GizmoDrag>,
     gizmo_preview: Option<TransformCommand>,
-    gizmo_snap_target: Option<Vec3>,
+    gizmo_snap_target: Option<ObjectSnapCandidate>,
+    gizmo_polar_angle: Option<f32>,
     numeric_transform_open: bool,
     numeric_transform_focused: bool,
     numeric_transform_selected: bool,
     numeric_transform_values: String,
-    vertex_snap: bool,
+    object_snaps: ObjectSnapSettings,
+    snap_settings_open: bool,
+    polar_tracking: bool,
     group_config_dialog: Option<GroupConfigDialog>,
     knife_active: bool,
     knife_start: Option<KnifeStart>,
@@ -183,11 +265,14 @@ impl Default for CadSceneState {
             gizmo_drag: None,
             gizmo_preview: None,
             gizmo_snap_target: None,
+            gizmo_polar_angle: None,
             numeric_transform_open: false,
             numeric_transform_focused: false,
             numeric_transform_selected: false,
             numeric_transform_values: "0, 0, 0".to_string(),
-            vertex_snap: true,
+            object_snaps: ObjectSnapSettings::default(),
+            snap_settings_open: false,
+            polar_tracking: false,
             group_config_dialog: None,
             knife_active: false,
             knife_start: None,
@@ -623,63 +708,46 @@ fn update_gizmo_drag(
         values,
     };
     let snap_target = if drag.mode == TransformMode::Move && drag.axis == TransformAxis::All {
-        let target = find_visible_vertex_snap(camera, mouse, mesh, state, command);
-        if let Some(target) = target {
-            command.values = target - drag.pivot_model;
-        }
-        target
+        let display_mesh = preview_mesh(mesh);
+        nearest_object_snap(
+            camera,
+            mouse,
+            mesh,
+            &display_mesh,
+            state,
+            state.object_snaps,
+        )
     } else {
         None
     };
+    let mut polar_angle = None;
+    if let Some(target) = snap_target {
+        command.values = target.position - drag.pivot_model;
+    } else if drag.mode == TransformMode::Move {
+        if state.grid_snap {
+            let snapped = snap_transform_to_grid(
+                drag.pivot_model,
+                command.values,
+                drag.axis,
+                state.grid_spacing,
+            );
+            command.values = snapped - drag.pivot_model;
+        } else if drag.axis == TransformAxis::All && state.polar_tracking {
+            let forward = (camera.target - camera.position).normalize_or_zero();
+            let right = forward.cross(camera.up).normalize_or_zero();
+            let up = right.cross(forward).normalize_or_zero();
+            let display_scale = mesh_center_and_scale(mesh).1;
+            let (tracked, angle) =
+                polar_track_delta(command.values * display_scale, right, up, 15.0);
+            command.values = tracked / display_scale;
+            polar_angle = Some(angle);
+        }
+    }
     Some(GizmoUpdate {
         command,
         snap_target,
+        polar_angle,
     })
-}
-
-fn find_visible_vertex_snap(
-    camera: &Camera3D,
-    mouse: Vec2,
-    mesh: &EditableMesh,
-    state: &CadSceneState,
-    command: TransformCommand,
-) -> Option<Vec3> {
-    if !state.vertex_snap {
-        return None;
-    }
-    let (origin, direction) = mouse_ray(camera, mouse)?;
-    let mut candidate = mesh.clone();
-    apply_transform_to_selection(&mut candidate, state, command).ok()?;
-    let display = preview_mesh_with_reference(&candidate, mesh);
-    let (hit_distance, _, _) = mesh_ray_hit_point(origin, direction, &display, None)?;
-
-    let selected_positions = selected_indices(mesh, state)
-        .into_iter()
-        .filter_map(|index| mesh.vertices.get(index).map(|vertex| vertex.position))
-        .collect::<Vec<_>>();
-    let mut closest = None;
-    let mut closest_screen_distance = 12.0;
-    for vertex in &mesh.vertices {
-        if selected_positions
-            .iter()
-            .any(|position| (*position - vertex.position).length_squared() <= 1e-8)
-        {
-            continue;
-        }
-        let target_display = model_to_display_point(mesh, vertex.position);
-        let Some(target_screen) = project_to_screen(camera, target_display) else {
-            continue;
-        };
-        let screen_distance = mouse.distance(target_screen);
-        let target_distance = (target_display - origin).dot(direction);
-        if screen_distance < closest_screen_distance
-            && (target_distance - hit_distance).abs() <= 0.08
-        {
-            closest = Some(vertex.position);
-            closest_screen_distance = screen_distance;
-        }
-    }
-    closest
 }
 
 fn gizmo_center_and_size(mesh: &EditableMesh, state: &CadSceneState) -> Option<(Vec3, f32)> {
@@ -745,6 +813,10 @@ fn mesh_center_and_scale(mesh: &EditableMesh) -> (Vec3, f32) {
     let extent = max - min;
     let scale = 2.4 / extent.x.max(extent.y).max(extent.z).max(0.001);
     (center, scale)
+}
+
+fn preview_mesh(mesh: &EditableMesh) -> EditableMesh {
+    preview_mesh_with_reference(mesh, mesh)
 }
 
 fn preview_mesh_with_reference(mesh: &EditableMesh, reference: &EditableMesh) -> EditableMesh {
@@ -1032,6 +1104,412 @@ fn point_segment_distance(point: Vec2, start: Vec2, end: Vec2) -> f32 {
     point.distance(start + segment * t)
 }
 
+fn polar_track_delta(
+    delta: Vec3,
+    screen_right: Vec3,
+    screen_up: Vec3,
+    increment_degrees: f32,
+) -> (Vec3, f32) {
+    let horizontal = delta.dot(screen_right);
+    let vertical = delta.dot(screen_up);
+    let magnitude = (horizontal * horizontal + vertical * vertical).sqrt();
+    if magnitude <= 1e-8 || increment_degrees <= 0.0 {
+        return (delta, 0.0);
+    }
+    let increment = increment_degrees.to_radians();
+    let angle = vertical.atan2(horizontal);
+    let tracked_angle = (angle / increment).round() * increment;
+    (
+        screen_right * (tracked_angle.cos() * magnitude)
+            + screen_up * (tracked_angle.sin() * magnitude),
+        tracked_angle.to_degrees(),
+    )
+}
+
+fn snap_transform_to_grid(pivot: Vec3, values: Vec3, axis: TransformAxis, spacing: f32) -> Vec3 {
+    let target = pivot + values;
+    let spacing = spacing.max(0.001);
+    match axis {
+        TransformAxis::All => snap_model_point(target, spacing),
+        TransformAxis::X => vec3((target.x / spacing).round() * spacing, target.y, target.z),
+        TransformAxis::Y => target,
+        TransformAxis::Z => vec3(target.x, target.y, (target.z / spacing).round() * spacing),
+    }
+}
+
+fn object_snap_priority(kind: ObjectSnapKind) -> u8 {
+    match kind {
+        ObjectSnapKind::Endpoint => 0,
+        ObjectSnapKind::Intersection => 1,
+        ObjectSnapKind::Midpoint => 2,
+        ObjectSnapKind::Center => 3,
+        ObjectSnapKind::Quadrant => 4,
+        ObjectSnapKind::Perpendicular => 5,
+        ObjectSnapKind::Tangent => 6,
+    }
+}
+
+fn unique_mesh_edges(mesh: &EditableMesh) -> Vec<(usize, usize)> {
+    let mut edges = HashSet::new();
+    for triangle in mesh.indices.chunks_exact(3) {
+        for side in 0..3 {
+            let a = triangle[side] as usize;
+            let b = triangle[(side + 1) % 3] as usize;
+            if a < mesh.vertices.len() && b < mesh.vertices.len() && a != b {
+                edges.insert(if a < b { (a, b) } else { (b, a) });
+            }
+        }
+    }
+    let mut edges = edges.into_iter().collect::<Vec<_>>();
+    edges.sort_unstable();
+    edges
+}
+
+fn fit_circular_loop(points: &[Vec3]) -> Option<CircularLoop> {
+    if points.len() < 6 {
+        return None;
+    }
+    let center = points.iter().copied().sum::<Vec3>() / points.len() as f32;
+    let first = (points[0] - center).normalize_or_zero();
+    if first.length_squared() <= 1e-8 {
+        return None;
+    }
+    let normal = points
+        .iter()
+        .skip(1)
+        .map(|point| first.cross(*point - center))
+        .find(|normal| normal.length_squared() > 1e-8)?
+        .normalize();
+    let u = (points[0] - center).normalize_or_zero();
+    let v = normal.cross(u).normalize_or_zero();
+    let radii = points
+        .iter()
+        .map(|point| {
+            let relative = *point - center;
+            if relative.dot(normal).abs() > 0.02 {
+                return None;
+            }
+            Some(vec2(relative.dot(u), relative.dot(v)).length())
+        })
+        .collect::<Option<Vec<_>>>()?;
+    let radius = radii.iter().sum::<f32>() / radii.len() as f32;
+    if radius <= 1e-5
+        || radii
+            .iter()
+            .any(|value| (*value - radius).abs() > (radius * 0.035).max(0.002))
+    {
+        return None;
+    }
+    Some(CircularLoop {
+        center,
+        normal,
+        u,
+        v,
+        radius,
+        vertices: points.to_vec(),
+    })
+}
+
+fn circular_loop_snap_points(
+    circle: &CircularLoop,
+    cursor_on_plane: Option<Vec3>,
+) -> Vec<ObjectSnapCandidate> {
+    let mut candidates = vec![ObjectSnapCandidate {
+        kind: ObjectSnapKind::Center,
+        position: circle.center,
+    }];
+    for direction in [circle.u, -circle.u, circle.v, -circle.v] {
+        candidates.push(ObjectSnapCandidate {
+            kind: ObjectSnapKind::Quadrant,
+            position: circle.center + direction * circle.radius,
+        });
+    }
+    if let Some(cursor_point) = cursor_on_plane {
+        let relative = cursor_point - circle.center;
+        let distance_squared = relative.dot(circle.u).powi(2) + relative.dot(circle.v).powi(2);
+        if distance_squared > circle.radius * circle.radius + 1e-6 {
+            let base_angle = relative.dot(circle.v).atan2(relative.dot(circle.u));
+            let offset = (circle.radius / distance_squared.sqrt()).acos();
+            for angle in [base_angle + offset, base_angle - offset] {
+                candidates.push(ObjectSnapCandidate {
+                    kind: ObjectSnapKind::Tangent,
+                    position: circle.center
+                        + circle.radius * (circle.u * angle.cos() + circle.v * angle.sin()),
+                });
+            }
+        }
+    }
+    candidates
+}
+
+fn circular_edge_loops(mesh: &EditableMesh) -> Vec<CircularLoop> {
+    let mut edge_normals: HashMap<(usize, usize), Vec<Vec3>> = HashMap::new();
+    for triangle in mesh.indices.chunks_exact(3) {
+        let [Some(a_vertex), Some(b_vertex), Some(c_vertex)] = [
+            mesh.vertices.get(triangle[0] as usize),
+            mesh.vertices.get(triangle[1] as usize),
+            mesh.vertices.get(triangle[2] as usize),
+        ] else {
+            continue;
+        };
+        let normal = (b_vertex.position - a_vertex.position)
+            .cross(c_vertex.position - a_vertex.position)
+            .normalize_or_zero();
+        for side in 0..3 {
+            let a = triangle[side] as usize;
+            let b = triangle[(side + 1) % 3] as usize;
+            if a < mesh.vertices.len() && b < mesh.vertices.len() && a != b {
+                let edge = if a < b { (a, b) } else { (b, a) };
+                edge_normals.entry(edge).or_default().push(normal);
+            }
+        }
+    }
+    let circular_feature_edges = edge_normals
+        .into_iter()
+        .filter_map(|(edge, normals)| {
+            let is_loop_edge = match normals.as_slice() {
+                [_] => true,
+                [first, second] => first.dot(*second) <= 0.25,
+                _ => false,
+            };
+            is_loop_edge.then_some(edge)
+        })
+        .collect::<Vec<_>>();
+    let mut adjacency = vec![Vec::new(); mesh.vertices.len()];
+    for &(a, b) in &circular_feature_edges {
+        adjacency[a].push(b);
+        adjacency[b].push(a);
+    }
+    let mut visited = HashSet::new();
+    let mut loops = Vec::new();
+    for &(start, next) in &circular_feature_edges {
+        let edge = if start < next {
+            (start, next)
+        } else {
+            (next, start)
+        };
+        if visited.contains(&edge) || adjacency[start].len() != 2 || adjacency[next].len() != 2 {
+            continue;
+        }
+        let mut indices = vec![start];
+        let mut previous = start;
+        let mut current = next;
+        visited.insert(edge);
+        while current != start && indices.len() <= circular_feature_edges.len() {
+            indices.push(current);
+            let Some(&following) = adjacency[current]
+                .iter()
+                .find(|&&candidate| candidate != previous)
+            else {
+                break;
+            };
+            let edge = if current < following {
+                (current, following)
+            } else {
+                (following, current)
+            };
+            if !visited.insert(edge) && following != start {
+                break;
+            }
+            previous = current;
+            current = following;
+        }
+        if current == start {
+            let points = indices
+                .iter()
+                .filter_map(|&index| mesh.vertices.get(index).map(|vertex| vertex.position))
+                .collect::<Vec<_>>();
+            if let Some(circle) = fit_circular_loop(&points) {
+                loops.push(circle);
+            }
+        }
+    }
+    loops
+}
+
+fn projected_segment_intersection(
+    a0: Vec2,
+    a1: Vec2,
+    b0: Vec2,
+    b1: Vec2,
+) -> Option<(f32, f32, Vec2)> {
+    let a = a1 - a0;
+    let b = b1 - b0;
+    let cross = a.perp_dot(b);
+    if cross.abs() <= 1e-5 {
+        return None;
+    }
+    let offset = b0 - a0;
+    let t = offset.perp_dot(b) / cross;
+    let u = offset.perp_dot(a) / cross;
+    (0.01..=0.99)
+        .contains(&t)
+        .then_some(())
+        .filter(|_| (0.01..=0.99).contains(&u))
+        .map(|_| (t, u, a0 + a * t))
+}
+
+fn snap_candidate_is_visible(
+    camera: &Camera3D,
+    mesh: &EditableMesh,
+    position: Vec3,
+    screen: Vec2,
+) -> bool {
+    let Some((origin, direction)) = mouse_ray(camera, screen) else {
+        return false;
+    };
+    let target_distance = (position - origin).dot(direction);
+    if target_distance <= 0.0 {
+        return false;
+    }
+    mesh_ray_hit_point(origin, direction, mesh, None)
+        .is_none_or(|(hit_distance, _, _)| hit_distance + 0.035 >= target_distance)
+}
+
+fn nearest_object_snap(
+    camera: &Camera3D,
+    mouse: Vec2,
+    source_mesh: &EditableMesh,
+    display_mesh: &EditableMesh,
+    state: &CadSceneState,
+    settings: ObjectSnapSettings,
+) -> Option<ObjectSnapCandidate> {
+    let mut candidates = Vec::new();
+    let selected_positions = selected_indices(source_mesh, state)
+        .into_iter()
+        .filter_map(|index| {
+            source_mesh
+                .vertices
+                .get(index)
+                .map(|vertex| model_to_display_point(source_mesh, vertex.position))
+        })
+        .collect::<Vec<_>>();
+    let is_selected = |position: Vec3| {
+        selected_positions
+            .iter()
+            .any(|selected| (*selected - position).length_squared() <= 1e-8)
+    };
+    let edges = unique_mesh_edges(display_mesh);
+    let edge_screens = edges
+        .iter()
+        .filter_map(|&(a, b)| {
+            let a_position = display_mesh.vertices.get(a)?.position;
+            let b_position = display_mesh.vertices.get(b)?.position;
+            let a_screen = project_to_screen(camera, a_position)?;
+            let b_screen = project_to_screen(camera, b_position)?;
+            let near_cursor = point_segment_distance(mouse, a_screen, b_screen) < 24.0;
+            near_cursor.then_some((a, b, a_position, b_position, a_screen, b_screen))
+        })
+        .collect::<Vec<_>>();
+    let mut consider = |kind: ObjectSnapKind, point: Vec3| {
+        if !settings.enabled(kind) {
+            return;
+        }
+        let Some(screen) = project_to_screen(camera, point) else {
+            return;
+        };
+        let distance = mouse.distance(screen);
+        if distance <= 14.0 && snap_candidate_is_visible(camera, display_mesh, point, screen) {
+            candidates.push((distance, object_snap_priority(kind), kind, point));
+        }
+    };
+
+    if settings.endpoint {
+        for vertex in &display_mesh.vertices {
+            if !is_selected(vertex.position) {
+                consider(ObjectSnapKind::Endpoint, vertex.position);
+            }
+        }
+    }
+    if settings.midpoint {
+        for &(_, _, a, b, _, _) in &edge_screens {
+            if !is_selected(a) && !is_selected(b) {
+                consider(ObjectSnapKind::Midpoint, (a + b) * 0.5);
+            }
+        }
+    }
+    if settings.intersection {
+        for first in 0..edge_screens.len() {
+            let (a_index, a_end, a0, a1, a0_screen, a1_screen) = edge_screens[first];
+            for &(b_index, b_end, b0, b1, b0_screen, b1_screen) in &edge_screens[first + 1..] {
+                if [a_index, a_end].contains(&b_index) || [a_index, a_end].contains(&b_end) {
+                    continue;
+                }
+                if [a0, a1].iter().all(|point| is_selected(*point))
+                    || [b0, b1].iter().all(|point| is_selected(*point))
+                {
+                    continue;
+                }
+                let Some((t, u, screen)) =
+                    projected_segment_intersection(a0_screen, a1_screen, b0_screen, b1_screen)
+                else {
+                    continue;
+                };
+                let first_position = a0.lerp(a1, t);
+                let second_position = b0.lerp(b1, u);
+                if first_position.distance(second_position) <= 0.035 {
+                    consider(
+                        ObjectSnapKind::Intersection,
+                        (first_position + second_position) * 0.5,
+                    );
+                } else {
+                    let Some((origin, direction)) = mouse_ray(camera, screen) else {
+                        continue;
+                    };
+                    let first_depth = (first_position - origin).dot(direction);
+                    let second_depth = (second_position - origin).dot(direction);
+                    if (first_depth - second_depth).abs() <= 0.035 {
+                        consider(
+                            ObjectSnapKind::Intersection,
+                            (first_position + second_position) * 0.5,
+                        );
+                    }
+                }
+            }
+        }
+    }
+    if settings.perpendicular {
+        for &(_, _, a, b, a_screen, b_screen) in &edge_screens {
+            if is_selected(a) && is_selected(b) {
+                continue;
+            }
+            let segment = b_screen - a_screen;
+            if segment.length_squared() <= 1e-6 {
+                continue;
+            }
+            let t = ((mouse - a_screen).dot(segment) / segment.length_squared()).clamp(0.0, 1.0);
+            if point_segment_distance(mouse, a_screen, b_screen) <= 14.0 {
+                consider(ObjectSnapKind::Perpendicular, a.lerp(b, t));
+            }
+        }
+    }
+
+    let circles = circular_edge_loops(display_mesh);
+    for circle in circles {
+        if circle.vertices.iter().all(|point| is_selected(*point)) {
+            continue;
+        }
+        let cursor_on_plane = mouse_ray(camera, mouse).and_then(|(origin, direction)| {
+            ray_plane_hit(origin, direction, circle.center, circle.normal)
+        });
+        for candidate in circular_loop_snap_points(&circle, cursor_on_plane) {
+            consider(candidate.kind, candidate.position);
+        }
+    }
+
+    candidates.sort_by(|a, b| {
+        a.0.total_cmp(&b.0)
+            .then_with(|| a.1.cmp(&b.1))
+            .then_with(|| a.2.cmp(&b.2))
+    });
+    candidates
+        .first()
+        .map(|(_, _, kind, display_position)| ObjectSnapCandidate {
+            kind: *kind,
+            position: display_to_model_point(source_mesh, *display_position),
+        })
+}
+
 fn pick_edge(camera: &Camera3D, mouse: Vec2, mesh: &EditableMesh) -> Option<(usize, usize)> {
     let mut closest: Option<(f32, (usize, usize))> = None;
     let mut visited = HashSet::new();
@@ -1143,27 +1621,29 @@ fn draw_view_controls(
             ctx.font_sm,
             ctx.colors_rt.text_secondary,
         );
-        let snap_rect = grid_snap_rect(panel);
-        let vertex_snap_button = vertex_snap_rect(panel);
+        let snap_rect = object_snap_rect(panel);
+        let polar_rect = polar_tracking_rect(panel);
+        let grid_rect = grid_snap_rect(panel);
         let spacing_minus = grid_spacing_minus_rect(panel);
         let spacing_plus = grid_spacing_plus_rect(panel);
         let preview_rect = interaction_preview_rect(panel);
+        let _ = button(ctx, snap_rect, "Object Snaps...");
         let _ = button(
             ctx,
-            snap_rect,
-            if state.grid_snap {
-                "Grid: On"
+            polar_rect,
+            if state.polar_tracking {
+                "Polar: On (15 deg)"
             } else {
-                "Grid: Off"
+                "Polar: Off (15 deg)"
             },
         );
         let _ = button(
             ctx,
-            vertex_snap_button,
-            if state.vertex_snap {
-                "Vertex: On"
+            grid_rect,
+            if state.grid_snap {
+                "Grid Snap: On"
             } else {
-                "Vertex: Off"
+                "Grid Snap: Off"
             },
         );
         let _ = button(
@@ -1215,31 +1695,56 @@ fn draw_view_controls(
 }
 
 fn grid_snap_rect(panel: Rect) -> Rect {
-    Rect::new(panel.x + 12.0, panel.y + 166.0, 78.0, 27.0)
-}
-
-fn vertex_snap_rect(panel: Rect) -> Rect {
-    Rect::new(panel.x + 96.0, panel.y + 166.0, panel.w - 108.0, 27.0)
-}
-
-fn grid_spacing_minus_rect(panel: Rect) -> Rect {
-    Rect::new(panel.x + 12.0, panel.y + 196.0, panel.w - 56.0, 27.0)
-}
-
-fn grid_spacing_plus_rect(panel: Rect) -> Rect {
-    Rect::new(panel.x + panel.w - 38.0, panel.y + 196.0, 26.0, 27.0)
-}
-
-fn interaction_preview_rect(panel: Rect) -> Rect {
     Rect::new(panel.x + 12.0, panel.y + 226.0, panel.w - 24.0, 27.0)
 }
 
+fn object_snap_rect(panel: Rect) -> Rect {
+    Rect::new(panel.x + 12.0, panel.y + 166.0, panel.w - 24.0, 27.0)
+}
+
+fn polar_tracking_rect(panel: Rect) -> Rect {
+    Rect::new(panel.x + 12.0, panel.y + 196.0, panel.w - 24.0, 27.0)
+}
+
+fn grid_spacing_minus_rect(panel: Rect) -> Rect {
+    Rect::new(panel.x + 12.0, panel.y + 256.0, panel.w - 56.0, 27.0)
+}
+
+fn grid_spacing_plus_rect(panel: Rect) -> Rect {
+    Rect::new(panel.x + panel.w - 38.0, panel.y + 256.0, 26.0, 27.0)
+}
+
+fn interaction_preview_rect(panel: Rect) -> Rect {
+    Rect::new(panel.x + 12.0, panel.y + 286.0, panel.w - 24.0, 27.0)
+}
+
 fn preview_shuffle_rect(panel: Rect) -> Rect {
-    Rect::new(panel.x + 12.0, panel.y + 256.0, panel.w - 24.0, 27.0)
+    Rect::new(panel.x + 12.0, panel.y + 316.0, panel.w - 24.0, 27.0)
 }
 
 fn radial_center_rect(panel: Rect) -> Rect {
-    Rect::new(panel.x + 12.0, panel.y + 286.0, panel.w - 24.0, 27.0)
+    Rect::new(panel.x + 12.0, panel.y + 346.0, panel.w - 24.0, 27.0)
+}
+
+fn object_snap_panel_rect(panel: Rect) -> Rect {
+    Rect::new(
+        (panel.x - 232.0).max(SIDEBAR_WIDTH + 8.0),
+        panel.y + 165.0,
+        220.0,
+        166.0,
+    )
+}
+
+fn object_snap_button_rect(panel: Rect, index: usize) -> Rect {
+    let popup = object_snap_panel_rect(panel);
+    let column = index % 2;
+    let row = index / 2;
+    Rect::new(
+        popup.x + 8.0 + column as f32 * 104.0,
+        popup.y + 28.0 + row as f32 * 31.0,
+        98.0,
+        27.0,
+    )
 }
 
 fn placement_panel_rect(viewport: Rect) -> Rect {
@@ -1464,6 +1969,7 @@ fn close_editor(state: &mut CadSceneState) {
     state.gizmo_drag = None;
     state.gizmo_preview = None;
     state.gizmo_snap_target = None;
+    state.gizmo_polar_angle = None;
     state.numeric_transform_open = false;
     state.numeric_transform_focused = false;
     state.numeric_transform_selected = false;
@@ -1494,6 +2000,7 @@ fn switch_to_object(state: &mut CadSceneState, id: ObjectId) {
     state.gizmo_drag = None;
     state.gizmo_preview = None;
     state.gizmo_snap_target = None;
+    state.gizmo_polar_angle = None;
     state.numeric_transform_open = false;
     state.numeric_transform_focused = false;
     state.numeric_transform_selected = false;
@@ -1623,6 +2130,7 @@ fn commit_transform_command(
         state.gizmo_preview = None;
         state.gizmo_drag = None;
         state.gizmo_snap_target = None;
+        state.gizmo_polar_angle = None;
         return Ok(());
     }
     let snapshot = capture_snapshot(catalog, state)?;
@@ -1635,6 +2143,7 @@ fn commit_transform_command(
     state.gizmo_preview = None;
     state.gizmo_drag = None;
     state.gizmo_snap_target = None;
+    state.gizmo_polar_angle = None;
     Ok(())
 }
 
@@ -2659,6 +3168,58 @@ fn draw_numeric_transform_panel(
         state.error = None;
     }
 }
+
+fn draw_object_snap_panel(ctx: &FrameContext, panel: Rect, state: &mut CadSceneState) {
+    if !state.snap_settings_open {
+        return;
+    }
+    let popup = object_snap_panel_rect(panel);
+    draw_rectangle(popup.x, popup.y, popup.w, popup.h, ctx.colors_rt.panel_bg);
+    draw_rectangle_lines(
+        popup.x,
+        popup.y,
+        popup.w,
+        popup.h,
+        1.0,
+        ctx.colors_rt.panel_border,
+    );
+    draw_text(
+        "Object snap modes",
+        popup.x + 8.0,
+        popup.y + 19.0,
+        ctx.font_sm,
+        ctx.colors_rt.text_primary,
+    );
+    for (index, (kind, label)) in [
+        (ObjectSnapKind::Endpoint, "End"),
+        (ObjectSnapKind::Midpoint, "Mid"),
+        (ObjectSnapKind::Center, "Center"),
+        (ObjectSnapKind::Intersection, "Intersect"),
+        (ObjectSnapKind::Quadrant, "Quad"),
+        (ObjectSnapKind::Perpendicular, "Perp"),
+        (ObjectSnapKind::Tangent, "Tangent"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let rect = object_snap_button_rect(panel, index);
+        let enabled = state.object_snaps.enabled(kind);
+        if button(ctx, rect, label) {
+            state.object_snaps.set(kind, !enabled);
+        }
+        if enabled {
+            draw_rectangle_lines(
+                rect.x,
+                rect.y,
+                rect.w,
+                rect.h,
+                2.0,
+                Color::from_rgba(27, 119, 105, 255),
+            );
+        }
+    }
+}
+
 fn undo_or_redo(catalog: &mut ObjectCatalog, state: &mut CadSceneState, is_undo: bool) {
     let result = if is_undo {
         undo(catalog, state)
@@ -2695,7 +3256,7 @@ pub fn run(
         screen_width() - 205.0,
         18.0,
         190.0,
-        if state.editing { 350.0 } else { 155.0 },
+        if state.editing { 390.0 } else { 155.0 },
     );
     if is_key_pressed(KeyCode::Escape) {
         if state.exit_confirmation_open {
@@ -2713,6 +3274,7 @@ pub fn run(
             state.gizmo_drag = None;
             state.gizmo_preview = None;
             state.gizmo_snap_target = None;
+            state.gizmo_polar_angle = None;
             state.error = None;
         } else if state.primitive_placement.is_some() {
             state.primitive_placement = None;
@@ -2874,27 +3436,30 @@ pub fn run(
             .is_some_and(|placement| placement.center.is_some())
             && placement_panel_rect(viewport).contains(ctx.mouse);
     if !modal_open && !rename_dialog_open && state.editing {
+        if button(ctx, object_snap_rect(view_panel), "Object Snaps...") {
+            state.snap_settings_open = !state.snap_settings_open;
+        }
+        if button(
+            ctx,
+            polar_tracking_rect(view_panel),
+            if state.polar_tracking {
+                "Polar: On (15 deg)"
+            } else {
+                "Polar: Off (15 deg)"
+            },
+        ) {
+            state.polar_tracking = !state.polar_tracking;
+        }
         if button(
             ctx,
             grid_snap_rect(view_panel),
             if state.grid_snap {
-                "Snap: On"
+                "Grid Snap: On"
             } else {
-                "Snap: Off"
+                "Grid Snap: Off"
             },
         ) {
             state.grid_snap = !state.grid_snap;
-        }
-        if button(
-            ctx,
-            vertex_snap_rect(view_panel),
-            if state.vertex_snap {
-                "Vertex: On"
-            } else {
-                "Vertex: Off"
-            },
-        ) {
-            state.vertex_snap = !state.vertex_snap;
         }
         if button(
             ctx,
@@ -3369,6 +3934,10 @@ pub fn run(
         && Rect::new(SIDEBAR_WIDTH, action_y - 4.0, screen_width(), 40.0).contains(ctx.mouse);
     ui_capturing |=
         state.numeric_transform_open && numeric_transform_panel_rect().contains(ctx.mouse);
+    ui_capturing |=
+        state.snap_settings_open && object_snap_panel_rect(view_panel).contains(ctx.mouse);
+    ui_capturing |=
+        state.snap_settings_open && object_snap_panel_rect(view_panel).contains(ctx.mouse);
     if state.numeric_transform_open
         && is_mouse_button_pressed(MouseButton::Left)
         && !numeric_transform_panel_rect().contains(ctx.mouse)
@@ -3418,6 +3987,7 @@ pub fn run(
             let update = update_gizmo_drag(&camera, ctx.mouse, mesh, state, drag);
             state.gizmo_preview = update.map(|update| update.command);
             state.gizmo_snap_target = update.and_then(|update| update.snap_target);
+            state.gizmo_polar_angle = update.and_then(|update| update.polar_angle);
         }
         if is_mouse_button_released(MouseButton::Left) {
             if let Some(command) = state.gizmo_preview {
@@ -3427,12 +3997,14 @@ pub fn run(
                         state.gizmo_drag = None;
                         state.gizmo_preview = None;
                         state.gizmo_snap_target = None;
+                        state.gizmo_polar_angle = None;
                         state.error = Some(error);
                     }
                 }
             } else {
                 state.gizmo_drag = None;
                 state.gizmo_snap_target = None;
+                state.gizmo_polar_angle = None;
             }
         }
     }
@@ -3530,9 +4102,10 @@ pub fn run(
                     }
                 }
                 if let Some(source_mesh) = current_mesh.as_ref()
-                    && let Some((mut center, handle_size)) =
+                    && let Some((start_center, handle_size)) =
                         gizmo_center_and_size(source_mesh, state)
                 {
+                    let mut center = start_center;
                     if let Some(command) = state.gizmo_preview {
                         let indices = selected_indices(source_mesh, state);
                         if let Ok(pivot) = selected_bounds_center(source_mesh, &indices) {
@@ -3544,13 +4117,36 @@ pub fn run(
                     }
                     draw_transform_gizmo(center, state.transform_mode, handle_size);
                     if let Some(target) = state.gizmo_snap_target {
-                        let snap_point = model_to_display_point(source_mesh, target);
-                        draw_line_3d(center, snap_point, Color::from_rgba(255, 220, 75, 220));
+                        let snap_point = model_to_display_point(source_mesh, target.position);
+                        draw_line_3d(
+                            start_center,
+                            snap_point,
+                            Color::from_rgba(255, 220, 75, 220),
+                        );
                         draw_sphere(
                             snap_point,
                             handle_size * 0.075,
                             None,
                             Color::from_rgba(255, 220, 75, 255),
+                        );
+                    }
+                    if state.gizmo_polar_angle.is_some() {
+                        let pivot_model = selected_bounds_center(
+                            source_mesh,
+                            &selected_indices(source_mesh, state),
+                        )
+                        .unwrap_or(Vec3::ZERO);
+                        draw_line_3d(
+                            start_center,
+                            model_to_display_point(
+                                source_mesh,
+                                pivot_model
+                                    + state
+                                        .gizmo_preview
+                                        .map(|command| command.values)
+                                        .unwrap_or(Vec3::ZERO),
+                            ),
+                            Color::from_rgba(255, 220, 75, 220),
                         );
                     }
                 }
@@ -3576,6 +4172,23 @@ pub fn run(
             }
         }
         set_default_camera();
+    }
+    if let Some(target) = state.gizmo_snap_target {
+        draw_text(
+            &format!("{:?}", target.kind),
+            ctx.mouse.x + 12.0,
+            ctx.mouse.y - 10.0,
+            ctx.font_sm,
+            Color::from_rgba(255, 220, 75, 255),
+        );
+    } else if let Some(angle) = state.gizmo_polar_angle {
+        draw_text(
+            &format!("{angle:.0} deg"),
+            ctx.mouse.x + 12.0,
+            ctx.mouse.y + 16.0,
+            ctx.font_sm,
+            Color::from_rgba(255, 220, 75, 255),
+        );
     }
 
     if viewport_active
@@ -3681,6 +4294,7 @@ pub fn run(
                 state.gizmo_drag = Some(drag);
                 state.gizmo_preview = None;
                 state.gizmo_snap_target = None;
+                state.gizmo_polar_angle = None;
                 state.error = None;
             } else {
                 let extend = is_key_down(KeyCode::LeftShift) || is_key_down(KeyCode::RightShift);
@@ -3932,9 +4546,10 @@ pub fn run(
         metadata.is_some_and(|metadata| metadata.radial_main_group_id().is_some()),
         metadata.and_then(|metadata| metadata.radial_pivot),
     );
+    draw_object_snap_panel(ctx, view_panel, state);
     if state.editing {
         draw_text(
-            "Drag handles; Move center is free and snaps to vertices. Value opens exact XYZ input.",
+            "Drag handles; Object snaps, 15 deg polar and grid snap guide Move. Value is optional.",
             SIDEBAR_WIDTH + 12.0,
             action_y + 50.0,
             ctx.font_sm,
@@ -4291,6 +4906,184 @@ mod tests {
             Some(Vec3::ZERO)
         );
         assert_eq!(construction_plane_hit(vec3(0.0, 2.0, 0.0), Vec3::X), None);
+    }
+
+    #[test]
+    fn object_snap_modes_are_independent_and_enabled_by_default() {
+        let mut settings = ObjectSnapSettings::default();
+        for kind in [
+            ObjectSnapKind::Center,
+            ObjectSnapKind::Tangent,
+            ObjectSnapKind::Quadrant,
+            ObjectSnapKind::Intersection,
+            ObjectSnapKind::Endpoint,
+            ObjectSnapKind::Midpoint,
+            ObjectSnapKind::Perpendicular,
+        ] {
+            assert!(settings.enabled(kind));
+        }
+
+        settings.set(ObjectSnapKind::Endpoint, false);
+        assert!(!settings.enabled(ObjectSnapKind::Endpoint));
+        assert!(settings.enabled(ObjectSnapKind::Midpoint));
+        assert!(settings.enabled(ObjectSnapKind::Center));
+    }
+
+    #[test]
+    fn polar_tracking_uses_nearest_fifteen_degree_direction() {
+        let (tracked, angle) = polar_track_delta(vec3(1.0, 0.0, 1.0), Vec3::X, Vec3::Z, 15.0);
+        assert!((angle - 45.0).abs() < 1e-4);
+        assert!((tracked - vec3(1.0, 0.0, 1.0)).length() < 1e-4);
+
+        let (_, angle) = polar_track_delta(vec3(1.0, 0.0, 0.4), Vec3::X, Vec3::Z, 15.0);
+        assert!((angle - 15.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn grid_snapping_respects_transform_axis_constraints() {
+        assert_eq!(
+            snap_transform_to_grid(
+                vec3(0.2, 0.4, 0.3),
+                vec3(0.5, 0.0, 0.4),
+                TransformAxis::All,
+                1.0
+            ),
+            vec3(1.0, 0.4, 1.0)
+        );
+        let x_snapped = snap_transform_to_grid(
+            vec3(0.2, 0.4, 0.3),
+            vec3(0.5, 0.0, 0.4),
+            TransformAxis::X,
+            1.0,
+        );
+        assert!((x_snapped - vec3(1.0, 0.4, 0.7)).length() < 1e-5);
+    }
+
+    #[test]
+    fn recognized_circular_loops_fit_and_non_circular_loops_are_rejected() {
+        let points = (0..12)
+            .map(|step| {
+                let angle = std::f32::consts::TAU * step as f32 / 12.0;
+                vec3(angle.cos() * 2.0, 0.0, angle.sin() * 2.0)
+            })
+            .collect::<Vec<_>>();
+        let circle = fit_circular_loop(&points).unwrap();
+        assert!(circle.center.length() < 1e-5);
+        assert!((circle.radius - 2.0).abs() < 1e-5);
+        let snap_points = circular_loop_snap_points(&circle, Some(vec3(4.0, 0.0, 0.0)));
+        assert_eq!(
+            snap_points
+                .iter()
+                .filter(|candidate| candidate.kind == ObjectSnapKind::Tangent)
+                .count(),
+            2
+        );
+        assert_eq!(
+            snap_points
+                .iter()
+                .filter(|candidate| candidate.kind == ObjectSnapKind::Quadrant)
+                .count(),
+            4
+        );
+        assert_eq!(
+            snap_points
+                .iter()
+                .find(|candidate| candidate.kind == ObjectSnapKind::Center)
+                .unwrap()
+                .position,
+            circle.center
+        );
+        assert!(
+            fit_circular_loop(&[
+                vec3(-1.0, 0.0, -1.0),
+                vec3(1.0, 0.0, -1.0),
+                vec3(1.0, 0.0, 1.0),
+                vec3(-1.0, 0.0, 1.0),
+            ])
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn circular_snap_detection_requires_a_closed_mesh_edge_loop() {
+        let mut vertices = vec![Vertex::new2(Vec3::ZERO, Vec2::ZERO, WHITE)];
+        for step in 0..8 {
+            let angle = std::f32::consts::TAU * step as f32 / 8.0;
+            vertices.push(Vertex::new2(
+                vec3(angle.cos(), 0.0, angle.sin()),
+                Vec2::ZERO,
+                WHITE,
+            ));
+        }
+        let mut indices = Vec::new();
+        for step in 0..8 {
+            indices.extend_from_slice(&[0, (step + 1) as u32, ((step + 1) % 8 + 1) as u32]);
+        }
+        let mesh = EditableMesh { vertices, indices };
+        assert_eq!(circular_edge_loops(&mesh).len(), 1);
+        let triangle = EditableMesh {
+            vertices: vec![
+                Vertex::new2(Vec3::ZERO, Vec2::ZERO, WHITE),
+                Vertex::new2(Vec3::X, Vec2::ZERO, WHITE),
+                Vertex::new2(Vec3::Y, Vec2::ZERO, WHITE),
+            ],
+            indices: vec![0, 1, 2],
+        };
+        assert!(circular_edge_loops(&triangle).is_empty());
+    }
+
+    #[test]
+    fn circular_snap_detection_recognizes_capped_cylinder_rims() {
+        let segments = 8;
+        let mut vertices = Vec::new();
+        for y in [1.0, -1.0] {
+            for step in 0..segments {
+                let angle = std::f32::consts::TAU * step as f32 / segments as f32;
+                vertices.push(Vertex::new2(
+                    vec3(angle.cos(), y, angle.sin()),
+                    Vec2::ZERO,
+                    WHITE,
+                ));
+            }
+        }
+        vertices.push(Vertex::new2(Vec3::Y, Vec2::ZERO, WHITE));
+        vertices.push(Vertex::new2(-Vec3::Y, Vec2::ZERO, WHITE));
+        let mut indices = Vec::new();
+        for step in 0..segments {
+            let next = (step + 1) % segments;
+            let top = step as u32;
+            let top_next = next as u32;
+            let bottom = (step + segments) as u32;
+            let bottom_next = (next + segments) as u32;
+            indices.extend_from_slice(&[top, bottom, bottom_next, top, bottom_next, top_next]);
+            indices.extend_from_slice(&[16, top_next, top, 17, bottom, bottom_next]);
+        }
+        let mesh = EditableMesh { vertices, indices };
+        let circles = circular_edge_loops(&mesh);
+        assert_eq!(circles.len(), 2);
+        assert!(
+            circles
+                .iter()
+                .all(|circle| (circle.radius - 1.0).abs() < 1e-5)
+        );
+    }
+
+    #[test]
+    fn projected_intersection_snap_ignores_parallel_and_endpoint_contacts() {
+        let crossing = projected_segment_intersection(
+            vec2(-1.0, 0.0),
+            vec2(1.0, 0.0),
+            vec2(0.0, -1.0),
+            vec2(0.0, 1.0),
+        )
+        .unwrap();
+        assert!((crossing.0 - 0.5).abs() < 1e-5);
+        assert!((crossing.1 - 0.5).abs() < 1e-5);
+        assert_eq!(crossing.2, Vec2::ZERO);
+        assert!(
+            projected_segment_intersection(Vec2::ZERO, Vec2::X, vec2(0.0, 1.0), vec2(1.0, 1.0))
+                .is_none()
+        );
         assert_eq!(
             dimensions_from_click(MeshPrimitive::Sphere, Vec3::ZERO, Vec3::X),
             vec3(2.0, 2.0, 2.0)

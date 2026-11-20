@@ -13,10 +13,17 @@ the last saved version.
   colored axis handles around the selection; the white center handle moves freely.
   Rotation uses colored rings, and scaling uses the cube handles. Release to
   commit one undoable edit; press `Escape` during a drag to cancel it.
-- **Vertex Snap** is on by default for free Move drags. It snaps the selection
-  center to visible unselected vertices and highlights the snap target. Toggle it
-  in the view panel to move freely. Grid snap and spacing control primitive
-  placement.
+- **Object Snaps...** opens independent toggles for center, tangent, quadrant,
+  intersection, endpoint, midpoint, and perpendicular targets. They are enabled
+  by default and apply to free Move drags. Targets must be visible; the active
+  snap type is shown by the cursor. Center, tangent, and quadrant targets are
+  offered only for recognized circular edge loops.
+- **Polar** constrains free Move drags to the nearest 15-degree direction.
+  It is off by default.
+  **Grid Snap** rounds the moved selection center to the configured X/Z grid
+  spacing. Object snaps take priority over grid and polar tracking; grid applies
+  when no object target is active and takes priority over polar tracking.
+  Grid snapping is off by default and also controls primitive placement.
 - **Value** opens a small, non-blocking XYZ input for exact translations,
   rotations in degrees, or scale factors. Press `Enter` or **Apply** to commit;
   close the input or press `Escape` to dismiss it.

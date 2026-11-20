@@ -97,6 +97,7 @@ pub struct CadSceneState {
     grid_snap: bool,
     grid_spacing: f32,
     interaction_preview: bool,
+    placing_radial_center: bool,
     preview_seed: u64,
     preview_neighbors: [RadialNeighborState; 6],
     original_mesh: Option<EditableMesh>,
@@ -134,6 +135,7 @@ impl Default for CadSceneState {
             grid_snap: false,
             grid_spacing: 0.5,
             interaction_preview: false,
+            placing_radial_center: false,
             preview_seed: 1,
             preview_neighbors: [RadialNeighborState::Empty; 6],
             original_mesh: None,
@@ -186,7 +188,20 @@ fn mesh_center_and_scale(mesh: &EditableMesh) -> (Vec3, f32) {
 }
 
 fn preview_mesh(mesh: &EditableMesh) -> EditableMesh {
-    let (center, scale) = mesh_center_and_scale(mesh);
+    preview_mesh_with_reference(mesh, mesh)
+}
+
+fn preview_mesh_with_reference(mesh: &EditableMesh, reference: &EditableMesh) -> EditableMesh {
+    preview_mesh_with_reference_at(mesh, reference, None)
+}
+
+fn preview_mesh_with_reference_at(
+    mesh: &EditableMesh,
+    reference: &EditableMesh,
+    anchor: Option<Vec3>,
+) -> EditableMesh {
+    let (reference_center, scale) = mesh_center_and_scale(reference);
+    let center = anchor.unwrap_or(reference_center);
     mesh.transformed(|position| (position - center) * scale)
 }
 
@@ -215,6 +230,33 @@ fn snap_model_point(point: Vec3, spacing: f32) -> Vec3 {
         point.y,
         (point.z / spacing).round() * spacing,
     )
+}
+
+fn snap_model_point_to_triangular_grid(point: Vec3, center: Vec3, spacing: f32) -> Vec3 {
+    let spacing = spacing.max(0.001);
+    let relative = point - center;
+    let root_three = 3.0_f32.sqrt();
+    let axial_q = relative.x / spacing - relative.z / (root_three * spacing);
+    let axial_r = 2.0 * relative.z / (root_three * spacing);
+    let q_center = axial_q.round() as i32;
+    let r_center = axial_r.round() as i32;
+    let mut closest = Vec3::ZERO;
+    let mut closest_distance = f32::INFINITY;
+    for q in q_center - 1..=q_center + 1 {
+        for r in r_center - 1..=r_center + 1 {
+            let candidate = vec3(
+                (q as f32 + r as f32 * 0.5) * spacing,
+                relative.y,
+                r as f32 * root_three * 0.5 * spacing,
+            );
+            let distance = (candidate.x - relative.x).powi(2) + (candidate.z - relative.z).powi(2);
+            if distance < closest_distance {
+                closest = candidate;
+                closest_distance = distance;
+            }
+        }
+    }
+    center + closest
 }
 
 fn primitive_dimension_count(primitive: MeshPrimitive) -> usize {
@@ -465,7 +507,13 @@ fn pick_edge(camera: &Camera3D, mouse: Vec2, mesh: &EditableMesh) -> Option<(usi
     closest.map(|(_, edge)| edge)
 }
 
-fn draw_view_controls(ctx: &FrameContext, state: &CadSceneState, panel: Rect) {
+fn draw_view_controls(
+    ctx: &FrameContext,
+    state: &CadSceneState,
+    panel: Rect,
+    has_radial_group: bool,
+    radial_pivot: Option<[f32; 3]>,
+) {
     draw_rectangle(panel.x, panel.y, panel.w, panel.h, ctx.colors_rt.panel_bg);
     draw_rectangle_lines(
         panel.x,
@@ -587,6 +635,16 @@ fn draw_view_controls(ctx: &FrameContext, state: &CadSceneState, panel: Rect) {
                 ctx.colors_rt.text_secondary,
             );
         }
+        if has_radial_group {
+            let label = if state.placing_radial_center {
+                "Cancel UCS placement"
+            } else if radial_pivot.is_some() {
+                "Move UCS origin"
+            } else {
+                "Place UCS origin"
+            };
+            let _ = button(ctx, radial_center_rect(panel), label);
+        }
     }
 }
 
@@ -608,6 +666,10 @@ fn interaction_preview_rect(panel: Rect) -> Rect {
 
 fn preview_shuffle_rect(panel: Rect) -> Rect {
     Rect::new(panel.x + 12.0, panel.y + 256.0, panel.w - 24.0, 27.0)
+}
+
+fn radial_center_rect(panel: Rect) -> Rect {
+    Rect::new(panel.x + 12.0, panel.y + 286.0, panel.w - 24.0, 27.0)
 }
 
 fn placement_panel_rect(viewport: Rect) -> Rect {
@@ -834,6 +896,7 @@ fn close_editor(state: &mut CadSceneState) {
     state.knife_start = None;
     state.primitive_placement = None;
     state.interaction_preview = false;
+    state.placing_radial_center = false;
     state.face_scroll = 0;
     state.undo_stack.clear();
     state.redo_stack.clear();
@@ -857,6 +920,7 @@ fn switch_to_object(state: &mut CadSceneState, id: ObjectId) {
     state.knife_start = None;
     state.primitive_placement = None;
     state.interaction_preview = false;
+    state.placing_radial_center = false;
     state.undo_stack.clear();
     state.redo_stack.clear();
     state.face_scroll = 0;
@@ -1237,14 +1301,15 @@ fn random_preview_neighbors(metadata: &FaceMetadata, seed: u64) -> [RadialNeighb
     })
 }
 
-fn rotate_mesh_y(mesh: &EditableMesh, angle: f32) -> EditableMesh {
+fn rotate_mesh_y_about(mesh: &EditableMesh, angle: f32, pivot: Vec3) -> EditableMesh {
     let (sin, cos) = angle.sin_cos();
     mesh.transformed(|point| {
+        let relative = point - pivot;
         vec3(
-            point.x * cos - point.z * sin,
-            point.y,
-            point.x * sin + point.z * cos,
-        )
+            relative.x * cos - relative.z * sin,
+            relative.y,
+            relative.x * sin + relative.z * cos,
+        ) + pivot
     })
 }
 
@@ -1257,13 +1322,18 @@ fn interaction_preview_mesh(
     let Some(metadata) = selected_metadata(catalog, state) else {
         return Ok(base_mesh.clone());
     };
-    compose_conditioned_preview(base_mesh, metadata, &state.preview_neighbors)
+    let pivot = metadata
+        .radial_pivot
+        .map(|[x, y, z]| vec3(x, y, z))
+        .unwrap_or(Vec3::ZERO);
+    compose_conditioned_preview(base_mesh, metadata, &state.preview_neighbors, pivot)
 }
 
 fn compose_conditioned_preview(
     base_mesh: &EditableMesh,
     metadata: &FaceMetadata,
     neighbors: &[RadialNeighborState; 6],
+    pivot: Vec3,
 ) -> Result<EditableMesh, String> {
     if metadata.radial_main_group_id().is_none() {
         return Ok(base_mesh.clone());
@@ -1276,12 +1346,34 @@ fn compose_conditioned_preview(
         let sector_mesh = metadata
             .radial_sector_mesh(base_mesh, condition)?
             .ok_or_else(|| "Configured radial group could not be previewed".to_string())?;
-        composite.append(&rotate_mesh_y(
+        composite.append(&rotate_mesh_y_about(
             &sector_mesh,
             std::f32::consts::TAU * sector as f32 / 6.0,
+            pivot,
         ))?;
     }
     Ok(composite)
+}
+
+fn route_neighbor_preview_mesh(
+    route_mesh: &EditableMesh,
+    metadata: &FaceMetadata,
+    neighbor_index: usize,
+) -> Result<Option<EditableMesh>, String> {
+    let Some(sector_mesh) = metadata.radial_sector_mesh(route_mesh, RadialNeighborState::Route)?
+    else {
+        return Ok(None);
+    };
+    let pivot = metadata
+        .radial_pivot
+        .map(|[x, y, z]| vec3(x, y, z))
+        .unwrap_or(Vec3::ZERO);
+    let sector = (neighbor_index + 3) % 6;
+    Ok(Some(rotate_mesh_y_about(
+        &sector_mesh,
+        std::f32::consts::TAU * sector as f32 / 6.0,
+        pivot,
+    )))
 }
 
 fn preview_neighbor_object(
@@ -1294,7 +1386,7 @@ fn preview_neighbor_object(
         .entries()
         .iter()
         .filter(|entry| {
-            entry.definition.category != ObjectCategory::Units
+            entry.definition.category == ObjectCategory::Buildings
                 && entry.definition.id != selected
                 && entry.definition.id != ObjectId::PlanetRoute
                 && entry.mesh.is_some()
@@ -1329,8 +1421,14 @@ fn draw_hex_outline(center: Vec3, radius: f32, color: Color) {
     }
 }
 
-fn draw_preview_object(mesh: &EditableMesh, center: Vec3, scale: f32) -> Result<(), String> {
-    let normalized = preview_mesh(mesh);
+fn draw_preview_object(
+    mesh: &EditableMesh,
+    reference: &EditableMesh,
+    anchor: Option<Vec3>,
+    center: Vec3,
+    scale: f32,
+) -> Result<(), String> {
+    let normalized = preview_mesh_with_reference_at(mesh, reference, anchor);
     let min_y = normalized
         .vertices
         .iter()
@@ -1340,6 +1438,59 @@ fn draw_preview_object(mesh: &EditableMesh, center: Vec3, scale: f32) -> Result<
     normalized
         .transformed(|position| position * scale + center + vec3(0.0, -min_y * scale + 0.02, 0.0))
         .render()
+}
+
+fn draw_triangular_grid(center: Vec3, model_scale: f32, spacing: f32) {
+    let color = Color::from_rgba(150, 175, 190, 75);
+    for (start, end) in triangular_grid_segments(center, spacing * model_scale, 4.0) {
+        draw_line_3d(start, end, color);
+    }
+}
+
+fn triangular_grid_segments(center: Vec3, spacing: f32, side_length: f32) -> Vec<(Vec3, Vec3)> {
+    let spacing = spacing.max(0.001);
+    let steps = (side_length.max(spacing) / spacing).ceil().clamp(1.0, 60.0) as usize;
+    let x_axis = Vec3::X;
+    let z_axis = vec3(0.5, 0.0, 3.0_f32.sqrt() * 0.5);
+    let mut segments = Vec::with_capacity(steps * 3);
+
+    for step in 0..=steps {
+        let distance = step as f32 * spacing;
+        let remaining = (steps - step) as f32 * spacing;
+        let x_offset = x_axis * distance;
+        let z_offset = z_axis * distance;
+        let diagonal_start = center + x_offset;
+        let diagonal_end = center + z_offset;
+
+        if remaining > 0.0 {
+            segments.push((center + x_offset, center + x_offset + z_axis * remaining));
+            segments.push((center + z_offset, center + z_offset + x_axis * remaining));
+        }
+        if step > 0 {
+            segments.push((diagonal_start, diagonal_end));
+        }
+    }
+
+    segments
+}
+
+fn draw_ucs_icon(origin: Vec3, length: f32) {
+    draw_line_3d(
+        origin,
+        origin + Vec3::X * length,
+        Color::from_rgba(240, 65, 65, 255),
+    );
+    draw_line_3d(
+        origin,
+        origin + Vec3::Y * length,
+        Color::from_rgba(80, 225, 100, 255),
+    );
+    draw_line_3d(
+        origin,
+        origin + vec3(0.5, 0.0, 3.0_f32.sqrt() * 0.5) * length,
+        Color::from_rgba(80, 145, 255, 255),
+    );
+    draw_sphere(origin, 0.035, None, WHITE);
 }
 
 fn preview_camera(state: &CadSceneState) -> Camera3D {
@@ -1363,7 +1514,18 @@ fn draw_interaction_preview(catalog: &ObjectCatalog, state: &CadSceneState) -> R
         }
 
         let center_mesh = interaction_preview_mesh(catalog, state)?;
-        draw_preview_object(&center_mesh, origin, 0.28)?;
+        let reference_mesh = selected_mesh(catalog, state)
+            .ok_or_else(|| "Selected object is unavailable".to_string())?;
+        let metadata = selected_metadata(catalog, state);
+        let radial_anchor = metadata
+            .filter(|metadata| metadata.radial_main_group_id().is_some())
+            .map(|metadata| {
+                metadata
+                    .radial_pivot
+                    .map(|[x, y, z]| vec3(x, y, z))
+                    .unwrap_or(Vec3::ZERO)
+            });
+        draw_preview_object(&center_mesh, reference_mesh, radial_anchor, origin, 0.28)?;
         for (index, condition) in state.preview_neighbors.iter().copied().enumerate() {
             let object_id = match condition {
                 RadialNeighborState::Empty => None,
@@ -1375,7 +1537,38 @@ fn draw_interaction_preview(catalog: &ObjectCatalog, state: &CadSceneState) -> R
             let Some(mesh) = object_id.and_then(|id| catalog.get(id)) else {
                 continue;
             };
-            draw_preview_object(mesh, hex_cell_center(index, CELL_RADIUS, origin), 0.24)?;
+            if condition == RadialNeighborState::Route {
+                if let Some(metadata) = catalog.metadata(ObjectId::PlanetRoute, None)
+                    && metadata.radial_main_group_id().is_some()
+                {
+                    let Some(neighbor_mesh) = route_neighbor_preview_mesh(mesh, metadata, index)?
+                    else {
+                        continue;
+                    };
+                    if neighbor_mesh.vertices.is_empty() {
+                        continue;
+                    }
+                    let pivot = metadata
+                        .radial_pivot
+                        .map(|[x, y, z]| vec3(x, y, z))
+                        .unwrap_or(Vec3::ZERO);
+                    draw_preview_object(
+                        &neighbor_mesh,
+                        mesh,
+                        Some(pivot),
+                        hex_cell_center(index, CELL_RADIUS, origin),
+                        0.24,
+                    )?;
+                    continue;
+                }
+            }
+            draw_preview_object(
+                mesh,
+                mesh,
+                None,
+                hex_cell_center(index, CELL_RADIUS, origin),
+                0.24,
+            )?;
         }
         Ok(())
     })();
@@ -1504,6 +1697,29 @@ fn delete_selected(catalog: &mut ObjectCatalog, state: &mut CadSceneState) -> Re
     state.selected_faces.clear();
     state.selected_group = None;
     state.selected_vertices.clear();
+    push_undo(state, snapshot);
+    state.dirty = true;
+    Ok(())
+}
+
+fn set_radial_center(
+    catalog: &mut ObjectCatalog,
+    state: &mut CadSceneState,
+    center: Vec3,
+) -> Result<(), String> {
+    let metadata = selected_metadata(catalog, state)
+        .ok_or_else(|| "Selected face metadata is unavailable".to_string())?;
+    if metadata.radial_main_group_id().is_none() {
+        return Err("Create a Radial Repeat group before setting its center".to_string());
+    }
+    let center = [center.x, center.y, center.z];
+    if metadata.radial_pivot == Some(center) {
+        return Ok(());
+    }
+    let snapshot = capture_snapshot(catalog, state)?;
+    selected_metadata_mut(catalog, state)
+        .ok_or_else(|| "Selected face metadata is unavailable".to_string())?
+        .radial_pivot = Some(center);
     push_undo(state, snapshot);
     state.dirty = true;
     Ok(())
@@ -1695,6 +1911,15 @@ fn draw_group_config_dialog(
         state.group_config_dialog = None;
         state.error = None;
     }
+    if state.placing_radial_center {
+        draw_text(
+            "Click the grid to place the UCS origin; Esc cancels.",
+            SIDEBAR_WIDTH + 12.0,
+            screen_height() - 18.0,
+            ctx.font_sm,
+            ctx.colors_rt.text_primary,
+        );
+    }
     if let Some(error) = &state.error {
         draw_text(
             error,
@@ -1742,19 +1967,14 @@ pub fn run(
         screen_width() - 205.0,
         18.0,
         190.0,
-        if state.editing {
-            if state.interaction_preview {
-                318.0
-            } else {
-                288.0
-            }
-        } else {
-            155.0
-        },
+        if state.editing { 350.0 } else { 155.0 },
     );
     if is_key_pressed(KeyCode::Escape) {
         if state.primitive_placement.is_some() {
             state.primitive_placement = None;
+            state.error = None;
+        } else if state.placing_radial_center {
+            state.placing_radial_center = false;
             state.error = None;
         } else if state.knife_active {
             state.knife_active = false;
@@ -1918,6 +2138,22 @@ pub fn run(
             && button(ctx, preview_shuffle_rect(view_panel), "Shuffle neighbors")
         {
             shuffle_preview_neighbors(state, catalog);
+        }
+        let radial_metadata = selected_metadata(catalog, state)
+            .filter(|metadata| metadata.radial_main_group_id().is_some());
+        let radial_pivot = radial_metadata.and_then(|metadata| metadata.radial_pivot);
+        let radial_center_label = if state.placing_radial_center {
+            "Cancel UCS placement"
+        } else if radial_pivot.is_some() {
+            "Move UCS origin"
+        } else {
+            "Place UCS origin"
+        };
+        if radial_metadata.is_some()
+            && button(ctx, radial_center_rect(view_panel), radial_center_label)
+        {
+            state.placing_radial_center = !state.placing_radial_center;
+            state.error = None;
         }
         if state.grid_spacing != 0.5 {
             state.grid_spacing = (state.grid_spacing * 100.0).round() / 100.0;
@@ -2407,7 +2643,20 @@ pub fn run(
             && let Some(mesh) = current_mesh.as_ref()
         {
             let (model_center, scale) = mesh_center_and_scale(mesh);
-            draw_square_grid(model_center, scale, state.grid_spacing);
+            let metadata = selected_metadata(catalog, state);
+            if let Some(metadata) = metadata
+                && metadata.radial_main_group_id().is_some()
+            {
+                let pivot = metadata
+                    .radial_pivot
+                    .map(|[x, y, z]| vec3(x, y, z))
+                    .unwrap_or(Vec3::ZERO);
+                let center = (pivot - model_center) * scale;
+                draw_triangular_grid(center, scale, state.grid_spacing);
+                draw_ucs_icon(center, 0.32);
+            } else {
+                draw_square_grid(model_center, scale, state.grid_spacing);
+            }
         }
         if let Some(mesh) = preview.as_ref() {
             if let Err(error) = mesh.render() {
@@ -2423,6 +2672,18 @@ pub fn run(
                             Color::from_rgba(255, 235, 60, 255),
                         );
                     }
+                }
+                if let Some(mesh) = current_mesh.as_ref()
+                    && let Some([x, y, z]) =
+                        selected_metadata(catalog, state).and_then(|metadata| metadata.radial_pivot)
+                {
+                    let (center, scale) = mesh_center_and_scale(mesh);
+                    draw_sphere(
+                        (vec3(x, y, z) - center) * scale,
+                        0.06,
+                        None,
+                        Color::from_rgba(70, 235, 120, 255),
+                    );
                 }
                 for &(a, b) in &state.selected_edges {
                     if let (Some(a), Some(b)) = (mesh.vertices.get(a), mesh.vertices.get(b)) {
@@ -2488,14 +2749,45 @@ pub fn run(
         if let (Some((origin, direction)), Some(mesh)) =
             (mouse_ray(&camera, ctx.mouse), preview.as_ref())
         {
-            if let Some(placement) = state.primitive_placement.clone() {
+            if state.placing_radial_center {
+                if let Some(display_point) = construction_plane_hit(origin, direction) {
+                    let model_point = display_to_model_point(
+                        current_mesh.as_ref().unwrap_or(mesh),
+                        display_point,
+                    );
+                    match set_radial_center(catalog, state, model_point) {
+                        Ok(()) => {
+                            state.placing_radial_center = false;
+                            state.error = None;
+                        }
+                        Err(error) => state.error = Some(error),
+                    }
+                } else {
+                    state.error = Some("The click did not intersect the construction plane".into());
+                }
+            } else if let Some(placement) = state.primitive_placement.clone() {
                 if let Some(display_point) = construction_plane_hit(origin, direction) {
                     let mut model_point = display_to_model_point(
                         current_mesh.as_ref().unwrap_or(mesh),
                         display_point,
                     );
                     if state.grid_snap {
-                        model_point = snap_model_point(model_point, state.grid_spacing);
+                        let metadata = selected_metadata(catalog, state);
+                        if let Some(metadata) = metadata
+                            && metadata.radial_main_group_id().is_some()
+                        {
+                            let center = metadata
+                                .radial_pivot
+                                .map(|[x, y, z]| vec3(x, y, z))
+                                .unwrap_or(Vec3::ZERO);
+                            model_point = snap_model_point_to_triangular_grid(
+                                model_point,
+                                center,
+                                state.grid_spacing,
+                            );
+                        } else {
+                            model_point = snap_model_point(model_point, state.grid_spacing);
+                        }
                     }
                     if let Some(center) = placement.center {
                         let dimensions =
@@ -2780,7 +3072,14 @@ pub fn run(
             Color::from_rgba(255, 110, 110, 255),
         );
     }
-    draw_view_controls(ctx, state, view_panel);
+    let metadata = selected_metadata(catalog, state);
+    draw_view_controls(
+        ctx,
+        state,
+        view_panel,
+        metadata.is_some_and(|metadata| metadata.radial_main_group_id().is_some()),
+        metadata.and_then(|metadata| metadata.radial_pivot),
+    );
     if let Some(error) = &state.error {
         draw_text(
             error,
@@ -3137,6 +3436,51 @@ mod tests {
     }
 
     #[test]
+    fn triangular_grid_snapping_is_centered_on_the_radial_pivot() {
+        let center = vec3(2.0, 4.0, -3.0);
+        let snapped = snap_model_point_to_triangular_grid(vec3(2.74, 5.0, -2.2), center, 1.0);
+
+        assert!((snapped - vec3(2.5, 5.0, -3.0 + 3.0_f32.sqrt() * 0.5)).length() < 1e-5);
+    }
+
+    #[test]
+    fn radial_ucs_and_grid_are_limited_to_a_sixty_degree_wedge() {
+        let origin = vec3(2.0, 1.0, -4.0);
+        let x_axis = Vec3::X;
+        let z_axis = vec3(0.5, 0.0, 3.0_f32.sqrt() * 0.5);
+        assert!((x_axis.dot(z_axis) - 0.5).abs() < 1e-6);
+
+        let segments = triangular_grid_segments(origin, 1.0, 4.0);
+        assert_eq!(segments.len(), 12);
+        for (start, end) in segments {
+            for point in [start, end] {
+                let relative = point - origin;
+                let r = 2.0 * relative.z / 3.0_f32.sqrt();
+                let q = relative.x - r * 0.5;
+                assert!(q >= -1e-5);
+                assert!(r >= -1e-5);
+                assert!(q + r <= 4.0 + 1e-5);
+            }
+        }
+    }
+
+    #[test]
+    fn radial_rotation_uses_the_ucs_origin_as_its_pivot() {
+        let mesh = EditableMesh {
+            vertices: vec![
+                Vertex::new2(Vec3::X, Vec2::ZERO, WHITE),
+                Vertex::new2(vec3(2.0, 0.0, 0.0), Vec2::ZERO, WHITE),
+            ],
+            indices: vec![],
+        };
+
+        let rotated = rotate_mesh_y_about(&mesh, std::f32::consts::FRAC_PI_2, Vec3::X);
+
+        assert!((rotated.vertices[0].position - Vec3::X).length() < 1e-5);
+        assert!((rotated.vertices[1].position - vec3(1.0, 0.0, 1.0)).length() < 1e-5);
+    }
+
+    #[test]
     fn interaction_preview_randomizes_only_configured_neighbor_conditions() {
         let mut metadata = FaceMetadata::for_face_count(3);
         let main = metadata.create_group(&[0]).unwrap();
@@ -3168,6 +3512,58 @@ mod tests {
                     ))
             );
         }
+    }
+
+    #[test]
+    fn interaction_preview_neighbor_buildings_exclude_machine_blocks() {
+        let catalog = ObjectCatalog::load();
+        let selected = ObjectId::PlanetBase;
+        for neighbor_index in 0..6 {
+            let neighbor = preview_neighbor_object(&catalog, selected, 1, neighbor_index)
+                .expect("catalog should contain another building");
+            let entry = catalog
+                .entries()
+                .iter()
+                .find(|entry| entry.definition.id == neighbor)
+                .unwrap();
+            assert_eq!(entry.definition.category, ObjectCategory::Buildings);
+        }
+    }
+
+    #[test]
+    fn interaction_preview_center_scale_uses_all_configured_geometry_bounds() {
+        let color = Color::from_rgba(255, 255, 255, 255);
+        let reference = EditableMesh {
+            vertices: vec![
+                Vertex::new2(vec3(-1.0, 0.0, -1.0), Vec2::ZERO, color),
+                Vertex::new2(vec3(1.0, 0.0, -1.0), Vec2::ZERO, color),
+                Vertex::new2(vec3(0.0, 1.0, 1.0), Vec2::ZERO, color),
+            ],
+            indices: vec![0, 1, 2],
+        };
+        let small_variant = reference.clone();
+        let mut large_variant = reference.clone();
+        large_variant
+            .append(&EditableMesh {
+                vertices: vec![
+                    Vertex::new2(vec3(8.0, 0.0, 0.0), Vec2::ZERO, color),
+                    Vertex::new2(vec3(9.0, 0.0, 0.0), Vec2::ZERO, color),
+                    Vertex::new2(vec3(8.0, 1.0, 0.0), Vec2::ZERO, color),
+                ],
+                indices: vec![0, 1, 2],
+            })
+            .unwrap();
+
+        let small_preview = preview_mesh_with_reference(&small_variant, &reference);
+        let large_preview = preview_mesh_with_reference(&large_variant, &reference);
+        assert_eq!(
+            small_preview.vertices[0].position,
+            large_preview.vertices[0].position
+        );
+        assert_eq!(
+            small_preview.vertices[1].position,
+            large_preview.vertices[1].position
+        );
     }
 
     #[test]
@@ -3267,9 +3663,51 @@ mod tests {
                 RadialNeighborState::Route,
                 RadialNeighborState::OtherBuilding,
             ],
+            Vec3::ZERO,
         )
         .unwrap();
         assert_eq!(preview.face_count(), 10);
+    }
+
+    #[test]
+    fn route_neighbor_preview_faces_back_toward_the_selected_cell() {
+        let color = Color::from_rgba(255, 255, 255, 255);
+        let mesh = EditableMesh {
+            vertices: vec![
+                Vertex::new2(-Vec3::X, Vec2::ZERO, color),
+                Vertex::new2(Vec3::X, Vec2::ZERO, color),
+                Vertex::new2(Vec3::ZERO, Vec2::ZERO, color),
+                Vertex::new2(Vec3::ZERO, Vec2::ZERO, color),
+                Vertex::new2(Vec3::X, Vec2::ZERO, color),
+                Vertex::new2(vec3(0.5, 0.0, 3.0_f32.sqrt() * 0.5), Vec2::ZERO, color),
+            ],
+            indices: vec![0, 1, 2, 3, 4, 5],
+        };
+        let mut metadata = FaceMetadata::for_face_count(2);
+        let main = metadata.create_group(&[0]).unwrap();
+        metadata
+            .set_group_program(main, FaceGroupProgram::RadialRepeat)
+            .unwrap();
+        let route = metadata.create_group_under(&[1], Some(main)).unwrap();
+        metadata
+            .set_group_program(
+                route,
+                FaceGroupProgram::IfNeighbor(RadialNeighborState::Route),
+            )
+            .unwrap();
+
+        let preview = route_neighbor_preview_mesh(&mesh, &metadata, 0)
+            .unwrap()
+            .unwrap();
+        let centroid = preview
+            .vertices
+            .iter()
+            .map(|vertex| vertex.position)
+            .sum::<Vec3>()
+            / preview.vertices.len() as f32;
+        let expected = 7.0 * std::f32::consts::PI / 6.0;
+
+        assert!((centroid.normalize() - vec3(expected.cos(), 0.0, expected.sin())).length() < 1e-5);
     }
 
     #[test]

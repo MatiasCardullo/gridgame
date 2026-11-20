@@ -906,6 +906,8 @@ impl EditableMesh {
 pub struct FaceMetadata {
     pub face_names: Vec<Option<String>>,
     pub groups: Vec<FaceGroup>,
+    #[serde(default)]
+    pub radial_pivot: Option<[f32; 3]>,
     next_group_id: u64,
 }
 
@@ -936,6 +938,7 @@ impl FaceMetadata {
         Self {
             face_names: vec![None; face_count],
             groups: Vec::new(),
+            radial_pivot: None,
             next_group_id: 1,
         }
     }
@@ -2249,7 +2252,7 @@ mod tests {
     }
 
     #[test]
-    fn removing_faces_compacts_vertices_and_remaps_metadata() {
+    fn removing_faces_compacts_vertices_and_remaps_face_metadata() {
         let vertex =
             |position| Vertex::new2(position, Vec2::ZERO, Color::from_rgba(80, 120, 160, 255));
         let mut mesh = EditableMesh {
@@ -2265,11 +2268,13 @@ mod tests {
         metadata.face_names[0] = Some("front".to_string());
         metadata.face_names[1] = Some("side".to_string());
         let group = metadata.create_group(&[0, 1]).unwrap();
+        metadata.radial_pivot = Some([2.0, 3.0, 4.0]);
 
         let remap = mesh.remove_faces(&[0]).unwrap();
         metadata.remap_after_face_removal(&remap);
 
         assert_eq!(remap, vec![None, Some(0)]);
+        assert_eq!(metadata.radial_pivot, Some([2.0, 3.0, 4.0]));
         assert_eq!(mesh.vertices.len(), 3);
         assert_eq!(mesh.indices, vec![0, 1, 2]);
         assert_eq!(metadata.face_names, vec![Some("side".to_string())]);
@@ -2600,6 +2605,7 @@ mod tests {
         let mut metadata = FaceMetadata::for_face_count(3);
         metadata.rename_face(1, "door".to_string()).unwrap();
         metadata.create_group(&[0, 2]).unwrap();
+        metadata.radial_pivot = Some([1.0, 2.0, 3.0]);
 
         save_face_metadata(&mesh_path, &metadata).unwrap();
         let (loaded, error) = load_face_metadata(&mesh_path, 3);
@@ -2607,6 +2613,7 @@ mod tests {
         assert!(error.is_none());
         assert_eq!(loaded.face_names, metadata.face_names);
         assert_eq!(loaded.groups, metadata.groups);
+        assert_eq!(loaded.radial_pivot, Some([1.0, 2.0, 3.0]));
         assert_eq!(loaded.next_group_id, metadata.next_group_id);
         fs::remove_file(face_metadata_path(&mesh_path)).unwrap();
         fs::remove_dir(directory).unwrap();

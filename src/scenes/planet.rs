@@ -3906,13 +3906,23 @@ fn draw_global_hex_cell(
     Some(best_index)
 }
 
-fn rotate_radial_sector(mesh: &EditableMesh, sector: usize, sides: usize) -> EditableMesh {
+fn rotate_radial_sector(
+    mesh: &EditableMesh,
+    sector: usize,
+    sides: usize,
+    pivot: Vec3,
+) -> EditableMesh {
     let angle = std::f32::consts::TAU * sector as f32 / sides as f32;
     mesh.transformed(|point| {
-        let x = point.x * angle.cos() - point.z * angle.sin();
-        let z = point.x * angle.sin() + point.z * angle.cos();
-        vec3(x, point.y, z)
+        let relative = point - pivot;
+        let x = relative.x * angle.cos() - relative.z * angle.sin();
+        let z = relative.x * angle.sin() + relative.z * angle.cos();
+        vec3(x, relative.y, z) + pivot
     })
+}
+
+fn radial_sector_start_angle(first_neighbor_angle: f32, sides: usize) -> f32 {
+    first_neighbor_angle - std::f32::consts::PI / sides as f32
 }
 
 fn draw_sim_buildings(
@@ -4022,7 +4032,10 @@ fn draw_sim_buildings(
                 );
                 (
                     key,
-                    neighbors.first().map(|(angle, _)| *angle).unwrap_or(0.0),
+                    neighbors
+                        .first()
+                        .map(|(angle, _)| radial_sector_start_angle(*angle, sides))
+                        .unwrap_or(0.0),
                     neighbors
                         .into_iter()
                         .map(|(_, state)| state)
@@ -4055,6 +4068,10 @@ fn draw_sim_buildings(
                 .and_then(|(_, _, neighbors)| {
                     let metadata = assets.metadata(object_id, None)?;
                     let base_mesh = assets.get(object_id)?;
+                    let pivot = metadata
+                        .radial_pivot
+                        .map(|[x, y, z]| vec3(x, y, z))
+                        .unwrap_or(Vec3::ZERO);
                     let mut composite = EditableMesh {
                         vertices: Vec::new(),
                         indices: Vec::new(),
@@ -4068,7 +4085,8 @@ fn draw_sim_buildings(
                                 return None;
                             }
                         };
-                        let sector_mesh = rotate_radial_sector(&sector_mesh, sector_index, sides);
+                        let sector_mesh =
+                            rotate_radial_sector(&sector_mesh, sector_index, sides, pivot);
                         if let Err(error) = composite.append(&sector_mesh) {
                             eprintln!("GridGame could not compose route sector: {error}");
                             return None;
@@ -6635,8 +6653,8 @@ mod tests {
             vertices: vec![Vertex::new2(Vec3::X, Vec2::ZERO, WHITE)],
             indices: Vec::new(),
         };
-        let pentagon_sector = rotate_radial_sector(&mesh, 1, 5);
-        let hexagon_sector = rotate_radial_sector(&mesh, 3, 6);
+        let pentagon_sector = rotate_radial_sector(&mesh, 1, 5, Vec3::ZERO);
+        let hexagon_sector = rotate_radial_sector(&mesh, 3, 6, Vec3::ZERO);
 
         assert!(
             (pentagon_sector.vertices[0].position.x - (std::f32::consts::TAU / 5.0).cos()).abs()
@@ -6648,6 +6666,28 @@ mod tests {
         );
         assert!((hexagon_sector.vertices[0].position.x + 1.0).abs() < 1e-6);
         assert!(hexagon_sector.vertices[0].position.z.abs() < 1e-6);
+    }
+
+    #[test]
+    fn radial_sector_rotation_uses_the_configured_pivot() {
+        let pivot = vec3(2.0, 3.0, 4.0);
+        let mesh = EditableMesh {
+            vertices: vec![Vertex::new2(pivot, Vec2::ZERO, WHITE)],
+            indices: Vec::new(),
+        };
+
+        let rotated = rotate_radial_sector(&mesh, 1, 6, pivot);
+
+        assert!((rotated.vertices[0].position - pivot).length() < 1e-6);
+    }
+
+    #[test]
+    fn radial_sector_alignment_centers_the_first_wedge_on_its_neighbor() {
+        let neighbor_angle = 0.73;
+        let sector_center_angle =
+            radial_sector_start_angle(neighbor_angle, 6) + std::f32::consts::PI / 6.0;
+
+        assert!((sector_center_angle - neighbor_angle).abs() < 1e-6);
     }
 
     fn test_building() -> PlanetBuildingState {

@@ -73,6 +73,7 @@ for endpoints and request examples.
 - Shift-click vertices to add or remove them from the selection.
 - Use the move and scale buttons to edit the selection; select a face and use **Extrude** to add geometry.
 - **Save** writes changes to the selected GLB asset; **Discard** restores its last saved geometry.
+- Radial Repeat groups, UCS origin placement, and editor metadata persistence are described in [docs/cad_editor.md](docs/cad_editor.md).
 
 ## Runtime data
 

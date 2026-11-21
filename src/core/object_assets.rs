@@ -1,8 +1,8 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use macroquad::prelude::{Color, Mesh, Vec2, Vec3, Vertex, draw_mesh, vec3};
+use macroquad::prelude::{Color, Mesh, Quat, Vec2, Vec3, Vertex, draw_mesh, vec3};
 use serde::{Deserialize, Serialize};
 
 use crate::core::MachineBlockType;
@@ -473,88 +473,6 @@ impl EditableMesh {
         Ok(())
     }
 
-    fn clip_triangle(
-        triangle: &[Vertex],
-        plane_point: Vec3,
-        plane_normal: Vec3,
-        keep_positive: bool,
-    ) -> Vec<Vertex> {
-        let signed = |vertex: Vertex| (vertex.position - plane_point).dot(plane_normal);
-        let inside = |distance: f32| {
-            if keep_positive {
-                distance >= -1e-6
-            } else {
-                distance <= 1e-6
-            }
-        };
-        let mut output = Vec::new();
-        for index in 0..triangle.len() {
-            let current = triangle[index];
-            let next = triangle[(index + 1) % triangle.len()];
-            let current_distance = signed(current);
-            let next_distance = signed(next);
-            let current_inside = inside(current_distance);
-            let next_inside = inside(next_distance);
-            if current_inside && next_inside {
-                output.push(next);
-            } else if current_inside && !next_inside {
-                output.push(Self::interpolate_vertex(
-                    current,
-                    next,
-                    current_distance,
-                    next_distance,
-                ));
-            } else if !current_inside && next_inside {
-                output.push(Self::interpolate_vertex(
-                    current,
-                    next,
-                    current_distance,
-                    next_distance,
-                ));
-                output.push(next);
-            }
-        }
-        output.dedup_by(|left, right| (left.position - right.position).length_squared() <= 1e-12);
-        output
-    }
-
-    fn interpolate_vertex(
-        start: Vertex,
-        end: Vertex,
-        start_distance: f32,
-        end_distance: f32,
-    ) -> Vertex {
-        let t = (start_distance / (start_distance - end_distance)).clamp(0.0, 1.0);
-        let color: [u8; 4] = std::array::from_fn(|index| {
-            (start.color[index] as f32 + (end.color[index] as f32 - start.color[index] as f32) * t)
-                .round() as u8
-        });
-        Vertex::new2(
-            start.position.lerp(end.position, t),
-            start.uv.lerp(end.uv, t),
-            Color::from_rgba(color[0], color[1], color[2], color[3]),
-        )
-    }
-
-    fn append_polygon(mesh: &mut EditableMesh, polygon: &[Vertex]) -> Result<(), String> {
-        if polygon.len() < 3 {
-            return Ok(());
-        }
-        let first = u32::try_from(mesh.vertices.len())
-            .map_err(|_| "mesh has too many vertices to edit".to_string())?;
-        mesh.vertices.extend_from_slice(polygon);
-        for corner in 1..polygon.len() - 1 {
-            let b = first
-                .checked_add(corner as u32)
-                .ok_or_else(|| "mesh index overflow".to_string())?;
-            let c = b
-                .checked_add(1)
-                .ok_or_else(|| "mesh index overflow".to_string())?;
-            mesh.indices.extend_from_slice(&[first, b, c]);
-        }
-        Ok(())
-    }
-
     fn sphere_primitive(color: Color) -> EditableMesh {
         const SEGMENTS: usize = 16;
         const RINGS: usize = 8;
@@ -789,71 +707,6 @@ impl EditableMesh {
         Ok(face_remap)
     }
 
-    pub fn cut_faces_by_plane(
-        &mut self,
-        selected_faces: &[usize],
-        plane_point: Vec3,
-        plane_normal: Vec3,
-    ) -> Result<Vec<Vec<usize>>, String> {
-        if self.indices.len() % 3 != 0 {
-            return Err("mesh index count is not divisible by three".to_string());
-        }
-        let normal = plane_normal.normalize_or_zero();
-        if normal.length_squared() <= f32::EPSILON {
-            return Err("cut plane must have a non-zero normal".to_string());
-        }
-        if selected_faces.is_empty() {
-            return Err("select one or more faces before cutting".to_string());
-        }
-        let mut selected = vec![false; self.face_count()];
-        for &face in selected_faces {
-            let Some(slot) = selected.get_mut(face) else {
-                return Err(format!("face {face} is out of range"));
-            };
-            *slot = true;
-        }
-        let mut mesh = Self {
-            vertices: self.vertices.clone(),
-            indices: Vec::with_capacity(self.indices.len()),
-        };
-        let mut face_map = vec![Vec::new(); self.face_count()];
-        let mut split_count = 0;
-        for (face_index, should_cut) in selected.into_iter().enumerate() {
-            let source_indices = &self.indices[face_index * 3..face_index * 3 + 3];
-            let source_vertices = source_indices
-                .iter()
-                .map(|&index| {
-                    self.vertices
-                        .get(index as usize)
-                        .copied()
-                        .ok_or_else(|| format!("mesh index {index} is out of range"))
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            let mut positive = Vec::new();
-            let mut negative = Vec::new();
-            if should_cut {
-                positive = Self::clip_triangle(&source_vertices, plane_point, normal, true);
-                negative = Self::clip_triangle(&source_vertices, plane_point, normal, false);
-            }
-            let is_split = should_cut && positive.len() >= 3 && negative.len() >= 3;
-            let first_face = mesh.indices.len() / 3;
-            if is_split {
-                Self::append_polygon(&mut mesh, &positive)?;
-                Self::append_polygon(&mut mesh, &negative)?;
-                split_count += 1;
-            } else {
-                mesh.indices.extend_from_slice(source_indices);
-            }
-            let new_face_count = mesh.indices.len() / 3 - first_face;
-            face_map[face_index] = (first_face..first_face + new_face_count).collect();
-        }
-        if split_count == 0 {
-            return Err("cut line did not cross any selected face".to_string());
-        }
-        *self = mesh;
-        Ok(face_map)
-    }
-
     pub fn extrude_face(&mut self, face_index: usize, distance: f32) -> Result<(), String> {
         let start = face_index
             .checked_mul(3)
@@ -899,6 +752,1089 @@ impl EditableMesh {
         }
         Ok(())
     }
+
+    pub fn copy_faces_reflected(
+        &mut self,
+        face_indices: &[usize],
+        plane_point: Vec3,
+        plane_normal: Vec3,
+    ) -> Result<Vec<(usize, usize)>, String> {
+        let normal = plane_normal.normalize_or_zero();
+        if !normal.is_finite() || normal.length_squared() <= f32::EPSILON {
+            return Err("mirror plane must have three non-collinear points".to_string());
+        }
+        let selected = validated_face_selection(self, face_indices)?;
+        let mut candidate = self.clone();
+        let mut vertex_map = HashMap::new();
+        let mut copied_faces = Vec::with_capacity(selected.len());
+        for face in selected {
+            let start = face * 3;
+            let source = [
+                self.indices[start],
+                self.indices[start + 1],
+                self.indices[start + 2],
+            ];
+            let mut reflected = [0; 3];
+            for (slot, &source_index) in source.iter().enumerate() {
+                let target_index = if let Some(&mapped) = vertex_map.get(&source_index) {
+                    mapped
+                } else {
+                    let vertex = *self
+                        .vertices
+                        .get(source_index as usize)
+                        .ok_or_else(|| format!("mesh index {source_index} is out of range"))?;
+                    let distance = (vertex.position - plane_point).dot(normal);
+                    let position = vertex.position - normal * (2.0 * distance);
+                    let mapped = u32::try_from(candidate.vertices.len())
+                        .map_err(|_| "mesh has too many vertices to mirror".to_string())?;
+                    candidate.vertices.push(Vertex { position, ..vertex });
+                    vertex_map.insert(source_index, mapped);
+                    mapped
+                };
+                reflected[slot] = target_index;
+            }
+            let new_face = candidate.face_count();
+            candidate
+                .indices
+                .extend_from_slice(&[reflected[0], reflected[2], reflected[1]]);
+            copied_faces.push((face, new_face));
+        }
+        *self = candidate;
+        Ok(copied_faces)
+    }
+
+    pub fn copy_faces_offset(
+        &mut self,
+        face_indices: &[usize],
+        distance: f32,
+    ) -> Result<Vec<(usize, usize)>, String> {
+        if !distance.is_finite() || distance.abs() <= 1e-6 {
+            return Err("offset distance must be finite and non-zero".to_string());
+        }
+        let selected = validated_face_selection(self, face_indices)?;
+        let mut vertex_normals = HashMap::<u32, Vec3>::new();
+        for &face in &selected {
+            let start = face * 3;
+            let indices = [
+                self.indices[start],
+                self.indices[start + 1],
+                self.indices[start + 2],
+            ];
+            let [a, b, c] = indices.map(|index| {
+                self.vertices
+                    .get(index as usize)
+                    .map(|vertex| vertex.position)
+            });
+            let [Some(a), Some(b), Some(c)] = [a, b, c] else {
+                return Err("mesh contains an out-of-range vertex index".to_string());
+            };
+            let normal = (b - a).cross(c - a).normalize_or_zero();
+            if normal.length_squared() <= f32::EPSILON {
+                return Err(format!("cannot offset degenerate face {face}"));
+            }
+            for index in indices {
+                *vertex_normals.entry(index).or_insert(Vec3::ZERO) += normal;
+            }
+        }
+        let normals = vertex_normals
+            .into_iter()
+            .map(|(index, normal)| (index, normal.normalize_or_zero()))
+            .collect::<HashMap<_, _>>();
+        if normals
+            .values()
+            .any(|normal| normal.length_squared() <= f32::EPSILON)
+        {
+            return Err("selected faces have an ambiguous vertex normal".to_string());
+        }
+
+        let mut candidate = self.clone();
+        let mut vertex_map = HashMap::new();
+        let mut copied_faces = Vec::with_capacity(selected.len());
+        for face in selected {
+            let start = face * 3;
+            let source = [
+                self.indices[start],
+                self.indices[start + 1],
+                self.indices[start + 2],
+            ];
+            let mut offset = [0; 3];
+            for (slot, &source_index) in source.iter().enumerate() {
+                let target_index = if let Some(&mapped) = vertex_map.get(&source_index) {
+                    mapped
+                } else {
+                    let vertex = *self
+                        .vertices
+                        .get(source_index as usize)
+                        .ok_or_else(|| format!("mesh index {source_index} is out of range"))?;
+                    let normal = *normals
+                        .get(&source_index)
+                        .ok_or_else(|| "selected vertex normal is unavailable".to_string())?;
+                    let mapped = u32::try_from(candidate.vertices.len())
+                        .map_err(|_| "mesh has too many vertices to offset".to_string())?;
+                    candidate.vertices.push(Vertex {
+                        position: vertex.position + normal * distance,
+                        ..vertex
+                    });
+                    vertex_map.insert(source_index, mapped);
+                    mapped
+                };
+                offset[slot] = target_index;
+            }
+            let new_face = candidate.face_count();
+            candidate.indices.extend_from_slice(&offset);
+            copied_faces.push((face, new_face));
+        }
+        *self = candidate;
+        Ok(copied_faces)
+    }
+
+    pub fn split_faces_by_intersections(
+        &mut self,
+        target_faces: &[usize],
+        cutter_faces: &[usize],
+        multiline: Option<(usize, &[Vec3])>,
+    ) -> Result<Vec<Vec<usize>>, String> {
+        if self.indices.len() % 3 != 0 {
+            return Err("mesh index count is not divisible by three".to_string());
+        }
+        let target_faces = validated_face_selection(self, target_faces)?;
+        let cutter_faces = if cutter_faces.is_empty() {
+            Vec::new()
+        } else {
+            validated_face_selection(self, cutter_faces)?
+        };
+        if target_faces.is_empty() {
+            return Err("select at least one target face".to_string());
+        }
+        if cutter_faces.is_empty() && multiline.is_none() {
+            return Err("select cutter faces or draw a multiline path".to_string());
+        }
+        if let Some((path_face, points)) = multiline
+            && (!target_faces.contains(&path_face) || points.len() < 2)
+        {
+            return Err("the multiline path must cross a selected target face".to_string());
+        }
+
+        let mut candidate = self.clone();
+        candidate.indices.clear();
+        let mut face_map = vec![Vec::new(); self.face_count()];
+        let mut generated_vertices = HashMap::<ClippedVertexKey, u32>::new();
+        let mut split_count = 0;
+        let target_set = target_faces.iter().copied().collect::<HashSet<_>>();
+        for (face, mapped_faces) in face_map.iter_mut().enumerate() {
+            if !target_set.contains(&face) {
+                let start = face * 3;
+                let new_face = candidate.face_count();
+                candidate
+                    .indices
+                    .extend_from_slice(&self.indices[start..start + 3]);
+                mapped_faces.push(new_face);
+                continue;
+            }
+
+            let source = triangle_vertices(self, face)?;
+            let [a, b, c] = source.map(|vertex| vertex.position);
+            let normal = (b - a).cross(c - a).normalize_or_zero();
+            let u_axis = (b - a).normalize_or_zero();
+            let v_axis = normal.cross(u_axis).normalize_or_zero();
+            if normal.length_squared() <= f32::EPSILON
+                || u_axis.length_squared() <= f32::EPSILON
+                || v_axis.length_squared() <= f32::EPSILON
+            {
+                return Err(format!("target face {face} is degenerate"));
+            }
+            let mut polygon = Vec::with_capacity(3);
+            let start = face * 3;
+            for (slot, vertex) in source.into_iter().enumerate() {
+                polygon.push(ClippedVertex {
+                    vertex,
+                    point: project_to_plane_2d(vertex.position, a, u_axis, v_axis),
+                    original_index: Some(self.indices[start + slot]),
+                });
+            }
+
+            let mut lines = Vec::<(Vec2, Vec2)>::new();
+            for &cutter_face in &cutter_faces {
+                let cutter = triangle_vertices(self, cutter_face)?;
+                let cutter_positions = cutter.map(|vertex| vertex.position);
+                if let Some((start, end)) =
+                    triangle_plane_intersection_segment(cutter_positions, a, normal)
+                {
+                    let start_2d = project_to_plane_2d(start, a, u_axis, v_axis);
+                    let end_2d = project_to_plane_2d(end, a, u_axis, v_axis);
+                    if segment_intersects_polygon_2d(start_2d, end_2d, &polygon) {
+                        push_unique_cut_line(&mut lines, start_2d, end_2d - start_2d);
+                    }
+                }
+            }
+
+            let mut polygons = if let Some((path_face, points)) = multiline
+                && path_face == face
+            {
+                split_triangle_by_path(&polygon, points, source, a, normal, u_axis, v_axis)?
+            } else {
+                vec![polygon]
+            };
+            if polygons.len() > 1 {
+                split_count += polygons.len() - 1;
+            }
+            for (line_start, line_direction) in lines {
+                let mut divided = Vec::new();
+                for polygon in polygons {
+                    let has_positive = polygon
+                        .iter()
+                        .any(|vertex| line_side(line_start, line_direction, vertex.point) > 1e-5);
+                    let has_negative = polygon
+                        .iter()
+                        .any(|vertex| line_side(line_start, line_direction, vertex.point) < -1e-5);
+                    if has_positive && has_negative {
+                        split_count += 1;
+                        let positive =
+                            clip_polygon_by_line(&polygon, line_start, line_direction, 1.0);
+                        let negative =
+                            clip_polygon_by_line(&polygon, line_start, line_direction, -1.0);
+                        if polygon_area(&positive).abs() > 1e-10 {
+                            divided.push(positive);
+                        }
+                        if polygon_area(&negative).abs() > 1e-10 {
+                            divided.push(negative);
+                        }
+                    } else {
+                        divided.push(polygon);
+                    }
+                }
+                polygons = divided;
+            }
+
+            for polygon in polygons {
+                for triangle in triangulate_polygon(&polygon)? {
+                    let points = triangle.map(|index| polygon[index]);
+                    let new_face = candidate.face_count();
+                    for point in &points {
+                        let index = if let Some(index) = point.original_index {
+                            index
+                        } else {
+                            let key = ClippedVertexKey::from_vertex(point.vertex);
+                            if let Some(&index) = generated_vertices.get(&key) {
+                                index
+                            } else {
+                                let index = u32::try_from(candidate.vertices.len())
+                                    .map_err(|_| "trim creates too many vertices".to_string())?;
+                                candidate.vertices.push(point.vertex);
+                                generated_vertices.insert(key, index);
+                                index
+                            }
+                        };
+                        candidate.indices.push(index);
+                    }
+                    mapped_faces.push(new_face);
+                }
+            }
+        }
+        if split_count == 0 {
+            return Err("the cutter geometry does not split any selected target face".to_string());
+        }
+        *self = candidate;
+        Ok(face_map)
+    }
+
+    pub fn fillet_edges(
+        &mut self,
+        edges: &[(usize, usize)],
+        radius: f32,
+        segments: usize,
+    ) -> Result<Vec<Vec<usize>>, String> {
+        if !radius.is_finite() || radius <= 1e-5 {
+            return Err("fillet radius must be positive and finite".to_string());
+        }
+        if !(2..=12).contains(&segments) {
+            return Err("fillet requires between 2 and 12 segments".to_string());
+        }
+        if self.indices.len() % 3 != 0 {
+            return Err("mesh index count is not divisible by three".to_string());
+        }
+        if edges.is_empty() {
+            return Err("select at least one mesh edge to fillet".to_string());
+        }
+        let mut edge_faces = HashMap::<(u32, u32), Vec<usize>>::new();
+        for face in 0..self.face_count() {
+            let start = face * 3;
+            let triangle = &self.indices[start..start + 3];
+            for side in 0..3 {
+                let a = triangle[side];
+                let b = triangle[(side + 1) % 3];
+                edge_faces
+                    .entry(if a < b { (a, b) } else { (b, a) })
+                    .or_default()
+                    .push(face);
+            }
+        }
+        let mut selected_edges = edges
+            .iter()
+            .map(|&(a, b)| {
+                let a =
+                    u32::try_from(a).map_err(|_| "selected edge index exceeds u32".to_string())?;
+                let b =
+                    u32::try_from(b).map_err(|_| "selected edge index exceeds u32".to_string())?;
+                if a == b || a as usize >= self.vertices.len() || b as usize >= self.vertices.len()
+                {
+                    return Err("selected edge has invalid vertices".to_string());
+                }
+                Ok(if a < b { (a, b) } else { (b, a) })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        selected_edges.sort_unstable();
+        selected_edges.dedup();
+        if selected_edges.len() != edges.len() {
+            return Err("selected edges contain duplicates".to_string());
+        }
+
+        #[derive(Clone)]
+        struct FilletEdge {
+            face_a: usize,
+            face_b: usize,
+            endpoints: [u32; 2],
+            tangents: [[Vertex; 2]; 2],
+            arcs: Vec<[Vertex; 2]>,
+            centers: [Vec3; 2],
+        }
+
+        let mut fillets = Vec::with_capacity(selected_edges.len());
+        let mut replaced_faces = HashSet::new();
+        let mut used_vertices = HashSet::new();
+        for edge in selected_edges {
+            let adjacent = edge_faces
+                .get(&edge)
+                .ok_or_else(|| "selected edge is not part of the mesh".to_string())?;
+            if adjacent.len() != 2 {
+                return Err("fillet supports only edges shared by exactly two faces".to_string());
+            }
+            let face_a = adjacent[0].min(adjacent[1]);
+            let face_b = adjacent[0].max(adjacent[1]);
+            if !replaced_faces.insert(face_a) || !replaced_faces.insert(face_b) {
+                return Err("fillet selected edges must not share faces".to_string());
+            }
+            if !used_vertices.insert(edge.0) || !used_vertices.insert(edge.1) {
+                return Err("fillet selected edges must not share vertices".to_string());
+            }
+            let a = self.vertices[edge.0 as usize].position;
+            let b = self.vertices[edge.1 as usize].position;
+            let edge_direction = (b - a).normalize_or_zero();
+            if edge_direction.length_squared() <= f32::EPSILON {
+                return Err("cannot fillet a zero-length edge".to_string());
+            }
+            let face_vertices = |face: usize| -> Result<[u32; 3], String> {
+                let start = face * 3;
+                let indices = [
+                    self.indices[start],
+                    self.indices[start + 1],
+                    self.indices[start + 2],
+                ];
+                if !indices.contains(&edge.0) || !indices.contains(&edge.1) {
+                    return Err("edge adjacency is inconsistent".to_string());
+                }
+                Ok(indices)
+            };
+            let indices_a = face_vertices(face_a)?;
+            let indices_b = face_vertices(face_b)?;
+            let opposite_a = *indices_a
+                .iter()
+                .find(|&&index| index != edge.0 && index != edge.1)
+                .ok_or_else(|| "fillet face is degenerate".to_string())?;
+            let opposite_b = *indices_b
+                .iter()
+                .find(|&&index| index != edge.0 && index != edge.1)
+                .ok_or_else(|| "fillet face is degenerate".to_string())?;
+            let opposite_position_a = self.vertices[opposite_a as usize].position;
+            let opposite_position_b = self.vertices[opposite_b as usize].position;
+            let inward_a = ((opposite_position_a - a)
+                - edge_direction * (opposite_position_a - a).dot(edge_direction))
+            .normalize_or_zero();
+            let inward_b = ((opposite_position_b - a)
+                - edge_direction * (opposite_position_b - a).dot(edge_direction))
+            .normalize_or_zero();
+            let angle = inward_a.dot(inward_b).clamp(-1.0, 1.0).acos();
+            if angle <= 1e-3 || angle >= std::f32::consts::PI - 1e-3 {
+                return Err("fillet edge must join two non-coplanar faces".to_string());
+            }
+            let tangent_distance = radius / (angle * 0.5).tan();
+            let height_a = (opposite_position_a - a).cross(edge_direction).length();
+            let height_b = (opposite_position_b - a).cross(edge_direction).length();
+            if tangent_distance >= height_a - 1e-5 || tangent_distance >= height_b - 1e-5 {
+                return Err("fillet radius is too large for the adjacent faces".to_string());
+            }
+            let bisector = (inward_a + inward_b).normalize_or_zero();
+            let center_offset = bisector * (radius / (angle * 0.5).sin());
+            if center_offset.length_squared() <= f32::EPSILON {
+                return Err("fillet radius produces an invalid arc".to_string());
+            }
+            let tangent_a_start = a + inward_a * tangent_distance;
+            let tangent_b_start = a + inward_b * tangent_distance;
+            let radial_start = tangent_a_start - (a + center_offset);
+            let radial_end = tangent_b_start - (a + center_offset);
+            let arc_angle = edge_direction
+                .dot(radial_start.cross(radial_end))
+                .atan2(radial_start.dot(radial_end));
+            let triangle_attributes =
+                |indices: [u32; 3]| indices.map(|index| self.vertices[index as usize]);
+            let source_a = triangle_attributes(indices_a);
+            let source_b = triangle_attributes(indices_b);
+            let tangent_for =
+                |source: [Vertex; 3], position: Vec3| interpolate_triangle_vertex(source, position);
+            let tangents = [
+                [
+                    tangent_for(source_a, tangent_a_start)?,
+                    tangent_for(source_a, b + inward_a * tangent_distance)?,
+                ],
+                [
+                    tangent_for(source_b, tangent_b_start)?,
+                    tangent_for(source_b, b + inward_b * tangent_distance)?,
+                ],
+            ];
+            let mut arcs = Vec::with_capacity(segments + 1);
+            for segment in 0..=segments {
+                let amount = segment as f32 / segments as f32;
+                let rotation = Quat::from_axis_angle(edge_direction, arc_angle * amount);
+                let radial = rotation.mul_vec3(radial_start);
+                let position_a = a + center_offset + radial;
+                let position_b = b + center_offset + radial;
+                let second = if segment == 0 {
+                    tangents[0][1]
+                } else if segment == segments {
+                    tangents[1][1]
+                } else {
+                    interpolate_mesh_vertex(tangents[0][1], tangents[1][1], position_b, amount)
+                };
+                let first = if segment == 0 {
+                    tangents[0][0]
+                } else if segment == segments {
+                    tangents[1][0]
+                } else {
+                    interpolate_mesh_vertex(tangents[0][0], tangents[1][0], position_a, amount)
+                };
+                arcs.push([
+                    Vertex {
+                        position: position_a,
+                        ..first
+                    },
+                    Vertex {
+                        position: position_b,
+                        ..second
+                    },
+                ]);
+            }
+            fillets.push(FilletEdge {
+                face_a,
+                face_b,
+                endpoints: [edge.0, edge.1],
+                tangents,
+                arcs,
+                centers: [a + center_offset, b + center_offset],
+            });
+        }
+
+        let mut candidate = self.clone();
+        let mut replacements = HashMap::<(usize, u32), Vertex>::new();
+        for fillet in &fillets {
+            for (side, face) in [fillet.face_a, fillet.face_b].into_iter().enumerate() {
+                replacements.insert((face, fillet.endpoints[0]), fillet.tangents[side][0]);
+                replacements.insert((face, fillet.endpoints[1]), fillet.tangents[side][1]);
+            }
+        }
+        let mut replacement_indices = HashMap::<(usize, u32), u32>::new();
+        let mut face_map = vec![Vec::new(); self.face_count()];
+        let mut indices = Vec::with_capacity(self.indices.len() + fillets.len() * segments * 6);
+        for (face, mapped_faces) in face_map.iter_mut().enumerate() {
+            let start = face * 3;
+            let old = &self.indices[start..start + 3];
+            let new_face = indices.len() / 3;
+            for &index in old {
+                if let Some(&vertex) = replacements.get(&(face, index)) {
+                    let new_index = u32::try_from(candidate.vertices.len())
+                        .map_err(|_| "fillet creates too many vertices".to_string())?;
+                    candidate.vertices.push(vertex);
+                    replacement_indices.insert((face, index), new_index);
+                    indices.push(new_index);
+                } else {
+                    indices.push(index);
+                }
+            }
+            mapped_faces.push(new_face);
+        }
+        candidate.indices = indices;
+        for fillet in &fillets {
+            let first = *replacement_indices
+                .get(&(fillet.face_a, fillet.endpoints[0]))
+                .ok_or_else(|| "fillet tangent vertex is unavailable".to_string())?;
+            let second = *replacement_indices
+                .get(&(fillet.face_a, fillet.endpoints[1]))
+                .ok_or_else(|| "fillet tangent vertex is unavailable".to_string())?;
+            let last_first = *replacement_indices
+                .get(&(fillet.face_b, fillet.endpoints[0]))
+                .ok_or_else(|| "fillet tangent vertex is unavailable".to_string())?;
+            let last_second = *replacement_indices
+                .get(&(fillet.face_b, fillet.endpoints[1]))
+                .ok_or_else(|| "fillet tangent vertex is unavailable".to_string())?;
+            let mut arc_indices = Vec::with_capacity(fillet.arcs.len());
+            for (step, arc) in fillet.arcs.iter().enumerate() {
+                let row = if step == 0 {
+                    [first, second]
+                } else if step + 1 == fillet.arcs.len() {
+                    [last_first, last_second]
+                } else {
+                    let first_index = u32::try_from(candidate.vertices.len())
+                        .map_err(|_| "fillet creates too many vertices".to_string())?;
+                    candidate.vertices.push(arc[0]);
+                    let second_index = u32::try_from(candidate.vertices.len())
+                        .map_err(|_| "fillet creates too many vertices".to_string())?;
+                    candidate.vertices.push(arc[1]);
+                    [first_index, second_index]
+                };
+                arc_indices.push(row);
+            }
+            for step in 0..segments {
+                let [a0, b0] = arc_indices[step];
+                let [a1, b1] = arc_indices[step + 1];
+                let p00 = candidate.vertices[a0 as usize].position;
+                let p11 = candidate.vertices[b1 as usize].position;
+                let expected =
+                    ((p00 - fillet.centers[0]) + (p11 - fillet.centers[1])).normalize_or_zero();
+                let mut triangles = [[a0, b0, b1], [a0, b1, a1]];
+                for triangle in &mut triangles {
+                    let [a, b, c] =
+                        triangle.map(|index| candidate.vertices[index as usize].position);
+                    if (b - a).cross(c - a).dot(expected) < 0.0 {
+                        triangle.swap(1, 2);
+                    }
+                    let face = candidate.face_count();
+                    candidate.indices.extend_from_slice(triangle);
+                    face_map[fillet.face_a].push(face);
+                }
+            }
+        }
+        *self = candidate;
+        Ok(face_map)
+    }
+}
+
+fn validated_face_selection(
+    mesh: &EditableMesh,
+    face_indices: &[usize],
+) -> Result<Vec<usize>, String> {
+    if mesh.indices.len() % 3 != 0 {
+        return Err("mesh index count is not divisible by three".to_string());
+    }
+    if face_indices.is_empty() {
+        return Err("select at least one face".to_string());
+    }
+    let mut selected = face_indices.to_vec();
+    selected.sort_unstable();
+    selected.dedup();
+    for &face in &selected {
+        let start = face
+            .checked_mul(3)
+            .ok_or_else(|| "face index overflow".to_string())?;
+        if start + 2 >= mesh.indices.len() {
+            return Err(format!("face {face} is out of range"));
+        }
+        for &vertex in &mesh.indices[start..start + 3] {
+            if vertex as usize >= mesh.vertices.len() {
+                return Err(format!("mesh index {vertex} is out of range"));
+            }
+        }
+    }
+    Ok(selected)
+}
+
+#[derive(Clone, Copy)]
+struct ClippedVertex {
+    vertex: Vertex,
+    point: Vec2,
+    original_index: Option<u32>,
+}
+
+fn triangle_vertices(mesh: &EditableMesh, face: usize) -> Result<[Vertex; 3], String> {
+    let start = face * 3;
+    let indices = [
+        *mesh
+            .indices
+            .get(start)
+            .ok_or_else(|| format!("face {face} is out of range"))?,
+        *mesh
+            .indices
+            .get(start + 1)
+            .ok_or_else(|| format!("face {face} is out of range"))?,
+        *mesh
+            .indices
+            .get(start + 2)
+            .ok_or_else(|| format!("face {face} is out of range"))?,
+    ];
+    let [Some(a), Some(b), Some(c)] =
+        indices.map(|index| mesh.vertices.get(index as usize).copied())
+    else {
+        return Err(format!("face {face} contains an out-of-range vertex"));
+    };
+    Ok([a, b, c])
+}
+
+fn triangle_plane_intersection_segment(
+    triangle: [Vec3; 3],
+    plane_point: Vec3,
+    plane_normal: Vec3,
+) -> Option<(Vec3, Vec3)> {
+    const TOLERANCE: f32 = 1e-5;
+    let distances = triangle.map(|point| (point - plane_point).dot(plane_normal));
+    if distances.iter().all(|distance| distance.abs() <= TOLERANCE) {
+        return None;
+    }
+    let mut points = Vec::new();
+    for side in 0..3 {
+        let next = (side + 1) % 3;
+        let start_distance = distances[side];
+        let end_distance = distances[next];
+        if start_distance.abs() <= TOLERANCE {
+            points.push(triangle[side]);
+        }
+        if start_distance * end_distance < 0.0 {
+            let amount = start_distance / (start_distance - end_distance);
+            points.push(triangle[side].lerp(triangle[next], amount));
+        }
+    }
+    if distances[2].abs() <= TOLERANCE {
+        points.push(triangle[2]);
+    }
+    points.dedup_by(|a, b| a.distance_squared(*b) <= TOLERANCE * TOLERANCE);
+    if points.len() < 2 {
+        return None;
+    }
+    let mut farthest = (0, 1, 0.0);
+    for first in 0..points.len() {
+        for second in first + 1..points.len() {
+            let distance = points[first].distance_squared(points[second]);
+            if distance > farthest.2 {
+                farthest = (first, second, distance);
+            }
+        }
+    }
+    (farthest.2 > TOLERANCE * TOLERANCE).then_some((points[farthest.0], points[farthest.1]))
+}
+
+fn push_unique_cut_line(lines: &mut Vec<(Vec2, Vec2)>, start: Vec2, direction: Vec2) {
+    let direction = direction.normalize_or_zero();
+    if direction.length_squared() <= 1e-10 {
+        return;
+    }
+    if lines.iter().any(|&(existing_start, existing_direction)| {
+        existing_direction.perp_dot(direction).abs() <= 1e-4
+            && line_side(existing_start, existing_direction, start).abs() <= 1e-4
+    }) {
+        return;
+    }
+    lines.push((start, direction));
+}
+
+fn segment_intersects_polygon_2d(start: Vec2, end: Vec2, polygon: &[ClippedVertex]) -> bool {
+    if point_in_polygon_2d(start, polygon) || point_in_polygon_2d(end, polygon) {
+        return true;
+    }
+    (0..polygon.len()).any(|index| {
+        segments_intersect_2d(
+            start,
+            end,
+            polygon[index].point,
+            polygon[(index + 1) % polygon.len()].point,
+        )
+    })
+}
+
+fn point_in_polygon_2d(point: Vec2, polygon: &[ClippedVertex]) -> bool {
+    let mut inside = false;
+    for index in 0..polygon.len() {
+        let start = polygon[index].point;
+        let end = polygon[(index + 1) % polygon.len()].point;
+        if point_on_segment_2d(point, start, end, 1e-5).is_some() {
+            return true;
+        }
+        if (start.y > point.y) != (end.y > point.y)
+            && point.x < (end.x - start.x) * (point.y - start.y) / (end.y - start.y) + start.x
+        {
+            inside = !inside;
+        }
+    }
+    inside
+}
+
+fn point_on_segment_2d(point: Vec2, start: Vec2, end: Vec2, tolerance: f32) -> Option<f32> {
+    let direction = end - start;
+    let length_squared = direction.length_squared();
+    if length_squared <= tolerance * tolerance {
+        return (point.distance_squared(start) <= tolerance * tolerance).then_some(0.0);
+    }
+    let amount = (point - start).dot(direction) / length_squared;
+    if !(-tolerance..=1.0 + tolerance).contains(&amount) {
+        return None;
+    }
+    let projected = start + direction * amount.clamp(0.0, 1.0);
+    (point.distance_squared(projected) <= tolerance * tolerance).then_some(amount.clamp(0.0, 1.0))
+}
+
+fn segments_intersect_2d(a: Vec2, b: Vec2, c: Vec2, d: Vec2) -> bool {
+    let first = b - a;
+    let second = d - c;
+    let denominator = first.perp_dot(second);
+    if denominator.abs() <= 1e-8 {
+        return false;
+    }
+    let displacement = c - a;
+    let first_amount = displacement.perp_dot(second) / denominator;
+    let second_amount = displacement.perp_dot(first) / denominator;
+    (-1e-5..=1.0 + 1e-5).contains(&first_amount) && (-1e-5..=1.0 + 1e-5).contains(&second_amount)
+}
+
+fn split_triangle_by_path(
+    triangle: &[ClippedVertex],
+    points: &[Vec3],
+    source: [Vertex; 3],
+    plane_origin: Vec3,
+    plane_normal: Vec3,
+    u_axis: Vec3,
+    v_axis: Vec3,
+) -> Result<Vec<Vec<ClippedVertex>>, String> {
+    if points.len() < 2 {
+        return Err("draw a path with at least two points".to_string());
+    }
+    let path = points
+        .iter()
+        .map(|&position| {
+            if (position - plane_origin).dot(plane_normal).abs() > 1e-4 {
+                return Err("multiline points must lie on the selected target face".to_string());
+            }
+            let point = project_to_plane_2d(position, plane_origin, u_axis, v_axis);
+            if !point_in_polygon_2d(point, triangle) {
+                return Err(
+                    "multiline points must stay inside the selected target face".to_string()
+                );
+            }
+            let vertex = interpolate_triangle_vertex(source, position)?;
+            Ok(ClippedVertex {
+                vertex,
+                point,
+                original_index: None,
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    if path
+        .windows(2)
+        .any(|pair| pair[0].point.distance_squared(pair[1].point) <= 1e-10)
+    {
+        return Err("multiline segments must have non-zero length".to_string());
+    }
+    for first in 0..path.len().saturating_sub(1) {
+        for second in first + 2..path.len().saturating_sub(1) {
+            if segments_intersect_2d(
+                path[first].point,
+                path[first + 1].point,
+                path[second].point,
+                path[second + 1].point,
+            ) {
+                return Err("multiline path must not cross itself".to_string());
+            }
+        }
+    }
+    let start = path[0].point;
+    let end = path[path.len() - 1].point;
+    if start.distance_squared(end) <= 1e-10 {
+        return Err("multiline path endpoints must be different".to_string());
+    }
+    if !(0..triangle.len()).any(|index| {
+        point_on_segment_2d(
+            start,
+            triangle[index].point,
+            triangle[(index + 1) % triangle.len()].point,
+            1e-4,
+        )
+        .is_some()
+    }) || !(0..triangle.len()).any(|index| {
+        point_on_segment_2d(
+            end,
+            triangle[index].point,
+            triangle[(index + 1) % triangle.len()].point,
+            1e-4,
+        )
+        .is_some()
+    }) {
+        return Err("multiline path must start and end on the target face boundary".to_string());
+    }
+
+    let endpoints = [path[0].point, end];
+    let mut boundary = Vec::new();
+    for side in 0..triangle.len() {
+        let next = (side + 1) % triangle.len();
+        boundary.push(triangle[side]);
+        let mut inserts = endpoints
+            .iter()
+            .filter_map(|&point| {
+                let amount =
+                    point_on_segment_2d(point, triangle[side].point, triangle[next].point, 1e-4)?;
+                (amount > 1e-5 && amount < 1.0 - 1e-5).then_some((amount, point))
+            })
+            .collect::<Vec<_>>();
+        inserts.sort_by(|a, b| a.0.total_cmp(&b.0));
+        for (amount, _) in inserts {
+            boundary.push(interpolate_vertex(triangle[side], triangle[next], amount));
+        }
+    }
+    let boundary_index = |point: Vec2| {
+        boundary
+            .iter()
+            .position(|vertex| vertex.point.distance_squared(point) <= 1e-8)
+    };
+    let start_index = boundary_index(start)
+        .ok_or_else(|| "could not place multiline start on target boundary".to_string())?;
+    let end_index = boundary_index(end)
+        .ok_or_else(|| "could not place multiline end on target boundary".to_string())?;
+    let boundary_arc = |from: usize, to: usize| {
+        let mut arc = Vec::new();
+        let mut index = from;
+        loop {
+            arc.push(boundary[index]);
+            if index == to {
+                break;
+            }
+            index = (index + 1) % boundary.len();
+        }
+        arc
+    };
+    let mut first = boundary_arc(start_index, end_index);
+    first.extend(path[1..path.len() - 1].iter().rev().copied());
+    let mut second = boundary_arc(end_index, start_index);
+    second.extend(path[1..path.len() - 1].iter().copied());
+    deduplicate_polygon(&mut first);
+    deduplicate_polygon(&mut second);
+    if polygon_area(&first).abs() <= 1e-10 || polygon_area(&second).abs() <= 1e-10 {
+        return Err("multiline path does not divide the target face".to_string());
+    }
+    Ok(vec![first, second])
+}
+
+fn triangulate_polygon(polygon: &[ClippedVertex]) -> Result<Vec<[usize; 3]>, String> {
+    if polygon.len() < 3 {
+        return Err("cannot triangulate a degenerate split region".to_string());
+    }
+    if polygon.len() == 3 {
+        return Ok(vec![[0, 1, 2]]);
+    }
+    let orientation = polygon_area(polygon).signum();
+    if orientation == 0.0 {
+        return Err("cannot triangulate a zero-area split region".to_string());
+    }
+    let mut remaining = (0..polygon.len()).collect::<Vec<_>>();
+    let mut triangles = Vec::with_capacity(polygon.len() - 2);
+    while remaining.len() > 3 {
+        let ear = (0..remaining.len()).find(|&slot| {
+            let previous = remaining[(slot + remaining.len() - 1) % remaining.len()];
+            let current = remaining[slot];
+            let next = remaining[(slot + 1) % remaining.len()];
+            let a = polygon[previous].point;
+            let b = polygon[current].point;
+            let c = polygon[next].point;
+            if (b - a).perp_dot(c - b) * orientation <= 1e-8 {
+                return false;
+            }
+            !remaining.iter().copied().any(|candidate| {
+                candidate != previous
+                    && candidate != current
+                    && candidate != next
+                    && point_in_triangle_2d(polygon[candidate].point, a, b, c, orientation)
+            })
+        });
+        let Some(slot) = ear else {
+            return Err("could not triangulate the split face safely".to_string());
+        };
+        let previous = remaining[(slot + remaining.len() - 1) % remaining.len()];
+        let current = remaining[slot];
+        let next = remaining[(slot + 1) % remaining.len()];
+        triangles.push([previous, current, next]);
+        remaining.remove(slot);
+    }
+    triangles.push([remaining[0], remaining[1], remaining[2]]);
+    Ok(triangles)
+}
+
+fn point_in_triangle_2d(point: Vec2, a: Vec2, b: Vec2, c: Vec2, orientation: f32) -> bool {
+    (b - a).perp_dot(point - a) * orientation >= -1e-7
+        && (c - b).perp_dot(point - b) * orientation >= -1e-7
+        && (a - c).perp_dot(point - c) * orientation >= -1e-7
+}
+
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+struct ClippedVertexKey {
+    position: [i64; 3],
+    uv: [i64; 2],
+    color: [u8; 4],
+}
+
+impl ClippedVertexKey {
+    fn from_vertex(vertex: Vertex) -> Self {
+        let quantize = |value: f32| (value * 1_000_000.0).round() as i64;
+        Self {
+            position: [
+                quantize(vertex.position.x),
+                quantize(vertex.position.y),
+                quantize(vertex.position.z),
+            ],
+            uv: [quantize(vertex.uv.x), quantize(vertex.uv.y)],
+            color: vertex.color,
+        }
+    }
+}
+
+fn project_to_plane_2d(point: Vec3, origin: Vec3, u_axis: Vec3, v_axis: Vec3) -> Vec2 {
+    let relative = point - origin;
+    Vec2::new(relative.dot(u_axis), relative.dot(v_axis))
+}
+
+fn line_side(start: Vec2, direction: Vec2, point: Vec2) -> f32 {
+    direction.perp_dot(point - start)
+}
+
+fn interpolate_vertex(a: ClippedVertex, b: ClippedVertex, t: f32) -> ClippedVertex {
+    if t <= 1e-6 {
+        return a;
+    }
+    if t >= 1.0 - 1e-6 {
+        return b;
+    }
+    let color: [u8; 4] = std::array::from_fn(|index| {
+        (a.vertex.color[index] as f32 * (1.0 - t) + b.vertex.color[index] as f32 * t).round() as u8
+    });
+    let mut vertex = Vertex::new2(
+        a.vertex.position.lerp(b.vertex.position, t),
+        a.vertex.uv.lerp(b.vertex.uv, t),
+        Color::from_rgba(color[0], color[1], color[2], color[3]),
+    );
+    vertex.normal = a.vertex.normal.lerp(b.vertex.normal, t);
+    ClippedVertex {
+        vertex,
+        point: a.point.lerp(b.point, t),
+        original_index: None,
+    }
+}
+
+fn interpolate_mesh_vertex(a: Vertex, b: Vertex, position: Vec3, t: f32) -> Vertex {
+    let color: [u8; 4] = std::array::from_fn(|channel| {
+        (a.color[channel] as f32 * (1.0 - t) + b.color[channel] as f32 * t)
+            .round()
+            .clamp(0.0, 255.0) as u8
+    });
+    let mut vertex = Vertex::new2(
+        position,
+        a.uv.lerp(b.uv, t),
+        Color::from_rgba(color[0], color[1], color[2], color[3]),
+    );
+    vertex.normal = a.normal.lerp(b.normal, t);
+    vertex
+}
+
+fn interpolate_triangle_vertex(source: [Vertex; 3], position: Vec3) -> Result<Vertex, String> {
+    let [a, b, c] = source;
+    let v0 = b.position - a.position;
+    let v1 = c.position - a.position;
+    let v2 = position - a.position;
+    let d00 = v0.dot(v0);
+    let d01 = v0.dot(v1);
+    let d11 = v1.dot(v1);
+    let d20 = v2.dot(v0);
+    let d21 = v2.dot(v1);
+    let denominator = d00 * d11 - d01 * d01;
+    if denominator.abs() <= 1e-12 {
+        return Err("cannot fillet a degenerate face".to_string());
+    }
+    let weight_b = (d11 * d20 - d01 * d21) / denominator;
+    let weight_c = (d00 * d21 - d01 * d20) / denominator;
+    let weight_a = 1.0 - weight_b - weight_c;
+    let blend = |a: f32, b: f32, c: f32| a * weight_a + b * weight_b + c * weight_c;
+    let color: [u8; 4] = std::array::from_fn(|channel| {
+        blend(
+            a.color[channel] as f32,
+            b.color[channel] as f32,
+            c.color[channel] as f32,
+        )
+        .round()
+        .clamp(0.0, 255.0) as u8
+    });
+    let mut vertex = Vertex::new2(
+        position,
+        Vec2::new(blend(a.uv.x, b.uv.x, c.uv.x), blend(a.uv.y, b.uv.y, c.uv.y)),
+        Color::from_rgba(color[0], color[1], color[2], color[3]),
+    );
+    vertex.normal = a.normal * weight_a + b.normal * weight_b + c.normal * weight_c;
+    Ok(vertex)
+}
+
+fn clip_polygon_by_line(
+    polygon: &[ClippedVertex],
+    line_start: Vec2,
+    line_direction: Vec2,
+    keep_side: f32,
+) -> Vec<ClippedVertex> {
+    if polygon.is_empty() {
+        return Vec::new();
+    }
+    const EPSILON: f32 = 1e-6;
+    let mut output = Vec::new();
+    let mut previous = *polygon.last().unwrap();
+    let mut previous_distance = keep_side * line_side(line_start, line_direction, previous.point);
+    for &current in polygon {
+        let current_distance = keep_side * line_side(line_start, line_direction, current.point);
+        let previous_inside = previous_distance >= -EPSILON;
+        let current_inside = current_distance >= -EPSILON;
+        if previous_inside != current_inside {
+            let t = (previous_distance / (previous_distance - current_distance)).clamp(0.0, 1.0);
+            output.push(interpolate_vertex(previous, current, t));
+        }
+        if current_inside {
+            output.push(current);
+        }
+        previous = current;
+        previous_distance = current_distance;
+    }
+    deduplicate_polygon(&mut output);
+    output
+}
+
+fn deduplicate_polygon(polygon: &mut Vec<ClippedVertex>) {
+    let mut clean = Vec::with_capacity(polygon.len());
+    for vertex in polygon.iter().copied() {
+        if clean
+            .last()
+            .is_none_or(|last: &ClippedVertex| last.point.distance_squared(vertex.point) > 1e-12)
+        {
+            clean.push(vertex);
+        }
+    }
+    if clean.len() > 1
+        && clean[0]
+            .point
+            .distance_squared(clean[clean.len() - 1].point)
+            <= 1e-12
+    {
+        clean.pop();
+    }
+    *polygon = clean;
+}
+
+fn polygon_area(polygon: &[ClippedVertex]) -> f32 {
+    if polygon.len() < 3 {
+        return 0.0;
+    }
+    polygon
+        .iter()
+        .zip(polygon.iter().cycle().skip(1))
+        .take(polygon.len())
+        .map(|(a, b)| a.point.perp_dot(b.point))
+        .sum::<f32>()
+        * 0.5
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -1330,13 +2266,7 @@ impl FaceMetadata {
         self.retain_nonempty_geometry_groups();
     }
 
-    pub fn remap_after_face_split(&mut self, face_map: &[Vec<usize>]) {
-        let new_face_count = face_map
-            .iter()
-            .flatten()
-            .copied()
-            .max()
-            .map_or(0, |maximum| maximum + 1);
+    pub fn remap_after_face_rewrite(&mut self, face_map: &[Vec<usize>], new_face_count: usize) {
         let old_names = std::mem::take(&mut self.face_names);
         self.face_names = vec![None; new_face_count];
         for (old_face, new_faces) in face_map.iter().enumerate() {
@@ -1358,6 +2288,34 @@ impl FaceMetadata {
             group.faces.dedup();
         }
         self.retain_nonempty_geometry_groups();
+    }
+
+    pub fn inherit_copied_faces(&mut self, copied_faces: &[(usize, usize)]) {
+        let required = copied_faces
+            .iter()
+            .map(|&(_, destination)| destination + 1)
+            .max()
+            .unwrap_or(self.face_names.len());
+        self.face_names.resize(required, None);
+        for &(source, destination) in copied_faces {
+            let name = self.face_names.get(source).cloned().flatten();
+            if let Some(name) = name
+                && let Some(slot) = self.face_names.get_mut(destination)
+            {
+                *slot = Some(name);
+            }
+        }
+        for group in &mut self.groups {
+            let copies = copied_faces
+                .iter()
+                .filter_map(|&(source, destination)| {
+                    group.faces.contains(&source).then_some(destination)
+                })
+                .collect::<Vec<_>>();
+            group.faces.extend(copies);
+            group.faces.sort_unstable();
+            group.faces.dedup();
+        }
     }
 
     pub fn inherit_group_for_extrusion(
@@ -2282,6 +3240,176 @@ mod tests {
     }
 
     #[test]
+    fn trim_splits_intersected_target_face_and_keeps_both_sides() {
+        let vertex =
+            |position| Vertex::new2(position, Vec2::ZERO, Color::from_rgba(255, 255, 255, 255));
+        let mut mesh = EditableMesh {
+            vertices: vec![
+                vertex(vec3(0.0, 0.0, 0.0)),
+                vertex(vec3(2.0, 0.0, 0.0)),
+                vertex(vec3(0.0, 2.0, 0.0)),
+                vertex(vec3(0.5, -1.0, -1.0)),
+                vertex(vec3(0.5, 3.0, -1.0)),
+                vertex(vec3(0.5, 1.0, 1.0)),
+            ],
+            indices: vec![0, 1, 2, 3, 4, 5],
+        };
+        let face_map = mesh.split_faces_by_intersections(&[0], &[1], None).unwrap();
+
+        assert_eq!(mesh.face_count(), 4);
+        assert_eq!(face_map[0].len(), 3);
+        assert_eq!(face_map[1].len(), 1);
+        let centroids = face_map[0]
+            .iter()
+            .map(|&face| {
+                let start = face * 3;
+                (0..3)
+                    .map(|slot| {
+                        mesh.vertices[mesh.indices[start + slot] as usize]
+                            .position
+                            .x
+                    })
+                    .sum::<f32>()
+                    / 3.0
+            })
+            .collect::<Vec<_>>();
+        assert!(centroids.iter().any(|&x| x < 0.5));
+        assert!(centroids.iter().any(|&x| x > 0.5));
+    }
+
+    #[test]
+    fn trim_rejects_non_intersecting_cutter_faces_without_mutating_mesh() {
+        let vertex =
+            |position| Vertex::new2(position, Vec2::ZERO, Color::from_rgba(255, 255, 255, 255));
+        let mut mesh = EditableMesh {
+            vertices: vec![
+                vertex(vec3(0.0, 0.0, 0.0)),
+                vertex(vec3(2.0, 0.0, 0.0)),
+                vertex(vec3(0.0, 2.0, 0.0)),
+                vertex(vec3(5.5, -1.0, -1.0)),
+                vertex(vec3(5.5, 3.0, -1.0)),
+                vertex(vec3(5.5, 1.0, 1.0)),
+            ],
+            indices: vec![0, 1, 2, 3, 4, 5],
+        };
+        let original = mesh.clone();
+
+        assert!(mesh.split_faces_by_intersections(&[0], &[1], None).is_err());
+        assert_eq!(mesh.indices, original.indices);
+        assert_eq!(
+            mesh.vertices
+                .iter()
+                .map(|vertex| vertex.position)
+                .collect::<Vec<_>>(),
+            original
+                .vertices
+                .iter()
+                .map(|vertex| vertex.position)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn trim_multiline_splits_only_the_selected_target_face() {
+        let vertex =
+            |position| Vertex::new2(position, Vec2::ZERO, Color::from_rgba(255, 255, 255, 255));
+        let mut mesh = EditableMesh {
+            vertices: vec![
+                vertex(vec3(0.0, 0.0, 0.0)),
+                vertex(vec3(2.0, 0.0, 0.0)),
+                vertex(vec3(0.0, 2.0, 0.0)),
+                vertex(vec3(0.0, 0.0, 1.0)),
+                vertex(vec3(2.0, 0.0, 1.0)),
+                vertex(vec3(0.0, 2.0, 1.0)),
+            ],
+            indices: vec![0, 1, 2, 3, 4, 5],
+        };
+        let path = vec![
+            vec3(0.0, 1.0, 0.0),
+            vec3(0.4, 0.4, 0.0),
+            vec3(1.0, 0.0, 0.0),
+        ];
+        let face_map = mesh
+            .split_faces_by_intersections(&[0], &[], Some((0, &path)))
+            .unwrap();
+
+        assert_eq!(face_map[0].len(), 5);
+        assert_eq!(face_map[1], vec![5]);
+        let target_area = face_map[0]
+            .iter()
+            .map(|&face| {
+                let start = face * 3;
+                let a = mesh.vertices[mesh.indices[start] as usize].position;
+                let b = mesh.vertices[mesh.indices[start + 1] as usize].position;
+                let c = mesh.vertices[mesh.indices[start + 2] as usize].position;
+                (b - a).cross(c - a).length() * 0.5
+            })
+            .sum::<f32>();
+        assert!((target_area - 2.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn reflected_and_offset_face_copies_keep_source_geometry_and_report_face_mapping() {
+        let mut mesh = EditableMesh::primitive(MeshPrimitive::Plane);
+        let original_indices = mesh.indices.clone();
+        let original_positions = mesh
+            .vertices
+            .iter()
+            .map(|vertex| vertex.position)
+            .collect::<Vec<_>>();
+        let reflected = mesh
+            .copy_faces_reflected(&[0], Vec3::ZERO, Vec3::X)
+            .unwrap();
+        assert_eq!(mesh.face_count(), 3);
+        assert_eq!(&mesh.indices[..original_indices.len()], original_indices);
+        assert_eq!(reflected, vec![(0, 2)]);
+        let source = &original_indices[..3];
+        let mirrored = &mesh.indices[6..9];
+        for (mirrored_index, source_index) in mirrored.iter().zip([source[0], source[2], source[1]])
+        {
+            assert_eq!(
+                mesh.vertices[*mirrored_index as usize].position.x,
+                -original_positions[source_index as usize].x
+            );
+        }
+
+        let before_offset = mesh.face_count();
+        let offset = mesh.copy_faces_offset(&[1], 0.5).unwrap();
+        assert_eq!(mesh.face_count(), before_offset + 1);
+        assert_eq!(offset, vec![(1, before_offset)]);
+        for &index in &mesh.indices[before_offset * 3..before_offset * 3 + 3] {
+            assert!((mesh.vertices[index as usize].position.y - 0.5).abs() < 1e-5);
+        }
+    }
+
+    #[test]
+    fn fillet_replaces_a_manifold_crease_with_a_rounded_triangle_strip() {
+        let mut mesh = EditableMesh::primitive(MeshPrimitive::Cube);
+        let original_face_count = mesh.face_count();
+        let face_map = mesh.fillet_edges(&[(0, 1)], 0.1, 4).unwrap();
+
+        assert_eq!(mesh.face_count(), original_face_count + 8);
+        assert_eq!(face_map.len(), original_face_count);
+        assert_eq!(face_map[0].len() + face_map[4].len(), 10);
+        assert!(!mesh.indices.chunks_exact(3).any(|triangle| {
+            (0..3).any(|side| {
+                let a = triangle[side];
+                let b = triangle[(side + 1) % 3];
+                (a == 0 && b == 1) || (a == 1 && b == 0)
+            })
+        }));
+    }
+
+    #[test]
+    fn fillet_rejects_non_manifold_or_oversized_edges_without_mutation() {
+        let mut mesh = EditableMesh::primitive(MeshPrimitive::Cube);
+        let original = mesh.indices.clone();
+
+        assert!(mesh.fillet_edges(&[(0, 1)], 10.0, 4).is_err());
+        assert_eq!(mesh.indices, original);
+    }
+
+    #[test]
     fn extracting_and_composing_face_groups_compacts_and_offsets_indices() {
         let white = Color::from_rgba(255, 255, 255, 255);
         let vertex = |position| Vertex::new2(position, Vec2::ZERO, white);
@@ -2396,9 +3524,12 @@ mod tests {
     fn legacy_face_groups_load_as_unparented_geometry_groups() {
         let group: FaceGroup =
             serde_json::from_str(r#"{"id":7,"name":"Existing","faces":[0]}"#).unwrap();
+        let metadata: FaceMetadata =
+            serde_json::from_str(r#"{"face_names":[],"groups":[],"next_group_id":1}"#).unwrap();
 
         assert_eq!(group.parent_id, None);
         assert_eq!(group.program, FaceGroupProgram::Geometry);
+        assert!(metadata.groups.is_empty());
     }
 
     #[test]
@@ -2538,50 +3669,6 @@ mod tests {
     }
 
     #[test]
-    fn knife_cut_splits_selected_triangles_and_remaps_face_groups() {
-        let white = Color::from_rgba(255, 255, 255, 255);
-        let mesh = EditableMesh {
-            vertices: vec![
-                Vertex::new2(Vec3::ZERO, Vec2::ZERO, white),
-                Vertex::new2(Vec3::X, Vec2::ZERO, white),
-                Vertex::new2(Vec3::Y, Vec2::ZERO, white),
-                Vertex::new2(vec3(2.0, 0.0, 0.0), Vec2::ZERO, white),
-                Vertex::new2(vec3(3.0, 0.0, 0.0), Vec2::ZERO, white),
-                Vertex::new2(vec3(2.0, 1.0, 0.0), Vec2::ZERO, white),
-            ],
-            indices: vec![0, 1, 2, 3, 4, 5],
-        };
-        let mut mesh = mesh;
-        let mut metadata = FaceMetadata::for_face_count(2);
-        metadata.rename_face(0, "cut face".to_string()).unwrap();
-        let group = metadata.create_group(&[0, 1]).unwrap();
-
-        let face_map = mesh
-            .cut_faces_by_plane(&[0], vec3(0.5, 0.0, 0.0), vec3(1.0, 1.0, 0.0))
-            .unwrap();
-        metadata.remap_after_face_split(&face_map);
-
-        assert_eq!(face_map[0], vec![0, 1, 2]);
-        assert_eq!(face_map[1], vec![3]);
-        assert_eq!(mesh.face_count(), 4);
-        assert_eq!(metadata.group(group).unwrap().faces, vec![0, 1, 2, 3]);
-        assert_eq!(
-            metadata.face_names,
-            vec![
-                Some("cut face".to_string()),
-                Some("cut face".to_string()),
-                Some("cut face".to_string()),
-                None,
-            ]
-        );
-        assert!(
-            mesh.indices
-                .iter()
-                .all(|&index| (index as usize) < mesh.vertices.len())
-        );
-    }
-
-    #[test]
     fn extruded_faces_inherit_group_without_names() {
         let mut metadata = FaceMetadata::for_face_count(2);
         metadata.rename_face(0, "source".to_string()).unwrap();
@@ -2598,24 +3685,26 @@ mod tests {
     }
 
     #[test]
-    fn face_metadata_round_trips_in_adjacent_sidecar() {
+    fn legacy_loose_lines_are_ignored_and_omitted_when_sidecar_is_saved() {
         let directory =
             std::env::temp_dir().join(format!("gridgame-cad-metadata-{}", std::process::id()));
         let mesh_path = directory.join("model.glb");
-        let mut metadata = FaceMetadata::for_face_count(3);
-        metadata.rename_face(1, "door".to_string()).unwrap();
-        metadata.create_group(&[0, 2]).unwrap();
-        metadata.radial_pivot = Some([1.0, 2.0, 3.0]);
-
-        save_face_metadata(&mesh_path, &metadata).unwrap();
+        let legacy_path = face_metadata_path(&mesh_path);
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(
+            &legacy_path,
+            r#"{"face_names":[null],"groups":[],"loose_lines":[{"start":[0,0,0],"end":[1,0,0]}]}"#,
+        )
+        .unwrap();
         let (loaded, error) = load_face_metadata(&mesh_path, 3);
 
         assert!(error.is_none());
-        assert_eq!(loaded.face_names, metadata.face_names);
-        assert_eq!(loaded.groups, metadata.groups);
-        assert_eq!(loaded.radial_pivot, Some([1.0, 2.0, 3.0]));
-        assert_eq!(loaded.next_group_id, metadata.next_group_id);
-        fs::remove_file(face_metadata_path(&mesh_path)).unwrap();
+        assert_eq!(loaded.face_names, vec![None; 3]);
+        assert_eq!(loaded.groups, Vec::new());
+        save_face_metadata(&mesh_path, &loaded).unwrap();
+        let saved = fs::read_to_string(&legacy_path).unwrap();
+        assert!(!saved.contains("loose_lines"));
+        fs::remove_file(legacy_path).unwrap();
         fs::remove_dir(directory).unwrap();
     }
 

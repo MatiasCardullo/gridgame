@@ -17,18 +17,39 @@ the last saved version.
   intersection, endpoint, midpoint, and perpendicular targets. They are enabled
   by default and apply to free Move drags. Targets must be visible; the active
   snap type is shown by the cursor. Center, tangent, and quadrant targets are
-  offered only for recognized circular edge loops.
-- **Polar** constrains free Move drags to the nearest 15-degree direction.
-  It is off by default.
-  **Grid Snap** rounds the moved selection center to the configured X/Z grid
-  spacing. Object snaps take priority over grid and polar tracking; grid applies
-  when no object target is active and takes priority over polar tracking.
-  Grid snapping is off by default and also controls primitive placement.
+  offered only for recognized circular edge loops. The same popover contains
+  **Polar** and **Grid Snap** toggles.
+- **Polar** constrains free Move drags to the nearest 15-degree direction and
+  is off by default. **Grid Snap** rounds the moved selection center to the
+  configured grid spacing. These toggles affect the current Move workflow;
+  Grid Snap also controls primitive placement. Grid snapping is off by default.
 - **Value** opens a small, non-blocking XYZ input for exact translations,
   rotations in degrees, or scale factors. Press `Enter` or **Apply** to commit;
   close the input or press `Escape` to dismiss it.
 - Use the primitive placement tools to add geometry; confirm placement with
   `Enter` and cancel with `Escape`.
+- **Trim** starts by selecting target face(s); `Shift` toggles faces in the
+  selection. Press `Enter` to choose cutter face(s), then select the mesh faces
+  whose intersections should split the targets. Press `Enter` to split; both
+  sides are retained. Alternatively, use **Draw Path** to draw a connected,
+  boundary-to-boundary multiline on one target face. Press `Enter` to finish
+  the path, then press it again to split. The path is temporary and is not
+  saved. Trim currently splits triangular faces at face-face intersections;
+  coplanar cutter faces do not define a cut line.
+  Press `Escape` to cancel the active Trim operation.
+- **Mirror** uses three clicks to define a plane. The reflected copy previews in
+  the viewport; press `Enter` to keep it alongside the original, or `Escape` to
+  cancel. `Backspace` removes the last plane point.
+- **Fillet** rounds selected mesh edge(s). Select edges, choose **Fillet**, enter
+  a radius in the viewport value panel, and click **Apply** or press `Enter`.
+  The current mesh operation supports manifold creases and rejects invalid or
+  overlapping edge sets.
+- **Offset** copies selected faces along their normals, leaving the source
+  unchanged. Select faces, choose **Offset**, enter a signed distance, then
+  click **Apply** or press `Enter`.
+- Mirror, Fillet, Offset, and Trim are undoable single operations. Their mesh
+  previews stay in the viewport; errors such as unsupported topology or
+  invalid values leave the original mesh unchanged.
 - Use undo/redo while editing; save or discard to finish.
 
 The interaction preview assembles a building from six neighboring hexes.

@@ -26,6 +26,13 @@ enum SelectionMode {
     Face,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum TrimPhase {
+    #[default]
+    Targets,
+    Cutters,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TransformMode {
     Move,
@@ -174,12 +181,6 @@ struct EditSnapshot {
     selection_mode: SelectionMode,
 }
 
-#[derive(Clone, Copy, Debug)]
-struct KnifeStart {
-    point: Vec3,
-    face: usize,
-}
-
 #[derive(Clone, Debug)]
 struct PrimitivePlacement {
     primitive: MeshPrimitive,
@@ -224,8 +225,20 @@ pub struct CadSceneState {
     snap_settings_open: bool,
     polar_tracking: bool,
     group_config_dialog: Option<GroupConfigDialog>,
-    knife_active: bool,
-    knife_start: Option<KnifeStart>,
+    trim_active: bool,
+    trim_phase: TrimPhase,
+    trim_target_faces: Vec<usize>,
+    trim_cutter_faces: Vec<usize>,
+    trim_path_active: bool,
+    trim_path_points: Vec<Vec3>,
+    trim_path_face: Option<usize>,
+    mirror_active: bool,
+    mirror_points: Vec<Vec3>,
+    fillet_active: bool,
+    offset_active: bool,
+    operation_value: String,
+    operation_value_focused: bool,
+    operation_value_selected: bool,
     primitive_placement: Option<PrimitivePlacement>,
     grid_snap: bool,
     grid_spacing: f32,
@@ -274,8 +287,20 @@ impl Default for CadSceneState {
             snap_settings_open: false,
             polar_tracking: false,
             group_config_dialog: None,
-            knife_active: false,
-            knife_start: None,
+            trim_active: false,
+            trim_phase: TrimPhase::Targets,
+            trim_target_faces: Vec::new(),
+            trim_cutter_faces: Vec::new(),
+            trim_path_active: false,
+            trim_path_points: Vec::new(),
+            trim_path_face: None,
+            mirror_active: false,
+            mirror_points: Vec::new(),
+            fillet_active: false,
+            offset_active: false,
+            operation_value: "0.1".to_string(),
+            operation_value_focused: false,
+            operation_value_selected: false,
             primitive_placement: None,
             grid_snap: false,
             grid_spacing: 0.5,
@@ -652,6 +677,7 @@ fn update_gizmo_drag(
     mouse: Vec2,
     mesh: &EditableMesh,
     state: &CadSceneState,
+    radial_grid_center: Option<Vec3>,
     drag: GizmoDrag,
 ) -> Option<GizmoUpdate> {
     let values = match drag.mode {
@@ -725,12 +751,28 @@ fn update_gizmo_drag(
         command.values = target.position - drag.pivot_model;
     } else if drag.mode == TransformMode::Move {
         if state.grid_snap {
-            let snapped = snap_transform_to_grid(
-                drag.pivot_model,
-                command.values,
-                drag.axis,
-                state.grid_spacing,
-            );
+            let mut snapped = if let Some(center) = radial_grid_center {
+                snap_transform_to_triangular_grid(
+                    drag.pivot_model,
+                    command.values,
+                    drag.axis,
+                    state.grid_spacing,
+                    center,
+                )
+            } else {
+                snap_transform_to_grid(
+                    drag.pivot_model,
+                    command.values,
+                    drag.axis,
+                    state.grid_spacing,
+                )
+            };
+            if matches!(drag.axis, TransformAxis::All | TransformAxis::Y) {
+                let floor_y = radial_grid_center
+                    .map(|center| center.y)
+                    .unwrap_or_else(|| mesh_center_and_scale(mesh).0.y);
+                snapped = snap_point_to_grid_floor(snapped, floor_y, state.grid_spacing);
+            }
             command.values = snapped - drag.pivot_model;
         } else if drag.axis == TransformAxis::All && state.polar_tracking {
             let forward = (camera.target - camera.position).normalize_or_zero();
@@ -885,6 +927,42 @@ fn snap_model_point_to_triangular_grid(point: Vec3, center: Vec3, spacing: f32) 
         }
     }
     center + closest
+}
+
+fn snap_point_to_grid_floor(point: Vec3, floor_y: f32, spacing: f32) -> Vec3 {
+    let snap_distance = spacing.max(0.001) * 0.25;
+    if (point.y - floor_y).abs() <= snap_distance {
+        vec3(point.x, floor_y, point.z)
+    } else {
+        point
+    }
+}
+
+fn grid_center_for_mesh(mesh: &EditableMesh, metadata: &FaceMetadata) -> (Vec3, bool) {
+    if metadata.radial_main_group_id().is_some() {
+        let center = metadata
+            .radial_pivot
+            .map(|[x, y, z]| vec3(x, y, z))
+            .unwrap_or(Vec3::ZERO);
+        (center, true)
+    } else {
+        let model_center = mesh_center_and_scale(mesh).0;
+        (vec3(0.0, model_center.y, 0.0), false)
+    }
+}
+
+fn snap_model_point_to_grid_layout(
+    point: Vec3,
+    center: Vec3,
+    spacing: f32,
+    triangular: bool,
+) -> Vec3 {
+    let snapped = if triangular {
+        snap_model_point_to_triangular_grid(point, center, spacing)
+    } else {
+        snap_model_point(point, spacing)
+    };
+    snap_point_to_grid_floor(snapped, center.y, spacing)
 }
 
 fn primitive_dimension_count(primitive: MeshPrimitive) -> usize {
@@ -1134,6 +1212,23 @@ fn snap_transform_to_grid(pivot: Vec3, values: Vec3, axis: TransformAxis, spacin
         TransformAxis::X => vec3((target.x / spacing).round() * spacing, target.y, target.z),
         TransformAxis::Y => target,
         TransformAxis::Z => vec3(target.x, target.y, (target.z / spacing).round() * spacing),
+    }
+}
+
+fn snap_transform_to_triangular_grid(
+    pivot: Vec3,
+    values: Vec3,
+    axis: TransformAxis,
+    spacing: f32,
+    center: Vec3,
+) -> Vec3 {
+    let target = pivot + values;
+    let snapped = snap_model_point_to_triangular_grid(target, center, spacing);
+    match axis {
+        TransformAxis::All => snapped,
+        TransformAxis::X => vec3(snapped.x, target.y, target.z),
+        TransformAxis::Y => target,
+        TransformAxis::Z => vec3(target.x, target.y, snapped.z),
     }
 }
 
@@ -1510,6 +1605,201 @@ fn nearest_object_snap(
         })
 }
 
+fn snap_model_point_to_grid(
+    point: Vec3,
+    state: &CadSceneState,
+    metadata: &FaceMetadata,
+    mesh: &EditableMesh,
+) -> Vec3 {
+    let (center, triangular) = grid_center_for_mesh(mesh, metadata);
+    snap_model_point_to_grid_layout(point, center, state.grid_spacing, triangular)
+}
+
+fn model_point_at_cursor(
+    camera: &Camera3D,
+    mouse: Vec2,
+    source_mesh: &EditableMesh,
+    display_mesh: &EditableMesh,
+    state: &CadSceneState,
+    metadata: &FaceMetadata,
+) -> Option<Vec3> {
+    if let Some(target) = nearest_object_snap(
+        camera,
+        mouse,
+        source_mesh,
+        display_mesh,
+        state,
+        state.object_snaps,
+    ) {
+        return Some(target.position);
+    }
+    let (origin, direction) = mouse_ray(camera, mouse)?;
+    let display_point = mesh_ray_hit_point(origin, direction, display_mesh, None)
+        .map(|(_, _, point)| point)
+        .or_else(|| construction_plane_hit(origin, direction))?;
+    let mut point = display_to_model_point(source_mesh, display_point);
+    if state.grid_snap {
+        point = snap_model_point_to_grid(point, state, metadata, source_mesh);
+    }
+    Some(point)
+}
+
+fn apply_trim(catalog: &mut ObjectCatalog, state: &mut CadSceneState) -> Result<(), String> {
+    let target_faces = state.trim_target_faces.clone();
+    let cutter_faces = state.trim_cutter_faces.clone();
+    let multiline = state
+        .trim_path_face
+        .map(|face| (face, state.trim_path_points.clone()));
+    if target_faces.is_empty() {
+        return Err("Select at least one target face".to_string());
+    }
+    if cutter_faces.is_empty() && multiline.is_none() {
+        return Err("Select cutter faces or draw a multiline path".to_string());
+    }
+    let snapshot = capture_snapshot(catalog, state)?;
+    let face_map = selected_mesh_mut(catalog, state)
+        .ok_or_else(|| "Selected object is unavailable".to_string())?
+        .split_faces_by_intersections(
+            &target_faces,
+            &cutter_faces,
+            multiline
+                .as_ref()
+                .map(|(face, points)| (*face, points.as_slice())),
+        )?;
+    let face_count = selected_mesh(catalog, state)
+        .map(EditableMesh::face_count)
+        .ok_or_else(|| "Selected object is unavailable".to_string())?;
+    selected_metadata_mut(catalog, state)
+        .ok_or_else(|| "Selected face metadata is unavailable".to_string())?
+        .remap_after_face_rewrite(&face_map, face_count);
+    push_undo(state, snapshot);
+    state.dirty = true;
+    state.selected_faces = target_faces
+        .iter()
+        .flat_map(|&face| face_map[face].iter().copied())
+        .collect();
+    state.selected_group = None;
+    state.selected_vertices.clear();
+    state.selected_edges.clear();
+    state.trim_active = false;
+    state.trim_target_faces.clear();
+    state.trim_cutter_faces.clear();
+    state.trim_path_active = false;
+    state.trim_path_points.clear();
+    state.trim_path_face = None;
+    state.error = None;
+    Ok(())
+}
+
+fn clear_trim_state(state: &mut CadSceneState) {
+    state.trim_active = false;
+    state.trim_phase = TrimPhase::Targets;
+    state.trim_target_faces.clear();
+    state.trim_cutter_faces.clear();
+    state.trim_path_active = false;
+    state.trim_path_points.clear();
+    state.trim_path_face = None;
+}
+
+fn finish_trim_path(state: &mut CadSceneState) -> Result<(), String> {
+    if state.trim_path_points.len() < 2 || state.trim_path_face.is_none() {
+        return Err("Draw a multiline path with at least two points".to_string());
+    }
+    state.trim_path_active = false;
+    state.error = None;
+    Ok(())
+}
+
+fn advance_trim(catalog: &mut ObjectCatalog, state: &mut CadSceneState) -> Result<(), String> {
+    if state.trim_phase == TrimPhase::Targets {
+        if state.trim_target_faces.is_empty() {
+            return Err("Select at least one target face first".to_string());
+        }
+        state.trim_phase = TrimPhase::Cutters;
+        state.error = None;
+        return Ok(());
+    }
+    if state.trim_path_active {
+        return finish_trim_path(state);
+    }
+    apply_trim(catalog, state)
+}
+
+fn copy_faces_with_operation(
+    catalog: &mut ObjectCatalog,
+    state: &mut CadSceneState,
+    mut operation: impl FnMut(&mut EditableMesh, &[usize]) -> Result<Vec<(usize, usize)>, String>,
+) -> Result<(), String> {
+    let snapshot = capture_snapshot(catalog, state)?;
+    let copied = operation(
+        selected_mesh_mut(catalog, state)
+            .ok_or_else(|| "Selected object is unavailable".to_string())?,
+        &state.selected_faces,
+    )?;
+    selected_metadata_mut(catalog, state)
+        .ok_or_else(|| "Selected face metadata is unavailable".to_string())?
+        .inherit_copied_faces(&copied);
+    push_undo(state, snapshot);
+    state.dirty = true;
+    state.selected_faces = copied.iter().map(|&(_, destination)| destination).collect();
+    state.selected_edges.clear();
+    state.selected_vertices.clear();
+    state.selection_mode = SelectionMode::Face;
+    state.selected_group = None;
+    state.error = None;
+    Ok(())
+}
+
+fn apply_mirror(
+    catalog: &mut ObjectCatalog,
+    state: &mut CadSceneState,
+    plane_point: Vec3,
+    plane_normal: Vec3,
+) -> Result<(), String> {
+    copy_faces_with_operation(catalog, state, |mesh, faces| {
+        mesh.copy_faces_reflected(faces, plane_point, plane_normal)
+    })
+}
+
+fn parse_operation_distance(text: &str, label: &str) -> Result<f32, String> {
+    let value = text
+        .trim()
+        .parse::<f32>()
+        .map_err(|_| format!("Enter a numeric {label}"))?;
+    if !value.is_finite() || value.abs() <= 1e-6 {
+        return Err(format!("{label} must be finite and non-zero"));
+    }
+    Ok(value)
+}
+
+fn apply_offset(catalog: &mut ObjectCatalog, state: &mut CadSceneState) -> Result<(), String> {
+    let distance = parse_operation_distance(&state.operation_value, "offset distance")?;
+    copy_faces_with_operation(catalog, state, |mesh, faces| {
+        mesh.copy_faces_offset(faces, distance)
+    })
+}
+
+fn apply_fillet(catalog: &mut ObjectCatalog, state: &mut CadSceneState) -> Result<(), String> {
+    let radius = parse_operation_distance(&state.operation_value, "fillet radius")?;
+    let snapshot = capture_snapshot(catalog, state)?;
+    let face_map = selected_mesh_mut(catalog, state)
+        .ok_or_else(|| "Selected object is unavailable".to_string())?
+        .fillet_edges(&state.selected_edges, radius, 4)?;
+    let face_count = selected_mesh(catalog, state)
+        .map(EditableMesh::face_count)
+        .ok_or_else(|| "Selected object is unavailable".to_string())?;
+    selected_metadata_mut(catalog, state)
+        .ok_or_else(|| "Selected face metadata is unavailable".to_string())?
+        .remap_after_face_rewrite(&face_map, face_count);
+    push_undo(state, snapshot);
+    state.dirty = true;
+    state.selected_faces = face_map.into_iter().flatten().collect();
+    state.selected_edges.clear();
+    state.selection_mode = SelectionMode::Face;
+    state.error = None;
+    Ok(())
+}
+
 fn pick_edge(camera: &Camera3D, mouse: Vec2, mesh: &EditableMesh) -> Option<(usize, usize)> {
     let mut closest: Option<(f32, (usize, usize))> = None;
     let mut visited = HashSet::new();
@@ -1622,30 +1912,10 @@ fn draw_view_controls(
             ctx.colors_rt.text_secondary,
         );
         let snap_rect = object_snap_rect(panel);
-        let polar_rect = polar_tracking_rect(panel);
-        let grid_rect = grid_snap_rect(panel);
         let spacing_minus = grid_spacing_minus_rect(panel);
         let spacing_plus = grid_spacing_plus_rect(panel);
         let preview_rect = interaction_preview_rect(panel);
         let _ = button(ctx, snap_rect, "Object Snaps...");
-        let _ = button(
-            ctx,
-            polar_rect,
-            if state.polar_tracking {
-                "Polar: On (15 deg)"
-            } else {
-                "Polar: Off (15 deg)"
-            },
-        );
-        let _ = button(
-            ctx,
-            grid_rect,
-            if state.grid_snap {
-                "Grid Snap: On"
-            } else {
-                "Grid Snap: Off"
-            },
-        );
         let _ = button(
             ctx,
             spacing_minus,
@@ -1694,36 +1964,28 @@ fn draw_view_controls(
     }
 }
 
-fn grid_snap_rect(panel: Rect) -> Rect {
-    Rect::new(panel.x + 12.0, panel.y + 226.0, panel.w - 24.0, 27.0)
-}
-
 fn object_snap_rect(panel: Rect) -> Rect {
     Rect::new(panel.x + 12.0, panel.y + 166.0, panel.w - 24.0, 27.0)
 }
 
-fn polar_tracking_rect(panel: Rect) -> Rect {
-    Rect::new(panel.x + 12.0, panel.y + 196.0, panel.w - 24.0, 27.0)
-}
-
 fn grid_spacing_minus_rect(panel: Rect) -> Rect {
-    Rect::new(panel.x + 12.0, panel.y + 256.0, panel.w - 56.0, 27.0)
+    Rect::new(panel.x + 12.0, panel.y + 196.0, panel.w - 56.0, 27.0)
 }
 
 fn grid_spacing_plus_rect(panel: Rect) -> Rect {
-    Rect::new(panel.x + panel.w - 38.0, panel.y + 256.0, 26.0, 27.0)
+    Rect::new(panel.x + panel.w - 38.0, panel.y + 196.0, 26.0, 27.0)
 }
 
 fn interaction_preview_rect(panel: Rect) -> Rect {
-    Rect::new(panel.x + 12.0, panel.y + 286.0, panel.w - 24.0, 27.0)
+    Rect::new(panel.x + 12.0, panel.y + 226.0, panel.w - 24.0, 27.0)
 }
 
 fn preview_shuffle_rect(panel: Rect) -> Rect {
-    Rect::new(panel.x + 12.0, panel.y + 316.0, panel.w - 24.0, 27.0)
+    Rect::new(panel.x + 12.0, panel.y + 256.0, panel.w - 24.0, 27.0)
 }
 
 fn radial_center_rect(panel: Rect) -> Rect {
-    Rect::new(panel.x + 12.0, panel.y + 346.0, panel.w - 24.0, 27.0)
+    Rect::new(panel.x + 12.0, panel.y + 286.0, panel.w - 24.0, 27.0)
 }
 
 fn object_snap_panel_rect(panel: Rect) -> Rect {
@@ -1731,7 +1993,17 @@ fn object_snap_panel_rect(panel: Rect) -> Rect {
         (panel.x - 232.0).max(SIDEBAR_WIDTH + 8.0),
         panel.y + 165.0,
         220.0,
-        166.0,
+        218.0,
+    )
+}
+
+fn object_snap_tracking_button_rect(panel: Rect, index: usize) -> Rect {
+    let popup = object_snap_panel_rect(panel);
+    Rect::new(
+        popup.x + 8.0 + index as f32 * 104.0,
+        popup.y + 183.0,
+        98.0,
+        27.0,
     )
 }
 
@@ -1974,8 +2246,19 @@ fn close_editor(state: &mut CadSceneState) {
     state.numeric_transform_focused = false;
     state.numeric_transform_selected = false;
     state.group_config_dialog = None;
-    state.knife_active = false;
-    state.knife_start = None;
+    state.trim_active = false;
+    state.trim_phase = TrimPhase::Targets;
+    state.trim_target_faces.clear();
+    state.trim_cutter_faces.clear();
+    state.trim_path_active = false;
+    state.trim_path_points.clear();
+    state.trim_path_face = None;
+    state.mirror_active = false;
+    state.mirror_points.clear();
+    state.fillet_active = false;
+    state.offset_active = false;
+    state.operation_value_focused = false;
+    state.operation_value_selected = false;
     state.primitive_placement = None;
     state.interaction_preview = false;
     state.placing_radial_center = false;
@@ -2005,8 +2288,19 @@ fn switch_to_object(state: &mut CadSceneState, id: ObjectId) {
     state.numeric_transform_focused = false;
     state.numeric_transform_selected = false;
     state.group_config_dialog = None;
-    state.knife_active = false;
-    state.knife_start = None;
+    state.trim_active = false;
+    state.trim_phase = TrimPhase::Targets;
+    state.trim_target_faces.clear();
+    state.trim_cutter_faces.clear();
+    state.trim_path_active = false;
+    state.trim_path_points.clear();
+    state.trim_path_face = None;
+    state.mirror_active = false;
+    state.mirror_points.clear();
+    state.fillet_active = false;
+    state.offset_active = false;
+    state.operation_value_focused = false;
+    state.operation_value_selected = false;
     state.primitive_placement = None;
     state.interaction_preview = false;
     state.placing_radial_center = false;
@@ -2260,6 +2554,36 @@ fn select_face(state: &mut CadSceneState, face: usize, extend: bool) {
         }
     } else {
         state.selected_faces = vec![face];
+    }
+}
+
+fn toggle_index(selection: &mut Vec<usize>, index: usize) {
+    if let Some(position) = selection.iter().position(|&selected| selected == index) {
+        selection.remove(position);
+    } else {
+        selection.push(index);
+        selection.sort_unstable();
+    }
+}
+
+fn draw_face_outline(mesh: &EditableMesh, face: usize, color: Color) {
+    let start = face * 3;
+    let Some(indices) = mesh.indices.get(start..start + 3) else {
+        return;
+    };
+    let Some(points) = indices
+        .iter()
+        .map(|&index| {
+            mesh.vertices
+                .get(index as usize)
+                .map(|vertex| vertex.position)
+        })
+        .collect::<Option<Vec<_>>>()
+    else {
+        return;
+    };
+    for edge in 0..3 {
+        draw_line_3d(points[edge], points[(edge + 1) % 3], color);
     }
 }
 
@@ -2731,68 +3055,6 @@ fn draw_square_grid(model_center: Vec3, scale: f32, spacing: f32) {
     }
 }
 
-fn perform_knife_cut(
-    catalog: &mut ObjectCatalog,
-    state: &mut CadSceneState,
-    preview: &EditableMesh,
-    start: KnifeStart,
-    end: Vec3,
-) -> Result<(), String> {
-    let snapshot = capture_snapshot(catalog, state)?;
-    let triangle_start = start
-        .face
-        .checked_mul(3)
-        .ok_or_else(|| "face index overflow".to_string())?;
-    let indices = preview
-        .indices
-        .get(triangle_start..triangle_start + 3)
-        .ok_or_else(|| "selected face is unavailable".to_string())?;
-    let [a, b, c] = [
-        preview.vertices.get(indices[0] as usize),
-        preview.vertices.get(indices[1] as usize),
-        preview.vertices.get(indices[2] as usize),
-    ];
-    let [Some(a), Some(b), Some(c)] = [a, b, c] else {
-        return Err("selected face has invalid mesh indices".to_string());
-    };
-    let face_normal = (b.position - a.position)
-        .cross(c.position - a.position)
-        .normalize_or_zero();
-    let plane_normal = face_normal.cross(end - start.point).normalize_or_zero();
-    if plane_normal.length_squared() <= f32::EPSILON {
-        return Err("choose two distinct points on the selected face".to_string());
-    }
-    let (center, scale) = mesh_center_and_scale(&snapshot.mesh);
-    if scale <= f32::EPSILON {
-        return Err("model has no usable geometry".to_string());
-    }
-    let to_model_space = |point: Vec3| point / scale + center;
-    let plane_point = to_model_space(start.point);
-    let mut mesh = snapshot.mesh.clone();
-    let face_map = mesh.cut_faces_by_plane(&state.selected_faces, plane_point, plane_normal)?;
-    let mut metadata = snapshot.metadata.clone();
-    metadata.remap_after_face_split(&face_map);
-    let selected_faces = state
-        .selected_faces
-        .iter()
-        .filter_map(|&face| face_map.get(face))
-        .flatten()
-        .copied()
-        .collect::<Vec<_>>();
-    *selected_mesh_mut(catalog, state)
-        .ok_or_else(|| "Selected object is unavailable".to_string())? = mesh;
-    *selected_metadata_mut(catalog, state)
-        .ok_or_else(|| "Selected face metadata is unavailable".to_string())? = metadata;
-    state.selected_faces = selected_faces;
-    state.selected_group = None;
-    state.selected_vertices.clear();
-    state.selected_edges.clear();
-    push_undo(state, snapshot);
-    state.dirty = true;
-    state.error = None;
-    Ok(())
-}
-
 fn assign_dragged_faces(
     catalog: &mut ObjectCatalog,
     state: &mut CadSceneState,
@@ -3072,6 +3334,15 @@ fn numeric_transform_panel_rect() -> Rect {
     Rect::new(SIDEBAR_WIDTH + 12.0, TOOLBAR_HEIGHT + 48.0, 260.0, 108.0)
 }
 
+fn operation_value_panel_rect(viewport: Rect) -> Rect {
+    Rect::new(viewport.x + 12.0, viewport.y + 112.0, 310.0, 86.0)
+}
+
+fn operation_value_input_rect(viewport: Rect) -> Rect {
+    let panel = operation_value_panel_rect(viewport);
+    Rect::new(panel.x + 10.0, panel.y + 32.0, panel.w - 20.0, 28.0)
+}
+
 fn draw_numeric_transform_panel(
     ctx: &FrameContext,
     catalog: &mut ObjectCatalog,
@@ -3218,6 +3489,29 @@ fn draw_object_snap_panel(ctx: &FrameContext, panel: Rect, state: &mut CadSceneS
             );
         }
     }
+    for (index, label, enabled) in [
+        (0, "Polar", state.polar_tracking),
+        (1, "Grid Snap", state.grid_snap),
+    ] {
+        let rect = object_snap_tracking_button_rect(panel, index);
+        if button(ctx, rect, label) {
+            if index == 0 {
+                state.polar_tracking = !state.polar_tracking;
+            } else {
+                state.grid_snap = !state.grid_snap;
+            }
+        }
+        if enabled {
+            draw_rectangle_lines(
+                rect.x,
+                rect.y,
+                rect.w,
+                rect.h,
+                2.0,
+                Color::from_rgba(27, 119, 105, 255),
+            );
+        }
+    }
 }
 
 fn undo_or_redo(catalog: &mut ObjectCatalog, state: &mut CadSceneState, is_undo: bool) {
@@ -3282,9 +3576,24 @@ pub fn run(
         } else if state.placing_radial_center {
             state.placing_radial_center = false;
             state.error = None;
-        } else if state.knife_active {
-            state.knife_active = false;
-            state.knife_start = None;
+        } else if state.trim_active {
+            state.trim_active = false;
+            state.trim_phase = TrimPhase::Targets;
+            state.trim_target_faces.clear();
+            state.trim_cutter_faces.clear();
+            state.trim_path_active = false;
+            state.trim_path_points.clear();
+            state.trim_path_face = None;
+            state.error = None;
+        } else if state.mirror_active {
+            state.mirror_active = false;
+            state.mirror_points.clear();
+            state.error = None;
+        } else if state.fillet_active || state.offset_active {
+            state.fillet_active = false;
+            state.offset_active = false;
+            state.operation_value_focused = false;
+            state.operation_value_selected = false;
             state.error = None;
         } else if state.editing {
             if state.dirty {
@@ -3295,6 +3604,51 @@ pub fn run(
         } else {
             *scene = Scene::MainMenu;
             return;
+        }
+    }
+    if state.mirror_active && is_key_pressed(KeyCode::Backspace) && !state.mirror_points.is_empty()
+    {
+        state.mirror_points.pop();
+        state.error = None;
+    }
+    if state.editing && is_key_pressed(KeyCode::Enter) {
+        if state.trim_active {
+            match advance_trim(catalog, state) {
+                Ok(()) => state.error = None,
+                Err(error) => state.error = Some(error),
+            }
+        } else if state.mirror_active {
+            if state.mirror_points.len() == 3 {
+                let [origin, second, third] = [
+                    state.mirror_points[0],
+                    state.mirror_points[1],
+                    state.mirror_points[2],
+                ];
+                match apply_mirror(
+                    catalog,
+                    state,
+                    origin,
+                    (second - origin).cross(third - origin),
+                ) {
+                    Ok(()) => {
+                        state.mirror_active = false;
+                        state.mirror_points.clear();
+                    }
+                    Err(error) => state.error = Some(error),
+                }
+            } else {
+                state.error = Some("Choose three points to define the mirror plane".to_string());
+            }
+        } else if state.fillet_active {
+            match apply_fillet(catalog, state) {
+                Ok(()) => state.fillet_active = false,
+                Err(error) => state.error = Some(error),
+            }
+        } else if state.offset_active {
+            match apply_offset(catalog, state) {
+                Ok(()) => state.offset_active = false,
+                Err(error) => state.error = Some(error),
+            }
         }
     }
     let mut modal_open = state.exit_confirmation_open
@@ -3324,6 +3678,30 @@ pub fn run(
             changed = true;
         }
         if changed {
+            state.error = None;
+        }
+    }
+    if !modal_open && (state.fillet_active || state.offset_active) && state.operation_value_focused
+    {
+        while let Some(character) = get_char_pressed() {
+            if character.is_ascii_digit() || matches!(character, '.' | '-' | '+') {
+                if state.operation_value_selected {
+                    state.operation_value.clear();
+                    state.operation_value_selected = false;
+                }
+                if state.operation_value.len() < 24 {
+                    state.operation_value.push(character);
+                }
+                state.error = None;
+            }
+        }
+        if is_key_pressed(KeyCode::Backspace) && !state.operation_value.is_empty() {
+            if state.operation_value_selected {
+                state.operation_value.clear();
+                state.operation_value_selected = false;
+            } else {
+                state.operation_value.pop();
+            }
             state.error = None;
         }
     }
@@ -3438,28 +3816,6 @@ pub fn run(
     if !modal_open && !rename_dialog_open && state.editing {
         if button(ctx, object_snap_rect(view_panel), "Object Snaps...") {
             state.snap_settings_open = !state.snap_settings_open;
-        }
-        if button(
-            ctx,
-            polar_tracking_rect(view_panel),
-            if state.polar_tracking {
-                "Polar: On (15 deg)"
-            } else {
-                "Polar: Off (15 deg)"
-            },
-        ) {
-            state.polar_tracking = !state.polar_tracking;
-        }
-        if button(
-            ctx,
-            grid_snap_rect(view_panel),
-            if state.grid_snap {
-                "Grid Snap: On"
-            } else {
-                "Grid Snap: Off"
-            },
-        ) {
-            state.grid_snap = !state.grid_snap;
         }
         if button(
             ctx,
@@ -3902,42 +4258,154 @@ pub fn run(
                 }
             }
         }
-        action_x += 88.0;
+        let modify_y = action_y + 38.0;
+        let mut modify_x = SIDEBAR_WIDTH + 12.0;
+        let trim_label = if state.trim_active {
+            "Cancel Trim"
+        } else {
+            "Trim"
+        };
         if !modal_open
             && !rename_dialog_open
-            && button(
-                ctx,
-                Rect::new(action_x, action_y, 84.0, 30.0),
-                if state.knife_active {
-                    "Cancel Cut"
-                } else {
-                    "Knife"
-                },
-            )
+            && button(ctx, Rect::new(modify_x, modify_y, 92.0, 30.0), trim_label)
         {
-            if state.knife_active {
-                state.knife_active = false;
-                state.knife_start = None;
-                state.error = None;
-            } else if state.selected_faces.is_empty() {
-                state.error = Some("Select one or more faces before using Knife".to_string());
+            if state.trim_active {
+                clear_trim_state(state);
             } else {
-                state.knife_active = true;
-                state.knife_start = None;
-                state.selection_mode = SelectionMode::Face;
+                state.trim_active = true;
+                state.trim_phase = TrimPhase::Targets;
+                state.trim_target_faces.clear();
+                state.trim_cutter_faces.clear();
+                state.trim_path_active = false;
+                state.trim_path_points.clear();
+                state.trim_path_face = None;
+                state.selected_faces.clear();
+                state.selected_group = None;
                 state.selected_edges.clear();
+                state.selection_mode = SelectionMode::Face;
+                state.mirror_active = false;
+                state.mirror_points.clear();
+                state.fillet_active = false;
+                state.offset_active = false;
+                state.operation_value_focused = false;
+                state.numeric_transform_open = false;
+                state.numeric_transform_focused = false;
                 state.error = None;
             }
+        }
+        modify_x += 98.0;
+        if state.trim_active && state.trim_phase == TrimPhase::Cutters {
+            let path_label = if state.trim_path_active {
+                "Finish Path"
+            } else if state.trim_path_points.is_empty() {
+                "Draw Path"
+            } else {
+                "Redraw Path"
+            };
+            if !modal_open
+                && !rename_dialog_open
+                && button(ctx, Rect::new(modify_x, modify_y, 94.0, 30.0), path_label)
+            {
+                if state.trim_path_active {
+                    if let Err(error) = finish_trim_path(state) {
+                        state.error = Some(error);
+                    }
+                } else {
+                    state.trim_path_active = true;
+                    state.trim_path_points.clear();
+                    state.trim_path_face = None;
+                    state.error = None;
+                }
+            }
+            modify_x += 100.0;
+        }
+        for (label, active, width) in [
+            (
+                if state.mirror_active {
+                    "Cancel Mirror"
+                } else {
+                    "Mirror"
+                },
+                state.mirror_active,
+                92.0,
+            ),
+            (
+                if state.fillet_active {
+                    "Cancel Fillet"
+                } else {
+                    "Fillet"
+                },
+                state.fillet_active,
+                88.0,
+            ),
+            (
+                if state.offset_active {
+                    "Cancel Offset"
+                } else {
+                    "Offset"
+                },
+                state.offset_active,
+                88.0,
+            ),
+        ] {
+            let rect = Rect::new(modify_x, modify_y, width, 30.0);
+            if !modal_open && !rename_dialog_open && button(ctx, rect, label) {
+                if active {
+                    clear_trim_state(state);
+                    state.mirror_active = false;
+                    state.mirror_points.clear();
+                    state.fillet_active = false;
+                    state.offset_active = false;
+                    state.operation_value_focused = false;
+                    state.error = None;
+                } else if label == "Mirror" && state.selected_faces.is_empty() {
+                    state.error = Some("Select faces to mirror before starting the tool".into());
+                } else if label == "Offset" && state.selected_faces.is_empty() {
+                    state.error = Some("Select faces to offset before starting the tool".into());
+                } else if label == "Fillet" && state.selected_edges.is_empty() {
+                    state.error =
+                        Some("Select mesh edges to fillet before starting the tool".into());
+                } else {
+                    clear_trim_state(state);
+                    state.mirror_active = label == "Mirror";
+                    state.mirror_points.clear();
+                    state.fillet_active = label == "Fillet";
+                    state.offset_active = label == "Offset";
+                    state.operation_value_focused = state.fillet_active || state.offset_active;
+                    state.operation_value_selected = state.operation_value_focused;
+                    if state.trim_active {
+                        state.selected_faces.clear();
+                        state.selected_group = None;
+                    } else if state.mirror_active || state.offset_active {
+                        state.selection_mode = SelectionMode::Face;
+                    } else if state.fillet_active {
+                        state.selection_mode = SelectionMode::Edge;
+                    }
+                    state.numeric_transform_open = false;
+                    state.numeric_transform_focused = false;
+                    state.error = None;
+                }
+            }
+            modify_x += width + 6.0;
         }
     }
     ui_capturing |= state.editing
         && Rect::new(SIDEBAR_WIDTH, action_y - 4.0, screen_width(), 40.0).contains(ctx.mouse);
+    ui_capturing |= state.editing
+        && Rect::new(SIDEBAR_WIDTH, action_y + 34.0, screen_width(), 38.0).contains(ctx.mouse);
     ui_capturing |=
         state.numeric_transform_open && numeric_transform_panel_rect().contains(ctx.mouse);
     ui_capturing |=
         state.snap_settings_open && object_snap_panel_rect(view_panel).contains(ctx.mouse);
     ui_capturing |=
         state.snap_settings_open && object_snap_panel_rect(view_panel).contains(ctx.mouse);
+    let operation_panel_open = state.fillet_active || state.offset_active;
+    let operation_panel = operation_value_panel_rect(viewport);
+    ui_capturing |= operation_panel_open && operation_panel.contains(ctx.mouse);
+    if operation_panel_open && is_mouse_button_pressed(MouseButton::Left) {
+        state.operation_value_focused = operation_value_input_rect(viewport).contains(ctx.mouse);
+        state.operation_value_selected = state.operation_value_focused;
+    }
     if state.numeric_transform_open
         && is_mouse_button_pressed(MouseButton::Left)
         && !numeric_transform_panel_rect().contains(ctx.mouse)
@@ -3984,7 +4452,16 @@ pub fn run(
     let current_mesh = selected_mesh(catalog, state).cloned();
     if let (Some(drag), Some(mesh)) = (state.gizmo_drag, current_mesh.as_ref()) {
         if is_mouse_button_down(MouseButton::Left) || is_mouse_button_released(MouseButton::Left) {
-            let update = update_gizmo_drag(&camera, ctx.mouse, mesh, state, drag);
+            let radial_grid_center = selected_metadata(catalog, state).and_then(|metadata| {
+                metadata.radial_main_group_id().map(|_| {
+                    metadata
+                        .radial_pivot
+                        .map(|[x, y, z]| vec3(x, y, z))
+                        .unwrap_or(Vec3::ZERO)
+                })
+            });
+            let update =
+                update_gizmo_drag(&camera, ctx.mouse, mesh, state, radial_grid_center, drag);
             state.gizmo_preview = update.map(|update| update.command);
             state.gizmo_snap_target = update.and_then(|update| update.snap_target);
             state.gizmo_polar_angle = update.and_then(|update| update.polar_angle);
@@ -4017,6 +4494,87 @@ pub fn run(
         }
         preview_mesh_with_reference(&candidate, mesh)
     });
+    let trim_path_cursor = if state.trim_active
+        && state.trim_phase == TrimPhase::Cutters
+        && state.trim_path_active
+        && viewport.contains(ctx.mouse)
+        && !ui_capturing
+    {
+        current_mesh
+            .as_ref()
+            .zip(preview.as_ref())
+            .and_then(|(source_mesh, display_mesh)| {
+                let (origin, direction) = mouse_ray(&camera, ctx.mouse)?;
+                let (_, face, point) = mesh_ray_hit_point(
+                    origin,
+                    direction,
+                    display_mesh,
+                    Some(&state.trim_target_faces),
+                )?;
+                if state.trim_path_face.is_some_and(|active| active != face) {
+                    return None;
+                }
+                Some(display_to_model_point(source_mesh, point))
+            })
+    } else {
+        None
+    };
+    let mirror_cursor_point =
+        if state.mirror_active && viewport.contains(ctx.mouse) && !ui_capturing {
+            current_mesh
+                .as_ref()
+                .zip(preview.as_ref())
+                .and_then(|(source_mesh, display_mesh)| {
+                    selected_metadata(catalog, state).and_then(|metadata| {
+                        model_point_at_cursor(
+                            &camera,
+                            ctx.mouse,
+                            source_mesh,
+                            display_mesh,
+                            state,
+                            metadata,
+                        )
+                    })
+                })
+        } else {
+            None
+        };
+    let operation_preview = current_mesh.as_ref().and_then(|mesh| {
+        let mut candidate = mesh.clone();
+        let preview_result = if state.fillet_active {
+            parse_operation_distance(&state.operation_value, "fillet radius").and_then(|radius| {
+                candidate
+                    .fillet_edges(&state.selected_edges, radius, 4)
+                    .map(|_| ())
+            })
+        } else if state.offset_active {
+            parse_operation_distance(&state.operation_value, "offset distance").and_then(
+                |distance| {
+                    candidate
+                        .copy_faces_offset(&state.selected_faces, distance)
+                        .map(|_| ())
+                },
+            )
+        } else if state.mirror_active && state.mirror_points.len() == 3 {
+            let [origin, second, third] = [
+                state.mirror_points[0],
+                state.mirror_points[1],
+                state.mirror_points[2],
+            ];
+            candidate
+                .copy_faces_reflected(
+                    &state.selected_faces,
+                    origin,
+                    (second - origin).cross(third - origin),
+                )
+                .map(|_| ())
+        } else {
+            Err("No preview operation".to_string())
+        };
+        preview_result
+            .ok()
+            .map(|()| preview_mesh_with_reference(&candidate, mesh))
+    });
     if state.interaction_preview {
         if let Err(error) = draw_interaction_preview(catalog, state) {
             state.error = Some(error);
@@ -4042,7 +4600,7 @@ pub fn run(
                 draw_square_grid(model_center, scale, state.grid_spacing);
             }
         }
-        if let Some(mesh) = preview.as_ref() {
+        if let Some(mesh) = operation_preview.as_ref().or(preview.as_ref()) {
             if let Err(error) = mesh.render() {
                 state.error = Some(error);
             }
@@ -4091,14 +4649,57 @@ pub fn run(
                                 );
                             }
                         }
-                        if let Some(start) = state.knife_start {
-                            draw_sphere(
-                                start.point,
-                                0.035,
-                                None,
-                                Color::from_rgba(255, 90, 90, 255),
-                            );
+                    }
+                }
+                for &face in &state.trim_target_faces {
+                    draw_face_outline(mesh, face, Color::from_rgba(255, 190, 65, 255));
+                }
+                for &face in &state.trim_cutter_faces {
+                    draw_face_outline(mesh, face, Color::from_rgba(180, 130, 255, 255));
+                }
+                if let Some(source_mesh) = current_mesh.as_ref() {
+                    let path = state
+                        .trim_path_points
+                        .iter()
+                        .map(|&point| model_to_display_point(source_mesh, point))
+                        .collect::<Vec<_>>();
+                    for pair in path.windows(2) {
+                        draw_line_3d(pair[0], pair[1], Color::from_rgba(255, 190, 65, 255));
+                    }
+                    for point in &path {
+                        draw_sphere(*point, 0.035, None, Color::from_rgba(255, 190, 65, 255));
+                    }
+                    if let Some(point) = trim_path_cursor {
+                        let cursor = model_to_display_point(source_mesh, point);
+                        if let Some(&last) = path.last() {
+                            draw_line_3d(last, cursor, Color::from_rgba(255, 190, 65, 210));
                         }
+                        draw_sphere(cursor, 0.045, None, Color::from_rgba(255, 190, 65, 255));
+                    }
+                    let mirror_points = state
+                        .mirror_points
+                        .iter()
+                        .map(|&point| model_to_display_point(source_mesh, point))
+                        .collect::<Vec<_>>();
+                    for pair in mirror_points.windows(2) {
+                        draw_line_3d(pair[0], pair[1], Color::from_rgba(200, 125, 255, 255));
+                    }
+                    if mirror_points.len() == 3 {
+                        draw_line_3d(
+                            mirror_points[2],
+                            mirror_points[0],
+                            Color::from_rgba(200, 125, 255, 255),
+                        );
+                    }
+                    for point in &mirror_points {
+                        draw_sphere(*point, 0.045, None, Color::from_rgba(200, 125, 255, 255));
+                    }
+                    if let Some(cursor_point) = mirror_cursor_point {
+                        let cursor = model_to_display_point(source_mesh, cursor_point);
+                        if let Some(&last) = mirror_points.last() {
+                            draw_line_3d(last, cursor, Color::from_rgba(200, 125, 255, 210));
+                        }
+                        draw_sphere(cursor, 0.04, None, Color::from_rgba(200, 125, 255, 255));
                     }
                 }
                 if let Some(source_mesh) = current_mesh.as_ref()
@@ -4190,6 +4791,24 @@ pub fn run(
             Color::from_rgba(255, 220, 75, 255),
         );
     }
+    if state.trim_active || state.mirror_active {
+        let instruction = if state.trim_active && state.trim_phase == TrimPhase::Targets {
+            "Trim 1/2: select target faces; Shift toggles; Enter for cutters"
+        } else if state.trim_active && state.trim_path_active {
+            "Draw Path: click boundary-to-boundary points on one target face; Enter finishes"
+        } else if state.trim_active {
+            "Trim 2/2: select intersecting cutter faces or Draw Path; Enter splits both sides"
+        } else {
+            "Mirror: click 3 plane points, Enter to keep reflected copy"
+        };
+        draw_text(
+            instruction,
+            SIDEBAR_WIDTH + 12.0,
+            TOOLBAR_HEIGHT + 22.0,
+            ctx.font_sm,
+            Color::from_rgba(255, 220, 75, 255),
+        );
+    }
 
     if viewport_active
         && state.editing
@@ -4222,21 +4841,24 @@ pub fn run(
                         display_point,
                     );
                     if state.grid_snap {
-                        let metadata = selected_metadata(catalog, state);
-                        if let Some(metadata) = metadata
-                            && metadata.radial_main_group_id().is_some()
-                        {
-                            let center = metadata
-                                .radial_pivot
-                                .map(|[x, y, z]| vec3(x, y, z))
-                                .unwrap_or(Vec3::ZERO);
-                            model_point = snap_model_point_to_triangular_grid(
+                        if let Some(metadata) = selected_metadata(catalog, state) {
+                            model_point = snap_model_point_to_grid(
                                 model_point,
-                                center,
-                                state.grid_spacing,
+                                state,
+                                metadata,
+                                current_mesh.as_ref().unwrap_or(mesh),
                             );
                         } else {
-                            model_point = snap_model_point(model_point, state.grid_spacing);
+                            let floor_y =
+                                mesh_center_and_scale(current_mesh.as_ref().unwrap_or(mesh))
+                                    .0
+                                    .y;
+                            model_point = snap_model_point_to_grid_layout(
+                                model_point,
+                                vec3(0.0, floor_y, 0.0),
+                                state.grid_spacing,
+                                false,
+                            );
                         }
                     }
                     if let Some(center) = placement.center {
@@ -4256,29 +4878,62 @@ pub fn run(
                 } else {
                     state.error = Some("The click did not intersect the construction plane".into());
                 }
-            } else if state.knife_active {
-                let hit = mesh_ray_hit_point(origin, direction, mesh, Some(&state.selected_faces));
-                match (state.knife_start, hit) {
-                    (None, Some((_, face, point))) => {
-                        state.knife_start = Some(KnifeStart { point, face });
+            } else if state.trim_active {
+                let extend = is_key_down(KeyCode::LeftShift) || is_key_down(KeyCode::RightShift);
+                if state.trim_phase == TrimPhase::Targets {
+                    if let Some(face) = mesh_ray_hit(origin, direction, mesh) {
+                        if !extend {
+                            state.trim_target_faces.clear();
+                        }
+                        toggle_index(&mut state.trim_target_faces, face);
+                        state.error = None;
+                    } else {
+                        state.error = Some("Click a target face to split".into());
+                    }
+                } else if state.trim_path_active {
+                    if let Some((_, face, point)) =
+                        mesh_ray_hit_point(origin, direction, mesh, Some(&state.trim_target_faces))
+                    {
+                        if state.trim_path_face.is_some_and(|active| active != face) {
+                            state.error =
+                                Some("Draw one multiline path on a single target face".into());
+                        } else {
+                            let point = current_mesh
+                                .as_ref()
+                                .map(|source| display_to_model_point(source, point))
+                                .unwrap_or(point);
+                            if state
+                                .trim_path_points
+                                .last()
+                                .is_none_or(|last| last.distance_squared(point) > 1e-10)
+                            {
+                                state.trim_path_points.push(point);
+                                state.trim_path_face = Some(face);
+                            }
+                            state.error = None;
+                        }
+                    } else {
+                        state.error =
+                            Some("Draw the multiline on one of the selected target faces".into());
+                    }
+                } else if let Some(face) = mesh_ray_hit(origin, direction, mesh) {
+                    if !extend {
+                        state.trim_cutter_faces.clear();
+                    }
+                    toggle_index(&mut state.trim_cutter_faces, face);
+                    state.error = None;
+                } else {
+                    state.error = Some("Click a mesh face to use as a cutter".into());
+                }
+            } else if state.mirror_active {
+                if let Some(point) = mirror_cursor_point {
+                    if state.mirror_points.len() < 3 {
+                        state.mirror_points.push(point);
                         state.error = None;
                     }
-                    (Some(start), Some((_, face, point))) if face == start.face => {
-                        match perform_knife_cut(catalog, state, mesh, start, point) {
-                            Ok(()) => {
-                                state.knife_active = false;
-                                state.knife_start = None;
-                            }
-                            Err(error) => state.error = Some(error),
-                        }
-                    }
-                    (Some(_), Some(_)) => {
-                        state.error =
-                            Some("Both knife points must lie on the same selected face".into());
-                    }
-                    (_, None) => {
-                        state.error = Some("Knife points must land on the selected face(s)".into());
-                    }
+                } else {
+                    state.error =
+                        Some("Click the mesh or construction plane to set the mirror plane".into());
                 }
             } else if let Some(source_mesh) = current_mesh.as_ref()
                 && let Some((_, handle_size)) = gizmo_center_and_size(source_mesh, state)
@@ -4336,7 +4991,7 @@ pub fn run(
                     }
                 }
             }
-            if !state.knife_active {
+            if !state.trim_active {
                 state.error = None;
             }
         }
@@ -4577,6 +5232,72 @@ pub fn run(
 
     draw_group_config_dialog(ctx, catalog, state);
     draw_numeric_transform_panel(ctx, catalog, state);
+    if operation_panel_open {
+        let panel = operation_value_panel_rect(viewport);
+        draw_rectangle(panel.x, panel.y, panel.w, panel.h, ctx.colors_rt.panel_bg);
+        draw_rectangle_lines(
+            panel.x,
+            panel.y,
+            panel.w,
+            panel.h,
+            1.0,
+            ctx.colors_rt.panel_border,
+        );
+        draw_text(
+            if state.fillet_active {
+                "Fillet radius (mesh units)"
+            } else {
+                "Offset distance (mesh units)"
+            },
+            panel.x + 10.0,
+            panel.y + 21.0,
+            ctx.font_sm,
+            ctx.colors_rt.text_primary,
+        );
+        let input = operation_value_input_rect(viewport);
+        draw_rectangle(
+            input.x,
+            input.y,
+            input.w,
+            input.h,
+            ctx.colors_rt.button_base,
+        );
+        draw_rectangle_lines(
+            input.x,
+            input.y,
+            input.w,
+            input.h,
+            1.0,
+            if state.operation_value_focused {
+                ctx.colors_rt.text_primary
+            } else {
+                ctx.colors_rt.button_border
+            },
+        );
+        draw_text(
+            &state.operation_value,
+            input.x + 8.0,
+            input.y + input.h * 0.5 + ctx.font_sm * 0.35,
+            ctx.font_sm,
+            ctx.colors_rt.text_primary,
+        );
+        let apply_rect = Rect::new(panel.x + panel.w - 88.0, panel.y + 64.0, 78.0, 24.0);
+        if button(ctx, apply_rect, "Apply") {
+            let result = if state.fillet_active {
+                apply_fillet(catalog, state)
+            } else {
+                apply_offset(catalog, state)
+            };
+            match result {
+                Ok(()) => {
+                    state.fillet_active = false;
+                    state.offset_active = false;
+                    state.operation_value_focused = false;
+                }
+                Err(error) => state.error = Some(error),
+            }
+        }
+    }
 
     if let Some(dialog) = &state.rename_dialog {
         draw_rectangle(
@@ -5096,6 +5817,52 @@ mod tests {
         let snapped = snap_model_point_to_triangular_grid(vec3(2.74, 5.0, -2.2), center, 1.0);
 
         assert!((snapped - vec3(2.5, 5.0, -3.0 + 3.0_f32.sqrt() * 0.5)).length() < 1e-5);
+    }
+
+    #[test]
+    fn grid_snapping_pulls_nearby_points_to_square_and_triangular_floors() {
+        let floor = vec3(0.0, 2.0, 0.0);
+        let near_floor = vec3(0.26, 2.2, 0.24);
+        assert_eq!(
+            snap_model_point_to_grid_layout(near_floor, floor, 1.0, false),
+            vec3(0.0, 2.0, 0.0)
+        );
+        assert_eq!(
+            snap_model_point_to_grid_layout(near_floor, floor, 1.0, true),
+            vec3(0.0, 2.0, 0.0)
+        );
+
+        let above_threshold = vec3(0.26, 2.26, 0.24);
+        assert_eq!(
+            snap_model_point_to_grid_layout(above_threshold, floor, 1.0, false).y,
+            above_threshold.y
+        );
+        assert_eq!(
+            snap_model_point_to_grid_layout(above_threshold, floor, 1.0, true).y,
+            above_threshold.y
+        );
+    }
+
+    #[test]
+    fn radial_gizmo_snapping_uses_the_triangular_grid_and_preserves_axis_constraints() {
+        let center = vec3(2.0, 4.0, -3.0);
+        let pivot = vec3(2.74, 5.0, -2.2);
+        let expected = vec3(2.5, 5.0, -3.0 + 3.0_f32.sqrt() * 0.5);
+
+        assert!(
+            (snap_transform_to_triangular_grid(pivot, Vec3::ZERO, TransformAxis::All, 1.0, center)
+                - expected)
+                .length()
+                < 1e-5
+        );
+        assert_eq!(
+            snap_transform_to_triangular_grid(pivot, Vec3::ZERO, TransformAxis::X, 1.0, center),
+            vec3(expected.x, pivot.y, pivot.z)
+        );
+        assert_eq!(
+            snap_transform_to_triangular_grid(pivot, Vec3::ZERO, TransformAxis::Y, 1.0, center),
+            pivot
+        );
     }
 
     #[test]
@@ -5713,5 +6480,203 @@ mod tests {
             push_undo(&mut state, snapshot.clone());
         }
         assert_eq!(state.undo_stack.len(), HISTORY_LIMIT);
+    }
+
+    fn trim_test_mesh() -> EditableMesh {
+        let vertex = |position| Vertex::new2(position, Vec2::ZERO, WHITE);
+        EditableMesh {
+            vertices: vec![
+                vertex(vec3(0.0, 0.0, 0.0)),
+                vertex(vec3(2.0, 0.0, 0.0)),
+                vertex(vec3(0.0, 2.0, 0.0)),
+                vertex(vec3(0.5, -1.0, -1.0)),
+                vertex(vec3(0.5, 3.0, -1.0)),
+                vertex(vec3(0.5, 1.0, 1.0)),
+            ],
+            indices: vec![0, 1, 2, 3, 4, 5],
+        }
+    }
+
+    #[test]
+    fn trim_splits_targets_and_keeps_both_sides_with_undo() {
+        let mut catalog = ObjectCatalog::load();
+        let mut state = CadSceneState {
+            editing: true,
+            trim_active: true,
+            trim_phase: TrimPhase::Cutters,
+            trim_target_faces: vec![0],
+            trim_cutter_faces: vec![1],
+            ..CadSceneState::default()
+        };
+        *selected_mesh_mut(&mut catalog, &state).unwrap() = trim_test_mesh();
+        let metadata = selected_metadata_mut(&mut catalog, &state).unwrap();
+        *metadata = FaceMetadata::for_face_count(2);
+        metadata.face_names[0] = Some("Target".to_string());
+        let group = metadata.create_group(&[0]).unwrap();
+        let original = selected_mesh(&catalog, &state).unwrap().clone();
+
+        apply_trim(&mut catalog, &mut state).unwrap();
+        assert_eq!(selected_mesh(&catalog, &state).unwrap().face_count(), 4);
+        let metadata = selected_metadata(&catalog, &state).unwrap();
+        assert_eq!(metadata.face_names.len(), 4);
+        assert_eq!(
+            metadata
+                .face_names
+                .iter()
+                .filter(|name| name.is_some())
+                .count(),
+            3
+        );
+        assert!(
+            metadata
+                .group(group)
+                .unwrap()
+                .faces
+                .iter()
+                .all(|&face| face < 4)
+        );
+        let target_centroids = state
+            .selected_faces
+            .iter()
+            .map(|&face| {
+                let start = face * 3;
+                (0..3)
+                    .map(|slot| {
+                        selected_mesh(&catalog, &state).unwrap().vertices[selected_mesh(
+                            &catalog, &state,
+                        )
+                        .unwrap()
+                        .indices[start + slot]
+                            as usize]
+                            .position
+                            .x
+                    })
+                    .sum::<f32>()
+                    / 3.0
+            })
+            .collect::<Vec<_>>();
+        assert!(target_centroids.iter().any(|&x| x < 0.5));
+        assert!(target_centroids.iter().any(|&x| x > 0.5));
+        assert!(undo(&mut catalog, &mut state).unwrap());
+        assert_eq!(selected_mesh(&catalog, &state).unwrap().face_count(), 2);
+        assert_eq!(
+            selected_mesh(&catalog, &state).unwrap().indices,
+            original.indices
+        );
+        assert_eq!(
+            selected_metadata(&catalog, &state).unwrap().face_names[0].as_deref(),
+            Some("Target")
+        );
+    }
+
+    #[test]
+    fn trim_requires_intersection_and_leaves_mesh_unchanged_on_failure() {
+        let mut catalog = ObjectCatalog::load();
+        let mut state = CadSceneState {
+            editing: true,
+            trim_active: true,
+            trim_phase: TrimPhase::Cutters,
+            trim_target_faces: vec![0],
+            trim_cutter_faces: vec![1],
+            ..CadSceneState::default()
+        };
+        let mut mesh = trim_test_mesh();
+        for index in 3..6 {
+            mesh.vertices[index].position.x += 5.0;
+        }
+        *selected_mesh_mut(&mut catalog, &state).unwrap() = mesh;
+        let original = selected_mesh(&catalog, &state).unwrap().clone();
+
+        assert!(apply_trim(&mut catalog, &mut state).is_err());
+        assert_eq!(
+            selected_mesh(&catalog, &state).unwrap().indices,
+            original.indices
+        );
+        assert!(state.undo_stack.is_empty());
+        assert!(state.trim_active);
+    }
+
+    #[test]
+    fn trim_path_splits_selected_face_and_is_undoable() {
+        let mut catalog = ObjectCatalog::load();
+        let mut state = CadSceneState {
+            editing: true,
+            trim_active: true,
+            trim_phase: TrimPhase::Cutters,
+            trim_target_faces: vec![0],
+            trim_path_face: Some(0),
+            trim_path_points: vec![vec3(0.5, 0.0, 0.0), vec3(0.0, 0.0, -0.5)],
+            ..CadSceneState::default()
+        };
+        let mut mesh = EditableMesh::primitive(MeshPrimitive::Plane);
+        *selected_mesh_mut(&mut catalog, &state).unwrap() = mesh.clone();
+
+        apply_trim(&mut catalog, &mut state).unwrap();
+        assert_eq!(selected_mesh(&catalog, &state).unwrap().face_count(), 4);
+        assert!(undo(&mut catalog, &mut state).unwrap());
+        mesh = selected_mesh(&catalog, &state).unwrap().clone();
+        assert_eq!(mesh.face_count(), 2);
+    }
+
+    #[test]
+    fn offset_copy_commits_and_is_undoable() {
+        let mut catalog = ObjectCatalog::load();
+        let mut state = CadSceneState {
+            editing: true,
+            selected_faces: vec![0],
+            operation_value: "0.1".to_string(),
+            ..CadSceneState::default()
+        };
+        let original_face_count = selected_mesh(&catalog, &state).unwrap().face_count();
+        apply_offset(&mut catalog, &mut state).unwrap();
+        assert_eq!(
+            selected_mesh(&catalog, &state).unwrap().face_count(),
+            original_face_count + 1
+        );
+        assert_eq!(state.selected_faces, vec![original_face_count]);
+        assert!(undo(&mut catalog, &mut state).unwrap());
+        assert_eq!(
+            selected_mesh(&catalog, &state).unwrap().face_count(),
+            original_face_count
+        );
+    }
+
+    #[test]
+    fn mirror_copy_inherits_face_metadata_and_is_undoable() {
+        let mut catalog = ObjectCatalog::load();
+        let mut state = CadSceneState {
+            editing: true,
+            selected_faces: vec![0],
+            ..CadSceneState::default()
+        };
+        let original_face_count = selected_mesh(&catalog, &state).unwrap().face_count();
+        let group = {
+            let metadata = selected_metadata_mut(&mut catalog, &state).unwrap();
+            metadata.face_names[0] = Some("Mirrored face".to_string());
+            metadata.create_group(&[0]).unwrap()
+        };
+
+        apply_mirror(&mut catalog, &mut state, Vec3::ZERO, Vec3::X).unwrap();
+        let metadata = selected_metadata(&catalog, &state).unwrap();
+        assert_eq!(
+            metadata.face_names[original_face_count].as_deref(),
+            Some("Mirrored face")
+        );
+        assert!(
+            metadata
+                .group(group)
+                .unwrap()
+                .faces
+                .contains(&original_face_count)
+        );
+        assert!(undo(&mut catalog, &mut state).unwrap());
+        assert_eq!(
+            selected_mesh(&catalog, &state).unwrap().face_count(),
+            original_face_count
+        );
+        assert_eq!(
+            selected_metadata(&catalog, &state).unwrap().face_names[0].as_deref(),
+            Some("Mirrored face")
+        );
     }
 }

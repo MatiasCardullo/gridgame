@@ -1856,6 +1856,10 @@ pub struct FaceGroup {
     pub parent_id: Option<u64>,
     #[serde(default)]
     pub program: FaceGroupProgram,
+    #[serde(default)]
+    pub locked: bool,
+    #[serde(default)]
+    pub hidden: bool,
 }
 
 fn extract_or_empty(mesh: &EditableMesh, faces: &[usize]) -> Result<EditableMesh, String> {
@@ -2023,6 +2027,99 @@ impl FaceMetadata {
         Some(self.descendant_faces(group_id, group.program != FaceGroupProgram::RadialRepeat))
     }
 
+    pub fn group_is_locked(&self, group_id: u64) -> bool {
+        self.group_flag_in_ancestors(group_id, true)
+    }
+
+    pub fn group_is_hidden(&self, group_id: u64) -> bool {
+        self.group_flag_in_ancestors(group_id, false)
+    }
+
+    pub fn group_has_locked_ancestor(&self, group_id: u64) -> bool {
+        self.group_ancestor_has_flag(group_id, true)
+    }
+
+    pub fn group_has_hidden_ancestor(&self, group_id: u64) -> bool {
+        self.group_ancestor_has_flag(group_id, false)
+    }
+
+    fn group_flag_in_ancestors(&self, group_id: u64, locked: bool) -> bool {
+        let mut current = Some(group_id);
+        let mut visited = HashSet::new();
+        while let Some(id) = current {
+            if !visited.insert(id) {
+                return false;
+            }
+            let Some(group) = self.group(id) else {
+                return false;
+            };
+            let flag = if locked { group.locked } else { group.hidden };
+            if flag {
+                return true;
+            }
+            current = group.parent_id;
+        }
+        false
+    }
+
+    fn group_ancestor_has_flag(&self, group_id: u64, locked: bool) -> bool {
+        let Some(group) = self.group(group_id) else {
+            return false;
+        };
+        let mut current = group.parent_id;
+        let mut visited = HashSet::new();
+        while let Some(id) = current {
+            if !visited.insert(id) {
+                return false;
+            }
+            let Some(group) = self.group(id) else {
+                return false;
+            };
+            let flag = if locked { group.locked } else { group.hidden };
+            if flag {
+                return true;
+            }
+            current = group.parent_id;
+        }
+        false
+    }
+
+    pub fn locked_faces(&self) -> HashSet<usize> {
+        self.groups
+            .iter()
+            .filter(|group| group.locked)
+            .flat_map(|group| self.descendant_faces(group.id, true))
+            .collect()
+    }
+
+    pub fn hidden_faces(&self) -> HashSet<usize> {
+        self.groups
+            .iter()
+            .filter(|group| group.hidden)
+            .flat_map(|group| self.descendant_faces(group.id, true))
+            .collect()
+    }
+
+    pub fn set_group_locked(&mut self, group_id: u64, locked: bool) -> Result<(), String> {
+        let group = self
+            .groups
+            .iter_mut()
+            .find(|group| group.id == group_id)
+            .ok_or_else(|| format!("face group {group_id} does not exist"))?;
+        group.locked = locked;
+        Ok(())
+    }
+
+    pub fn set_group_hidden(&mut self, group_id: u64, hidden: bool) -> Result<(), String> {
+        let group = self
+            .groups
+            .iter_mut()
+            .find(|group| group.id == group_id)
+            .ok_or_else(|| format!("face group {group_id} does not exist"))?;
+        group.hidden = hidden;
+        Ok(())
+    }
+
     pub fn radial_sector_mesh(
         &self,
         mesh: &EditableMesh,
@@ -2135,6 +2232,8 @@ impl FaceMetadata {
             faces: selected,
             parent_id,
             program: FaceGroupProgram::Geometry,
+            locked: false,
+            hidden: false,
         });
         Ok(id)
     }
@@ -2211,31 +2310,41 @@ impl FaceMetadata {
             .iter_mut()
             .find(|group| group.id == group_id)
             .ok_or_else(|| format!("face group {group_id} does not exist"))?;
-        if group.program != FaceGroupProgram::Geometry {
-            return Err("model program groups cannot be renamed".to_string());
-        }
         group.name = name;
         Ok(())
     }
 
     pub fn remove_group(&mut self, group_id: u64) -> Result<Vec<usize>, String> {
-        let index = self
+        let group = self
             .groups
             .iter()
-            .position(|group| group.id == group_id)
+            .find(|group| group.id == group_id)
             .ok_or_else(|| format!("face group {group_id} does not exist"))?;
-        let group = &self.groups[index];
-        if group.program != FaceGroupProgram::Geometry
-            || self
+        let remove_radial_pivot = group.program == FaceGroupProgram::RadialRepeat;
+        let mut group_ids = HashSet::from([group_id]);
+        let mut pending = vec![group_id];
+        let mut faces = Vec::new();
+        while let Some(parent_id) = pending.pop() {
+            if let Some(parent) = self.groups.iter().find(|group| group.id == parent_id) {
+                faces.extend(parent.faces.iter().copied());
+            }
+            for child in self
                 .groups
                 .iter()
-                .any(|child| child.parent_id == Some(group_id))
-        {
-            return Err(
-                "model program groups and groups with children cannot be deleted".to_string(),
-            );
+                .filter(|group| group.parent_id == Some(parent_id))
+            {
+                if group_ids.insert(child.id) {
+                    pending.push(child.id);
+                }
+            }
         }
-        Ok(self.groups.remove(index).faces)
+        self.groups.retain(|group| !group_ids.contains(&group.id));
+        if remove_radial_pivot {
+            self.radial_pivot = None;
+        }
+        faces.sort_unstable();
+        faces.dedup();
+        Ok(faces)
     }
 
     pub fn remap_after_face_removal(&mut self, face_remap: &[Option<usize>]) {
@@ -3598,8 +3707,56 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
-        assert!(metadata.remove_group(main_id).is_err());
-        assert!(metadata.remove_group(route_group).is_err());
+        let mut without_route = metadata.clone();
+        assert_eq!(without_route.remove_group(route_group).unwrap(), vec![1]);
+        assert!(without_route.group(route_group).is_none());
+        assert_eq!(without_route.radial_main_group_id(), Some(main_id));
+
+        let mut without_radial = metadata.clone();
+        without_radial.radial_pivot = Some([1.0, 2.0, 3.0]);
+        assert_eq!(without_radial.remove_group(main_id).unwrap(), vec![0, 1, 2]);
+        assert!(without_radial.groups.is_empty());
+        assert_eq!(without_radial.radial_main_group_id(), None);
+        assert_eq!(without_radial.radial_pivot, None);
+    }
+
+    #[test]
+    fn model_program_groups_can_be_renamed() {
+        let mut metadata = FaceMetadata::for_face_count(2);
+        let radial = metadata.create_group(&[0]).unwrap();
+        metadata
+            .set_group_program(radial, FaceGroupProgram::RadialRepeat)
+            .unwrap();
+        metadata
+            .rename_group(radial, "Main sector".to_string())
+            .unwrap();
+
+        assert_eq!(metadata.group(radial).unwrap().name, "Main sector");
+        assert_eq!(
+            metadata.group(radial).unwrap().program,
+            FaceGroupProgram::RadialRepeat
+        );
+    }
+
+    #[test]
+    fn group_lock_and_hide_apply_to_descendants_and_serialize() {
+        let mut metadata = FaceMetadata::for_face_count(2);
+        let parent = metadata.create_group(&[0]).unwrap();
+        let child = metadata.create_group_under(&[1], Some(parent)).unwrap();
+        metadata.set_group_locked(parent, true).unwrap();
+        metadata.set_group_hidden(parent, true).unwrap();
+
+        assert!(metadata.group_is_locked(child));
+        assert!(metadata.group_is_hidden(child));
+        assert_eq!(metadata.locked_faces(), HashSet::from([0, 1]));
+        assert_eq!(metadata.hidden_faces(), HashSet::from([0, 1]));
+        assert!(metadata.group_has_locked_ancestor(child));
+        assert!(metadata.group_has_hidden_ancestor(child));
+
+        let json = serde_json::to_string(&metadata).unwrap();
+        let loaded: FaceMetadata = serde_json::from_str(&json).unwrap();
+        assert_eq!(loaded.locked_faces(), HashSet::from([0, 1]));
+        assert_eq!(loaded.hidden_faces(), HashSet::from([0, 1]));
     }
 
     #[test]

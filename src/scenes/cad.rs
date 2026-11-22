@@ -6,7 +6,7 @@ use crate::core::object_assets::{
     EditableMesh, FaceGroupProgram, FaceMetadata, MeshPrimitive, ObjectCatalog, ObjectCategory,
     ObjectId, RadialNeighborState,
 };
-use crate::core::ui::ui_button;
+use crate::core::ui::{fit_status_text, ui_button};
 use crate::core::{FrameContext, Scene};
 
 const SIDEBAR_WIDTH: f32 = 250.0;
@@ -4103,27 +4103,6 @@ fn status_bar_message(state: &CadSceneState, asset_error: Option<&str>) -> (Stri
         "Select an object to edit."
     };
     (message.to_string(), false)
-}
-
-fn fit_status_text(text: &str, max_width: f32, font_size: u16) -> String {
-    if measure_text(text, None, font_size, 1.0).width <= max_width {
-        return text.to_string();
-    }
-    if max_width <= measure_text("...", None, font_size, 1.0).width {
-        return String::new();
-    }
-    let mut fitted = String::new();
-    for character in text.chars() {
-        let mut candidate = fitted.clone();
-        candidate.push(character);
-        candidate.push_str("...");
-        if measure_text(&candidate, None, font_size, 1.0).width > max_width {
-            break;
-        }
-        fitted.push(character);
-    }
-    fitted.push_str("...");
-    fitted
 }
 
 fn draw_status_bar(ctx: &FrameContext, catalog: &ObjectCatalog, state: &CadSceneState) {

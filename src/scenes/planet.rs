@@ -50,8 +50,8 @@ use crate::core::planet_units::{
     update_units_and_construction,
 };
 use crate::core::ui::{
-    WINDOW_TITLE_HEIGHT, WindowState, WindowStyle, draw_build_panel, draw_window, ui_button,
-    ui_checkbox,
+    WINDOW_TITLE_HEIGHT, WindowState, WindowStyle, draw_build_panel, draw_tooltip, draw_window,
+    ui_button, ui_checkbox,
 };
 use crate::core::{Axial, FrameContext, MachineBlock, MachineBlockType, Scene, axial_neighbors};
 use crate::core::{BaseInteriorState, tick_base_interior};
@@ -5641,32 +5641,7 @@ pub fn run(
         state.selected_build_tool = option;
     }
     if let Some(tip) = panel_result.hovered_tip {
-        let dim = measure_text(tip, None, ctx.font_sm as u16, 1.0);
-        let pad = 8.0;
-        let x = (mouse.x + 12.0).min(screen_width() - dim.width - pad * 2.0 - 4.0);
-        let y = (mouse.y + 14.0).min(screen_height() - dim.height - pad * 2.0 - 4.0);
-        draw_rectangle(
-            x,
-            y,
-            dim.width + pad * 2.0,
-            dim.height + pad * 2.0,
-            ctx.colors_rt.tooltip_bg,
-        );
-        draw_rectangle_lines(
-            x,
-            y,
-            dim.width + pad * 2.0,
-            dim.height + pad * 2.0,
-            1.0,
-            ctx.colors_rt.tooltip_border,
-        );
-        draw_text(
-            tip,
-            x + pad,
-            y + pad + dim.height - 2.0,
-            ctx.font_sm,
-            ctx.colors_rt.text_primary,
-        );
+        draw_tooltip(tip, mouse, ctx.font_sm, 8.0, &ctx.colors_rt);
     }
     let mut spawn_request: Option<(u32, PlanetUnitDefinitionId, PlanetUnitNodeConfig)> = None;
     let mut expand_mine_request: Option<u32> = None;

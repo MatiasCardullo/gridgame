@@ -1763,37 +1763,7 @@ pub fn run(
     }
 
     if let Some(tip) = tooltip {
-        let pad = 6.0;
-        let lines: Vec<&str> = tip.lines().collect();
-        let mut max_width: f32 = 0.0;
-        let mut total_height: f32 = 0.0;
-        for line in &lines {
-            let dim = measure_text(line, None, ctx.font_sm as u16, 1.0);
-            max_width = max_width.max(dim.width);
-            total_height += dim.height.max(ctx.font_sm);
-        }
-        let x = (ctx.mouse.x + 14.0).min(screen_width() - max_width - 2.0 * pad);
-        let y = (ctx.mouse.y + 16.0).min(screen_height() - total_height - 2.0 * pad);
-        draw_rectangle(
-            x,
-            y,
-            max_width + 2.0 * pad,
-            total_height + 2.0 * pad,
-            colors.tooltip_bg,
-        );
-        draw_rectangle_lines(
-            x,
-            y,
-            max_width + 2.0 * pad,
-            total_height + 2.0 * pad,
-            config.line_thickness.max(1.0),
-            colors.tooltip_border,
-        );
-        let mut line_y = y + pad + ctx.font_sm - 2.0;
-        for line in lines {
-            draw_text(line, x + pad, line_y, ctx.font_sm, colors.text_primary);
-            line_y += ctx.font_sm;
-        }
+        crate::core::ui::draw_tooltip(&tip, ctx.mouse, ctx.font_sm, 6.0, colors);
     }
 
     if window.open {

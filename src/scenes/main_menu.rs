@@ -1,6 +1,6 @@
 use macroquad::prelude::*;
 
-use crate::core::ui::{draw_log_panel, draw_progress_bar, ui_button};
+use crate::core::ui::{draw_log_panel, draw_panel_frame, draw_progress_bar, ui_button};
 use crate::core::{Axial, FrameContext, PlacedBlock, Scene, TileData, Unit, save_map};
 use std::collections::HashMap;
 
@@ -113,13 +113,10 @@ fn draw_planet_loading_panel(
         return;
     }
     let panel = Rect::new(24.0, screen_height() - 220.0, 420.0, 190.0);
-    draw_rectangle(panel.x, panel.y, panel.w, panel.h, ctx.colors_rt.panel_bg);
-    draw_rectangle_lines(
-        panel.x,
-        panel.y,
-        panel.w,
-        panel.h,
+    draw_panel_frame(
+        panel,
         1.5,
+        ctx.colors_rt.panel_bg,
         ctx.colors_rt.panel_border,
     );
     draw_text(

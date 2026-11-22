@@ -2432,19 +2432,19 @@ impl FaceMetadata {
         source_face: usize,
         first_new_face: usize,
         new_face_count: usize,
-    ) {
-        if let Some(group) = self
-            .groups
-            .iter_mut()
-            .find(|group| group.faces.contains(&source_face))
-        {
-            group
-                .faces
-                .extend(first_new_face..first_new_face + new_face_count);
-            group.faces.sort_unstable();
-        }
+    ) -> Result<u64, String> {
         self.face_names
             .resize(first_new_face + new_face_count, None);
+        let parent_id = self
+            .groups
+            .iter()
+            .find(|group| group.faces.contains(&source_face))
+            .and_then(|group| group.parent_id);
+        let mut involved_faces = vec![source_face];
+        involved_faces.extend(first_new_face..first_new_face + new_face_count);
+        let group_id = self.create_group_under(&involved_faces, parent_id)?;
+        self.rename_group(group_id, "Extrude".to_string())?;
+        Ok(group_id)
     }
 }
 
@@ -3826,12 +3826,12 @@ mod tests {
     }
 
     #[test]
-    fn extruded_faces_inherit_group_without_names() {
+    fn extrusion_creates_group_for_source_and_new_faces_without_names() {
         let mut metadata = FaceMetadata::for_face_count(2);
         metadata.rename_face(0, "source".to_string()).unwrap();
-        let group = metadata.create_group(&[0]).unwrap();
+        metadata.create_group(&[0]).unwrap();
 
-        metadata.inherit_group_for_extrusion(0, 2, 7);
+        let group = metadata.inherit_group_for_extrusion(0, 2, 7).unwrap();
 
         assert_eq!(
             metadata.group(group).unwrap().faces,

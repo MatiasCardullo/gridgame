@@ -4398,6 +4398,10 @@ pub fn run(
         for row in state.face_scroll..(state.face_scroll + visible_rows).min(items.len()) {
             let item = items[row];
             let y = FACE_LIST_TOP + (row - state.face_scroll) as f32 * FACE_ROW_HEIGHT;
+            let show_lock_hide = matches!(item, SidebarItem::Group(group_id)
+                if selected_metadata(catalog, state)
+                    .and_then(|metadata| metadata.faces_for_group(group_id))
+                    .is_some_and(|faces| !faces.is_empty()));
             let (depth, nested_face) = selected_metadata(catalog, state)
                 .map(|metadata| match item {
                     SidebarItem::Group(group_id) => (group_depth(metadata, group_id), false),
@@ -4424,6 +4428,7 @@ pub fn run(
             if !modal_open
                 && !rename_dialog_open
                 && matches!(item, SidebarItem::Group(_))
+                && show_lock_hide
                 && list_row_clicked(lock_rect, ctx.mouse)
             {
                 if let SidebarItem::Group(group_id) = item
@@ -4435,6 +4440,7 @@ pub fn run(
             } else if !modal_open
                 && !rename_dialog_open
                 && matches!(item, SidebarItem::Group(_))
+                && show_lock_hide
                 && list_row_clicked(hide_rect, ctx.mouse)
             {
                 if let SidebarItem::Group(group_id) = item
@@ -4471,13 +4477,27 @@ pub fn run(
                     SidebarItem::Face { index, .. } => {
                         let extend =
                             is_key_down(KeyCode::LeftShift) || is_key_down(KeyCode::RightShift);
-                        select_face(state, index, extend);
-                        let payload = if state.selected_faces.contains(&index) {
-                            state.selected_faces.clone()
+                        if state.trim_active && state.trim_phase == TrimPhase::Targets {
+                            toggle_index(&mut state.trim_target_faces, index);
+                            state.selected_faces = state.trim_target_faces.clone();
+                            state.selected_group = None;
+                            state.selection_mode = SelectionMode::Face;
+                            state.dragged_faces = None;
+                        } else if state.trim_active && state.trim_phase == TrimPhase::Cutters {
+                            toggle_index(&mut state.trim_cutter_faces, index);
+                            state.selected_faces = state.trim_cutter_faces.clone();
+                            state.selected_group = None;
+                            state.selection_mode = SelectionMode::Face;
+                            state.dragged_faces = None;
                         } else {
-                            vec![index]
-                        };
-                        state.dragged_faces = Some(payload);
+                            select_face(state, index, extend);
+                            let payload = if state.selected_faces.contains(&index) {
+                                state.selected_faces.clone()
+                            } else {
+                                vec![index]
+                            };
+                            state.dragged_faces = Some(payload);
+                        }
                     }
                 }
             }
@@ -4744,13 +4764,22 @@ pub fn run(
                             .map(EditableMesh::face_count)
                             .unwrap_or(old_face_count);
                         if let Some(metadata) = selected_metadata_mut(catalog, state) {
-                            metadata.inherit_group_for_extrusion(
+                            match metadata.inherit_group_for_extrusion(
                                 face,
                                 old_face_count,
                                 new_face_count.saturating_sub(old_face_count),
-                            );
+                            ) {
+                                Ok(group_id) => {
+                                    state.selected_group = Some(group_id);
+                                }
+                                Err(error) => {
+                                    state.error = Some(error);
+                                    return;
+                                }
+                            }
                         }
-                        state.selected_faces = vec![old_face_count];
+                        state.selected_faces = (old_face_count..new_face_count).collect();
+                        state.selected_faces.push(face);
                         push_undo(state, before);
                         state.dirty = true;
                         state.error = None;
@@ -5384,6 +5413,8 @@ pub fn run(
                             state.trim_target_faces.clear();
                         }
                         toggle_index(&mut state.trim_target_faces, face);
+                        state.selected_faces = state.trim_target_faces.clone();
+                        state.selected_group = None;
                         state.error = None;
                     } else {
                         state.error = Some("Click a target face to split".into());
@@ -5425,6 +5456,8 @@ pub fn run(
                         state.trim_cutter_faces.clear();
                     }
                     toggle_index(&mut state.trim_cutter_faces, face);
+                    state.selected_faces = state.trim_cutter_faces.clone();
+                    state.selected_group = None;
                     state.error = None;
                 } else {
                     state.error = Some("Click a mesh face to use as a cutter".into());
@@ -5619,18 +5652,23 @@ pub fn run(
                         let lock = Rect::new(configure.x + 36.0, y, 28.0, FACE_ROW_HEIGHT - 2.0);
                         let hide = Rect::new(configure.x + 66.0, y, 28.0, FACE_ROW_HEIGHT - 2.0);
                         draw_group_action_button(ctx, configure, "Set", false);
-                        draw_group_action_button(
-                            ctx,
-                            lock,
-                            "L",
-                            metadata.group_is_locked(group_id),
-                        );
-                        draw_group_action_button(
-                            ctx,
-                            hide,
-                            "H",
-                            metadata.group_is_hidden(group_id),
-                        );
+                        let nonempty = metadata
+                            .faces_for_group(group_id)
+                            .is_some_and(|faces| !faces.is_empty());
+                        if nonempty {
+                            draw_group_action_button(
+                                ctx,
+                                lock,
+                                "L",
+                                metadata.group_is_locked(group_id),
+                            );
+                            draw_group_action_button(
+                                ctx,
+                                hide,
+                                "H",
+                                metadata.group_is_hidden(group_id),
+                            );
+                        }
                     }
                 }
             }

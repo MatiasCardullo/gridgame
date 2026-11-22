@@ -3,8 +3,9 @@ use std::collections::{HashMap, HashSet};
 use macroquad::prelude::*;
 
 use crate::core::object_assets::{
-    EditableMesh, FaceGroupProgram, FaceMetadata, MeshPrimitive, ObjectCatalog, ObjectCategory,
-    ObjectId, RadialNeighborState,
+    BUILDING_PREVIEW_CELL_GUIDE_RADIUS, BUILDING_PREVIEW_CELL_RADIUS, EditableMesh,
+    FaceGroupProgram, FaceMetadata, MeshPrimitive, ObjectCatalog, ObjectCategory, ObjectId,
+    RadialNeighborState, building_model_scale_for_cell, mesh_center_and_scale,
 };
 use crate::core::ui::{fit_status_text, ui_button};
 use crate::core::{FrameContext, Scene};
@@ -12,8 +13,10 @@ use crate::core::{FrameContext, Scene};
 const SIDEBAR_WIDTH: f32 = 250.0;
 const TOOLBAR_HEIGHT: f32 = 62.0;
 const STATUS_BAR_HEIGHT: f32 = 28.0;
-const CAMERA_MIN_DISTANCE: f32 = 1.5;
-const CAMERA_MAX_DISTANCE: f32 = 100.0;
+const CAMERA_MIN_DISTANCE: f32 = 0.000001;
+const CAMERA_MAX_DISTANCE: f32 = 10.0;
+const MESH_VIEW_MIN_PREVIEW_DISTANCE: f32 = 2.0;
+const MESH_VIEW_DISTANCE_SCALE: f32 = 1.8;
 const HISTORY_LIMIT: usize = 100;
 const FACE_LIST_TOP: f32 = 148.0;
 const FACE_ROW_HEIGHT: f32 = 26.0;
@@ -246,11 +249,11 @@ pub struct CadSceneState {
     operation_value: String,
     operation_value_focused: bool,
     operation_value_selected: bool,
-    paint_active: bool,
     paint_color: Color,
     paint_hex: String,
     paint_hex_focused: bool,
     paint_hex_selected: bool,
+    paint_hex_last_click: f64,
     primitive_placement: Option<PrimitivePlacement>,
     grid_snap: bool,
     grid_spacing: f32,
@@ -313,11 +316,11 @@ impl Default for CadSceneState {
             operation_value: "0.1".to_string(),
             operation_value_focused: false,
             operation_value_selected: false,
-            paint_active: false,
             paint_color: Color::from_rgba(205, 190, 160, 255),
             paint_hex: "CDBEA0".to_string(),
             paint_hex_focused: false,
             paint_hex_selected: false,
+            paint_hex_last_click: -1.0,
             primitive_placement: None,
             grid_snap: false,
             grid_spacing: 0.5,
@@ -355,6 +358,31 @@ fn object_camera(state: &CadSceneState) -> Camera3D {
         z_far: 500.0,
         ..Default::default()
     }
+}
+
+fn mesh_view_camera_distance(preview_distance: f32) -> f32 {
+    preview_distance * BUILDING_PREVIEW_CELL_GUIDE_RADIUS / BUILDING_PREVIEW_CELL_RADIUS
+}
+
+fn mesh_view_preview_distance(distance: f32) -> f32 {
+    (distance * MESH_VIEW_DISTANCE_SCALE).max(MESH_VIEW_MIN_PREVIEW_DISTANCE)
+}
+
+fn cad_view_camera(state: &CadSceneState) -> Camera3D {
+    if state.interaction_preview {
+        return preview_camera(state);
+    }
+
+    let mut camera = object_camera(state);
+    if state.editing {
+        let direction = (camera.position - camera.target).normalize_or_zero();
+        let distance = mesh_view_camera_distance(mesh_view_preview_distance(state.distance));
+        camera.position = camera.target + direction * distance;
+        camera.z_far = (CAMERA_MAX_DISTANCE * 1.8 * BUILDING_PREVIEW_CELL_GUIDE_RADIUS
+            / BUILDING_PREVIEW_CELL_RADIUS)
+            .max(camera.z_far);
+    }
+    camera
 }
 
 fn zoom_distance(distance: f32, wheel: f32) -> f32 {
@@ -859,19 +887,6 @@ fn draw_transform_gizmo(center: Vec3, mode: TransformMode, handle_size: f32) {
         None,
         Color::from_rgba(245, 245, 245, 255),
     );
-}
-
-fn mesh_center_and_scale(mesh: &EditableMesh) -> (Vec3, f32) {
-    let mut min = vec3(f32::INFINITY, f32::INFINITY, f32::INFINITY);
-    let mut max = vec3(f32::NEG_INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY);
-    for vertex in &mesh.vertices {
-        min = min.min(vertex.position);
-        max = max.max(vertex.position);
-    }
-    let center = (min + max) * 0.5;
-    let extent = max - min;
-    let scale = 2.4 / extent.x.max(extent.y).max(extent.z).max(0.001);
-    (center, scale)
 }
 
 fn preview_mesh(mesh: &EditableMesh) -> EditableMesh {
@@ -1967,6 +1982,18 @@ fn parse_paint_hex(text: &str) -> Result<Color, String> {
     Ok(Color::from_rgba(bytes[0], bytes[1], bytes[2], alpha))
 }
 
+fn format_paint_hex(color: Color) -> String {
+    let red = (color.r * 255.0).round() as u8;
+    let green = (color.g * 255.0).round() as u8;
+    let blue = (color.b * 255.0).round() as u8;
+    let alpha = (color.a * 255.0).round() as u8;
+    if alpha == 255 {
+        format!("{red:02X}{green:02X}{blue:02X}")
+    } else {
+        format!("{red:02X}{green:02X}{blue:02X}{alpha:02X}")
+    }
+}
+
 fn parse_operation_distance(text: &str, label: &str) -> Result<f32, String> {
     let value = text
         .trim()
@@ -1985,70 +2012,50 @@ fn apply_offset(catalog: &mut ObjectCatalog, state: &mut CadSceneState) -> Resul
     })
 }
 
-fn apply_paint_pick(
+fn paint_selection_faces(
+    state: &CadSceneState,
+    metadata: &FaceMetadata,
+) -> Result<Vec<usize>, String> {
+    if state.selection_mode != SelectionMode::Face {
+        return Err("Select faces or a face group before painting".to_string());
+    }
+    let faces = if let Some(group_id) = state.selected_group {
+        let group = metadata
+            .group(group_id)
+            .ok_or_else(|| format!("Face group {group_id} does not exist"))?;
+        if metadata.group_is_locked(group_id) || group.locked {
+            return Err("Unlock the group before painting".to_string());
+        }
+        if metadata.group_is_hidden(group_id) || group.hidden {
+            return Err("Show the group before painting".to_string());
+        }
+        metadata
+            .faces_for_group(group_id)
+            .ok_or_else(|| format!("Face group {group_id} does not exist"))?
+    } else {
+        state.selected_faces.clone()
+    };
+    if faces.is_empty() {
+        return Err("Select at least one face or a non-empty face group to paint".to_string());
+    }
+    ensure_faces_editable(metadata, &faces)?;
+    Ok(faces)
+}
+
+fn apply_paint_selection(
     catalog: &mut ObjectCatalog,
     state: &mut CadSceneState,
-    camera: &Camera3D,
-    mouse: Vec2,
-    mesh: &EditableMesh,
-    blocked_faces: &HashSet<usize>,
+    color: Color,
 ) -> Result<(), String> {
-    let vertex_indices = match state.selection_mode {
-        SelectionMode::Vertex => {
-            let index = pick_vertex(camera, mouse, mesh, blocked_faces)
-                .ok_or_else(|| "Click a mesh vertex to paint".to_string())?;
-            state.selected_vertices = vec![index];
-            state.selected_edges.clear();
-            state.selected_faces.clear();
-            state.selected_group = None;
-            vec![index]
-        }
-        SelectionMode::Edge => {
-            let edge = pick_edge(camera, mouse, mesh, blocked_faces)
-                .ok_or_else(|| "Click a mesh edge to paint".to_string())?;
-            state.selected_edges = vec![edge];
-            state.selected_vertices.clear();
-            state.selected_faces.clear();
-            state.selected_group = None;
-            vec![edge.0, edge.1]
-        }
-        SelectionMode::Face => {
-            let (origin, direction) = mouse_ray(camera, mouse)
-                .ok_or_else(|| "Could not create a mouse ray".to_string())?;
-            let face = mesh_ray_hit_excluding(origin, direction, mesh, blocked_faces)
-                .ok_or_else(|| "Click a mesh face to paint".to_string())?;
-            ensure_faces_editable(
-                selected_metadata(catalog, state)
-                    .ok_or_else(|| "Selected face metadata is unavailable".to_string())?,
-                &[face],
-            )?;
-            state.selected_faces = vec![face];
-            state.selected_vertices.clear();
-            state.selected_edges.clear();
-            state.selected_group = None;
-            let start = face
-                .checked_mul(3)
-                .ok_or_else(|| "Invalid face index".to_string())?;
-            let triangle = mesh
-                .indices
-                .get(start..start + 3)
-                .ok_or_else(|| "Selected face is outside the mesh".to_string())?;
-            triangle.iter().map(|&index| index as usize).collect()
-        }
-    };
-    if vertex_indices.is_empty() {
-        return Err("Selected paint target is empty".to_string());
-    }
+    let faces = paint_selection_faces(
+        state,
+        selected_metadata(catalog, state)
+            .ok_or_else(|| "Selected face metadata is unavailable".to_string())?,
+    )?;
     let snapshot = capture_snapshot(catalog, state)?;
-    let mesh = selected_mesh_mut(catalog, state)
-        .ok_or_else(|| "Selected object is unavailable".to_string())?;
-    let mut unique_indices = vertex_indices;
-    unique_indices.sort_unstable();
-    unique_indices.dedup();
-    let result = mesh.paint_vertices(&unique_indices, state.paint_color);
-    if result.is_err() {
-        return result;
-    }
+    selected_mesh_mut(catalog, state)
+        .ok_or_else(|| "Selected object is unavailable".to_string())?
+        .paint_faces(&faces, color)?;
     push_undo(state, snapshot);
     state.dirty = true;
     state.error = None;
@@ -2116,7 +2123,12 @@ fn pick_edge(
     closest.map(|(_, edge)| edge)
 }
 
-fn draw_paint_panel(ctx: &FrameContext, panel: Rect, state: &mut CadSceneState) {
+fn draw_paint_panel(
+    ctx: &FrameContext,
+    panel: Rect,
+    state: &mut CadSceneState,
+    catalog: &mut ObjectCatalog,
+) {
     if !state.editing {
         return;
     }
@@ -2137,11 +2149,18 @@ fn draw_paint_panel(ctx: &FrameContext, panel: Rect, state: &mut CadSceneState) 
         ctx.colors_rt.panel_border,
     );
     draw_text(
-        "Paint Color",
+        "Face Paint",
         paint_panel.x + 12.0,
         paint_panel.y + 20.0,
         ctx.font_sm,
         ctx.colors_rt.text_primary,
+    );
+    draw_text(
+        "Select face/group; choose color",
+        paint_panel.x + 12.0,
+        paint_panel.y + 39.0,
+        ctx.font_sm,
+        ctx.colors_rt.text_secondary,
     );
     let swatches = [
         Color::from_rgba(205, 190, 160, 255),
@@ -2158,9 +2177,9 @@ fn draw_paint_panel(ctx: &FrameContext, panel: Rect, state: &mut CadSceneState) 
         let row = index / 4;
         let rect = Rect::new(
             paint_panel.x + 12.0 + column as f32 * 41.0,
-            paint_panel.y + 34.0 + row as f32 * 34.0,
+            paint_panel.y + 46.0 + row as f32 * 30.0,
             32.0,
-            26.0,
+            24.0,
         );
         draw_rectangle(rect.x, rect.y, rect.w, rect.h, color);
         draw_rectangle_lines(
@@ -2172,7 +2191,6 @@ fn draw_paint_panel(ctx: &FrameContext, panel: Rect, state: &mut CadSceneState) 
             ctx.colors_rt.panel_border,
         );
         if is_mouse_button_pressed(MouseButton::Left) && rect.contains(ctx.mouse) {
-            state.paint_active = true;
             state.paint_color = color;
             state.paint_hex = format!(
                 "{:02X}{:02X}{:02X}",
@@ -2182,9 +2200,14 @@ fn draw_paint_panel(ctx: &FrameContext, panel: Rect, state: &mut CadSceneState) 
             );
             state.paint_hex_focused = false;
             state.paint_hex_selected = false;
+            state.paint_hex_last_click = -1.0;
+            match apply_paint_selection(catalog, state, color) {
+                Ok(()) => state.error = None,
+                Err(error) => state.error = Some(error),
+            }
         }
     }
-    let input = Rect::new(paint_panel.x + 12.0, paint_panel.y + 104.0, 166.0, 28.0);
+    let input = Rect::new(paint_panel.x + 12.0, paint_panel.y + 108.0, 166.0, 24.0);
     draw_rectangle(
         input.x,
         input.y,
@@ -2208,9 +2231,20 @@ fn draw_paint_panel(ctx: &FrameContext, panel: Rect, state: &mut CadSceneState) 
         ctx.colors_rt.text_primary,
     );
     if is_mouse_button_pressed(MouseButton::Left) && input.contains(ctx.mouse) {
-        state.paint_active = true;
-        state.paint_hex_focused = true;
-        state.paint_hex_selected = true;
+        let now = get_time();
+        if state.paint_hex_last_click >= 0.0 && now - state.paint_hex_last_click <= 0.35 {
+            state.paint_hex_focused = true;
+            state.paint_hex_selected = true;
+            state.paint_hex_last_click = -1.0;
+        } else {
+            state.paint_hex_last_click = now;
+            state.paint_hex_focused = false;
+            state.paint_hex_selected = false;
+        }
+    } else if is_mouse_button_pressed(MouseButton::Left) {
+        state.paint_hex_focused = false;
+        state.paint_hex_selected = false;
+        state.paint_hex_last_click = -1.0;
     }
 }
 
@@ -2321,7 +2355,7 @@ fn draw_view_controls(
                 .iter()
                 .map(|state| match state {
                     RadialNeighborState::Empty => "Empty",
-                    RadialNeighborState::Route => "Route",
+                    RadialNeighborState::Route => "Same building",
                     RadialNeighborState::OtherBuilding => "Building",
                 })
                 .collect::<Vec<_>>()
@@ -2645,9 +2679,9 @@ fn restore_original_mesh(
 fn close_editor(state: &mut CadSceneState) {
     state.editing = false;
     state.dirty = false;
-    state.paint_active = false;
     state.paint_hex_focused = false;
     state.paint_hex_selected = false;
+    state.paint_hex_last_click = -1.0;
     state.original_mesh = None;
     state.original_metadata = None;
     state.selection_mode = SelectionMode::Vertex;
@@ -3223,7 +3257,6 @@ fn primitive_group_name(primitive: MeshPrimitive) -> &'static str {
 }
 
 fn start_primitive_placement(state: &mut CadSceneState, primitive: MeshPrimitive) {
-    state.paint_active = false;
     state.paint_hex_focused = false;
     state.paint_hex_selected = false;
     state.primitive_placement = Some(PrimitivePlacement {
@@ -3344,25 +3377,22 @@ fn compose_conditioned_preview(
     Ok(composite)
 }
 
-fn route_neighbor_preview_mesh(
-    route_mesh: &EditableMesh,
-    metadata: &FaceMetadata,
+fn radial_neighbor_conditions(
+    owner: ObjectId,
+    center: ObjectId,
+    neighbors: &[Option<ObjectId>; 6],
     neighbor_index: usize,
-) -> Result<Option<EditableMesh>, String> {
-    let Some(sector_mesh) = metadata.radial_sector_mesh(route_mesh, RadialNeighborState::Route)?
-    else {
-        return Ok(None);
+) -> [RadialNeighborState; 6] {
+    let condition_for = |neighbor: Option<ObjectId>| match neighbor {
+        None => RadialNeighborState::Empty,
+        Some(neighbor) if neighbor == owner => RadialNeighborState::Route,
+        Some(_) => RadialNeighborState::OtherBuilding,
     };
-    let pivot = metadata
-        .radial_pivot
-        .map(|[x, y, z]| vec3(x, y, z))
-        .unwrap_or(Vec3::ZERO);
-    let sector = (neighbor_index + 3) % 6;
-    Ok(Some(rotate_mesh_y_about(
-        &sector_mesh,
-        std::f32::consts::TAU * sector as f32 / 6.0,
-        pivot,
-    )))
+    let mut conditions = [RadialNeighborState::Empty; 6];
+    conditions[(neighbor_index + 3) % 6] = condition_for(Some(center));
+    conditions[(neighbor_index + 2) % 6] = condition_for(neighbors[(neighbor_index + 1) % 6]);
+    conditions[(neighbor_index + 4) % 6] = condition_for(neighbors[(neighbor_index + 5) % 6]);
+    conditions
 }
 
 fn preview_neighbor_object(
@@ -3377,7 +3407,6 @@ fn preview_neighbor_object(
         .filter(|entry| {
             entry.definition.category == ObjectCategory::Buildings
                 && entry.definition.id != selected
-                && entry.definition.id != ObjectId::PlanetRoute
                 && entry.mesh.is_some()
         })
         .map(|entry| entry.definition.id)
@@ -3388,6 +3417,40 @@ fn preview_neighbor_object(
     let index = seed.wrapping_add((neighbor_index as u64).wrapping_mul(0x9E37_79B9)) as usize
         % candidates.len();
     Some(candidates[index])
+}
+
+fn preview_neighbor_for_condition(
+    catalog: &ObjectCatalog,
+    selected: ObjectId,
+    seed: u64,
+    neighbor_index: usize,
+    condition: RadialNeighborState,
+) -> Option<ObjectId> {
+    match condition {
+        RadialNeighborState::Empty => None,
+        RadialNeighborState::Route => Some(selected),
+        RadialNeighborState::OtherBuilding => {
+            preview_neighbor_object(catalog, selected, seed, neighbor_index)
+        }
+    }
+}
+
+fn mesh_cell_guide_center(mesh: &EditableMesh, metadata: Option<&FaceMetadata>) -> Vec3 {
+    let (model_center, scale) = mesh_center_and_scale(mesh);
+    if let Some(metadata) = metadata.filter(|metadata| metadata.radial_main_group_id().is_some()) {
+        let pivot = metadata
+            .radial_pivot
+            .map(|[x, y, z]| vec3(x, y, z))
+            .unwrap_or(Vec3::ZERO);
+        return (pivot - model_center) * scale;
+    }
+    let min_y = mesh
+        .vertices
+        .iter()
+        .map(|vertex| vertex.position.y)
+        .reduce(f32::min)
+        .unwrap_or(model_center.y);
+    vec3(0.0, (min_y - model_center.y) * scale, 0.0)
 }
 
 fn hex_cell_center(index: usize, radius: f32, origin: Vec3) -> Vec3 {
@@ -3415,9 +3478,9 @@ fn draw_preview_object(
     reference: &EditableMesh,
     anchor: Option<Vec3>,
     center: Vec3,
-    scale: f32,
 ) -> Result<(), String> {
     let normalized = preview_mesh_with_reference_at(mesh, reference, anchor);
+    let scale = building_model_scale_for_cell(BUILDING_PREVIEW_CELL_RADIUS);
     let min_y = normalized
         .vertices
         .iter()
@@ -3485,7 +3548,7 @@ fn draw_ucs_icon(origin: Vec3, length: f32) {
 fn preview_camera(state: &CadSceneState) -> Camera3D {
     let mut camera = object_camera(state);
     let direction = (camera.position - camera.target).normalize_or_zero();
-    let distance = (state.distance * 1.8).max(5.5);
+    let distance = (state.distance * MESH_VIEW_DISTANCE_SCALE).max(5.5);
     camera.position = camera.target + direction * distance;
     camera
 }
@@ -3495,16 +3558,25 @@ fn draw_interaction_preview(catalog: &ObjectCatalog, state: &CadSceneState) -> R
     set_camera(&camera);
     let result = (|| {
         let origin = state.target;
-        const CELL_RADIUS: f32 = 0.9;
+        const CELL_RADIUS: f32 = BUILDING_PREVIEW_CELL_RADIUS;
         draw_hex_outline(origin, CELL_RADIUS, Color::from_rgba(255, 225, 90, 255));
         for index in 0..6 {
             let center = hex_cell_center(index, CELL_RADIUS, origin);
             draw_hex_outline(center, CELL_RADIUS, Color::from_rgba(115, 145, 165, 255));
         }
 
-        let center_mesh = interaction_preview_mesh(catalog, state)?;
-        let reference_mesh = selected_mesh(catalog, state)
+        let neighbor_objects = std::array::from_fn(|index| {
+            preview_neighbor_for_condition(
+                catalog,
+                state.selected,
+                state.preview_seed,
+                index,
+                state.preview_neighbors[index],
+            )
+        });
+        let center_reference = selected_mesh(catalog, state)
             .ok_or_else(|| "Selected object is unavailable".to_string())?;
+        let center_mesh = interaction_preview_mesh(catalog, state)?;
         let metadata = selected_metadata(catalog, state);
         let radial_anchor = metadata
             .filter(|metadata| metadata.radial_main_group_id().is_some())
@@ -3514,49 +3586,41 @@ fn draw_interaction_preview(catalog: &ObjectCatalog, state: &CadSceneState) -> R
                     .map(|[x, y, z]| vec3(x, y, z))
                     .unwrap_or(Vec3::ZERO)
             });
-        draw_preview_object(&center_mesh, reference_mesh, radial_anchor, origin, 0.28)?;
-        for (index, condition) in state.preview_neighbors.iter().copied().enumerate() {
-            let object_id = match condition {
-                RadialNeighborState::Empty => None,
-                RadialNeighborState::Route => Some(ObjectId::PlanetRoute),
-                RadialNeighborState::OtherBuilding => {
-                    preview_neighbor_object(catalog, state.selected, state.preview_seed, index)
-                }
-            };
-            let Some(mesh) = object_id.and_then(|id| catalog.get(id)) else {
+        draw_preview_object(&center_mesh, center_reference, radial_anchor, origin)?;
+        for (index, object_id) in neighbor_objects.iter().copied().enumerate() {
+            let Some(object_id) = object_id else {
                 continue;
             };
-            if condition == RadialNeighborState::Route {
-                if let Some(metadata) = catalog.metadata(ObjectId::PlanetRoute, None)
-                    && metadata.radial_main_group_id().is_some()
-                {
-                    let Some(neighbor_mesh) = route_neighbor_preview_mesh(mesh, metadata, index)?
-                    else {
-                        continue;
-                    };
-                    if neighbor_mesh.vertices.is_empty() {
-                        continue;
-                    }
-                    let pivot = metadata
-                        .radial_pivot
-                        .map(|[x, y, z]| vec3(x, y, z))
-                        .unwrap_or(Vec3::ZERO);
-                    draw_preview_object(
-                        &neighbor_mesh,
-                        mesh,
-                        Some(pivot),
-                        hex_cell_center(index, CELL_RADIUS, origin),
-                        0.24,
-                    )?;
-                    continue;
-                }
-            }
+            let Some(mesh) = catalog.get(object_id) else {
+                continue;
+            };
+            let metadata = catalog.metadata(object_id, None);
+            let radial = metadata.is_some_and(|metadata| metadata.radial_main_group_id().is_some());
+            let pivot = radial.then(|| {
+                metadata
+                    .and_then(|metadata| metadata.radial_pivot)
+                    .map(|[x, y, z]| vec3(x, y, z))
+                    .unwrap_or(Vec3::ZERO)
+            });
+            let neighbor_mesh = match (metadata, radial) {
+                (Some(metadata), true) => compose_conditioned_preview(
+                    mesh,
+                    metadata,
+                    &radial_neighbor_conditions(
+                        object_id,
+                        state.selected,
+                        &neighbor_objects,
+                        index,
+                    ),
+                    pivot.unwrap_or(Vec3::ZERO),
+                )?,
+                _ => mesh.clone(),
+            };
             draw_preview_object(
+                &neighbor_mesh,
                 mesh,
-                mesh,
-                None,
+                pivot,
                 hex_cell_center(index, CELL_RADIUS, origin),
-                0.24,
             )?;
         }
         Ok(())
@@ -4251,8 +4315,7 @@ pub fn run(
             state.operation_value_focused = false;
             state.operation_value_selected = false;
             state.error = None;
-        } else if state.paint_active {
-            state.paint_active = false;
+        } else if state.paint_hex_focused {
             state.paint_hex_focused = false;
             state.paint_hex_selected = false;
             state.error = None;
@@ -4366,7 +4429,7 @@ pub fn run(
             state.error = None;
         }
     }
-    if !modal_open && state.paint_active && state.paint_hex_focused {
+    if !modal_open && state.paint_hex_focused {
         let mut changed = false;
         while let Some(character) = get_char_pressed() {
             if character.is_ascii_hexdigit() {
@@ -4392,29 +4455,20 @@ pub fn run(
         if is_key_pressed(KeyCode::Enter) {
             match parse_paint_hex(&state.paint_hex) {
                 Ok(color) => {
-                    state.paint_active = true;
                     state.paint_color = color;
-                    state.paint_hex = format!(
-                        "{:02X}{:02X}{:02X}",
-                        (color.r * 255.0).round() as u8,
-                        (color.g * 255.0).round() as u8,
-                        (color.b * 255.0).round() as u8,
-                    );
+                    state.paint_hex = format_paint_hex(color);
                     state.paint_hex_focused = false;
                     state.paint_hex_selected = false;
-                    state.error = None;
+                    match apply_paint_selection(catalog, state, color) {
+                        Ok(()) => state.error = None,
+                        Err(error) => state.error = Some(error),
+                    }
                 }
                 Err(error) => state.error = Some(error),
             }
         }
-        if changed {
-            match parse_paint_hex(&state.paint_hex) {
-                Ok(color) => {
-                    state.paint_color = color;
-                    state.error = None;
-                }
-                Err(_) => {}
-            }
+        if changed && let Ok(color) = parse_paint_hex(&state.paint_hex) {
+            state.paint_color = color;
         }
     }
     if !modal_open
@@ -5140,7 +5194,6 @@ pub fn run(
                         Some("Select mesh edges to fillet before starting the tool".into());
                 } else {
                     clear_trim_state(state);
-                    state.paint_active = false;
                     state.paint_hex_focused = false;
                     state.paint_hex_selected = false;
                     state.mirror_active = label == "Mirror";
@@ -5191,7 +5244,7 @@ pub fn run(
         state.numeric_transform_selected = false;
     }
 
-    let camera = object_camera(state);
+    let camera = cad_view_camera(state);
     let editor_modal_open =
         state.exit_confirmation_open || state.group_config_dialog.is_some() || rename_dialog_open;
     let viewport_active = state.gizmo_drag.is_some()
@@ -5219,11 +5272,7 @@ pub fn run(
         }
     }
     state.last_mouse = ctx.mouse;
-    let camera = if state.interaction_preview {
-        preview_camera(state)
-    } else {
-        object_camera(state)
-    };
+    let camera = cad_view_camera(state);
 
     let current_mesh = selected_mesh(catalog, state).cloned();
     let hidden_faces = selected_metadata(catalog, state)
@@ -5367,6 +5416,12 @@ pub fn run(
         {
             let (model_center, scale) = mesh_center_and_scale(mesh);
             let metadata = selected_metadata(catalog, state);
+            let guide_center = mesh_cell_guide_center(mesh, metadata);
+            draw_hex_outline(
+                guide_center,
+                BUILDING_PREVIEW_CELL_GUIDE_RADIUS,
+                Color::from_rgba(255, 225, 90, 190),
+            );
             if let Some(metadata) = metadata
                 && metadata.radial_main_group_id().is_some()
             {
@@ -5718,22 +5773,6 @@ pub fn run(
                     state.error =
                         Some("Click the mesh or construction plane to set the mirror plane".into());
                 }
-            } else if state.paint_active {
-                if let Some(source_mesh) = current_mesh.as_ref() {
-                    match apply_paint_pick(
-                        catalog,
-                        state,
-                        &camera,
-                        ctx.mouse,
-                        source_mesh,
-                        &blocked_faces,
-                    ) {
-                        Ok(()) => state.error = None,
-                        Err(error) => state.error = Some(error),
-                    }
-                } else {
-                    state.error = Some("Selected mesh is unavailable".to_string());
-                }
             } else if ensure_selection_unlocked(catalog, state).is_ok()
                 && let Some(source_mesh) = current_mesh.as_ref()
                 && let Some((_, handle_size)) = gizmo_center_and_size(source_mesh, state)
@@ -5976,7 +6015,7 @@ pub fn run(
         metadata.and_then(|metadata| metadata.radial_pivot),
     );
     draw_object_snap_panel(ctx, view_panel, state);
-    draw_paint_panel(ctx, paint_panel, state);
+    draw_paint_panel(ctx, paint_panel, state, catalog);
 
     draw_group_config_dialog(ctx, catalog, state);
     draw_numeric_transform_panel(ctx, catalog, state);
@@ -6303,7 +6342,29 @@ mod tests {
 
         let rgba = parse_paint_hex("12ab34cd").unwrap();
         assert_eq!((rgba.a * 255.0).round() as u8, 205);
+        assert_eq!(format_paint_hex(rgba), "12AB34CD");
         assert!(parse_paint_hex("xyz").is_err());
+    }
+
+    #[test]
+    fn painting_targets_only_selected_faces_or_the_selected_group() {
+        let mut metadata = FaceMetadata::for_face_count(3);
+        let group = metadata.create_group(&[0, 2]).unwrap();
+        let mut state = CadSceneState {
+            selection_mode: SelectionMode::Face,
+            selected_faces: vec![1],
+            ..CadSceneState::default()
+        };
+        assert_eq!(paint_selection_faces(&state, &metadata).unwrap(), vec![1]);
+
+        state.selected_group = Some(group);
+        assert_eq!(
+            paint_selection_faces(&state, &metadata).unwrap(),
+            vec![0, 2]
+        );
+
+        state.selection_mode = SelectionMode::Vertex;
+        assert!(paint_selection_faces(&state, &metadata).is_err());
     }
 
     #[test]
@@ -6339,6 +6400,34 @@ mod tests {
             zoom_distance(CAMERA_MAX_DISTANCE, -100.0),
             CAMERA_MAX_DISTANCE
         );
+    }
+
+    #[test]
+    fn mesh_view_camera_matches_interaction_preview_cell_framing() {
+        let preview_distance = 7.2;
+        let mesh_view_distance = mesh_view_camera_distance(preview_distance);
+        let mesh_view_extent = crate::core::object_assets::NORMALIZED_MODEL_EXTENT;
+        let preview_extent = mesh_view_extent * crate::core::object_assets::BUILDING_PREVIEW_SCALE;
+
+        assert!(
+            (mesh_view_extent / mesh_view_distance - preview_extent / preview_distance).abs()
+                < 1e-6
+        );
+        assert!(
+            (BUILDING_PREVIEW_CELL_GUIDE_RADIUS / mesh_view_distance
+                - BUILDING_PREVIEW_CELL_RADIUS / preview_distance)
+                .abs()
+                < 1e-6
+        );
+    }
+
+    #[test]
+    fn mesh_view_allows_closer_zoom_than_interaction_preview() {
+        let minimum_mesh_distance = mesh_view_preview_distance(CAMERA_MIN_DISTANCE);
+        let minimum_preview_distance = 5.5;
+
+        assert!(minimum_mesh_distance < minimum_preview_distance);
+        assert!(minimum_mesh_distance >= MESH_VIEW_MIN_PREVIEW_DISTANCE);
     }
 
     #[test]
@@ -6743,7 +6832,33 @@ mod tests {
     }
 
     #[test]
-    fn interaction_preview_center_scale_uses_all_configured_geometry_bounds() {
+    fn same_building_preview_neighbors_reuse_the_selected_model() {
+        let catalog = ObjectCatalog::load();
+
+        assert_eq!(
+            preview_neighbor_for_condition(
+                &catalog,
+                ObjectId::PlanetRoute,
+                1,
+                0,
+                RadialNeighborState::Route,
+            ),
+            Some(ObjectId::PlanetRoute)
+        );
+        assert_eq!(
+            preview_neighbor_for_condition(
+                &catalog,
+                ObjectId::PlanetBase,
+                1,
+                0,
+                RadialNeighborState::Route,
+            ),
+            Some(ObjectId::PlanetBase)
+        );
+    }
+
+    #[test]
+    fn conditioned_interaction_preview_uses_canonical_mesh_scale() {
         let color = Color::from_rgba(255, 255, 255, 255);
         let reference = EditableMesh {
             vertices: vec![
@@ -6766,8 +6881,10 @@ mod tests {
             })
             .unwrap();
 
-        let small_preview = preview_mesh_with_reference(&small_variant, &reference);
-        let large_preview = preview_mesh_with_reference(&large_variant, &reference);
+        let small_preview =
+            preview_mesh_with_reference_at(&small_variant, &reference, Some(Vec3::ZERO));
+        let large_preview =
+            preview_mesh_with_reference_at(&large_variant, &reference, Some(Vec3::ZERO));
         assert_eq!(
             small_preview.vertices[0].position,
             large_preview.vertices[0].position
@@ -6882,44 +6999,94 @@ mod tests {
     }
 
     #[test]
-    fn route_neighbor_preview_faces_back_toward_the_selected_cell() {
-        let color = Color::from_rgba(255, 255, 255, 255);
+    fn radial_neighbor_preview_uses_the_center_and_two_adjacent_ring_cells() {
+        let neighbors = [
+            None,
+            Some(ObjectId::PlanetBase),
+            Some(ObjectId::PlanetRoute),
+            None,
+            Some(ObjectId::PlanetRoute),
+            Some(ObjectId::PlanetBase),
+        ];
+        let conditions =
+            radial_neighbor_conditions(ObjectId::PlanetRoute, ObjectId::PlanetRoute, &neighbors, 0);
+
+        assert_eq!(
+            conditions,
+            [
+                RadialNeighborState::Empty,
+                RadialNeighborState::Empty,
+                RadialNeighborState::OtherBuilding,
+                RadialNeighborState::Route,
+                RadialNeighborState::OtherBuilding,
+                RadialNeighborState::Empty,
+            ]
+        );
+        let condition_for = |owner: ObjectId, neighbor: Option<ObjectId>| match neighbor {
+            None => RadialNeighborState::Empty,
+            Some(neighbor) if neighbor == owner => RadialNeighborState::Route,
+            Some(_) => RadialNeighborState::OtherBuilding,
+        };
+        for neighbor_index in 0..6 {
+            let conditions = radial_neighbor_conditions(
+                ObjectId::PlanetRoute,
+                ObjectId::PlanetRoute,
+                &neighbors,
+                neighbor_index,
+            );
+            assert_eq!(
+                conditions[(neighbor_index + 3) % 6],
+                RadialNeighborState::Route
+            );
+            assert_eq!(
+                conditions[(neighbor_index + 2) % 6],
+                condition_for(ObjectId::PlanetRoute, neighbors[(neighbor_index + 1) % 6])
+            );
+            assert_eq!(
+                conditions[(neighbor_index + 4) % 6],
+                condition_for(ObjectId::PlanetRoute, neighbors[(neighbor_index + 5) % 6])
+            );
+            for (sector, condition) in conditions.iter().enumerate() {
+                if sector != (neighbor_index + 2) % 6
+                    && sector != (neighbor_index + 3) % 6
+                    && sector != (neighbor_index + 4) % 6
+                {
+                    assert_eq!(*condition, RadialNeighborState::Empty);
+                }
+            }
+        }
+        assert_eq!(
+            radial_neighbor_conditions(ObjectId::PlanetRoute, ObjectId::PlanetBase, &neighbors, 0)
+                [3],
+            RadialNeighborState::OtherBuilding
+        );
+    }
+
+    #[test]
+    fn mesh_view_hex_uses_explicit_or_default_radial_ucs_origin() {
         let mesh = EditableMesh {
             vertices: vec![
-                Vertex::new2(-Vec3::X, Vec2::ZERO, color),
-                Vertex::new2(Vec3::X, Vec2::ZERO, color),
-                Vertex::new2(Vec3::ZERO, Vec2::ZERO, color),
-                Vertex::new2(Vec3::ZERO, Vec2::ZERO, color),
-                Vertex::new2(Vec3::X, Vec2::ZERO, color),
-                Vertex::new2(vec3(0.5, 0.0, 3.0_f32.sqrt() * 0.5), Vec2::ZERO, color),
+                Vertex::new2(vec3(1.0, 2.0, 3.0), Vec2::ZERO, WHITE),
+                Vertex::new2(vec3(3.0, 4.0, 5.0), Vec2::ZERO, WHITE),
             ],
-            indices: vec![0, 1, 2, 3, 4, 5],
+            indices: Vec::new(),
         };
-        let mut metadata = FaceMetadata::for_face_count(2);
+        let (model_center, scale) = mesh_center_and_scale(&mesh);
+        let mut metadata = FaceMetadata::for_face_count(1);
         let main = metadata.create_group(&[0]).unwrap();
         metadata
             .set_group_program(main, FaceGroupProgram::RadialRepeat)
             .unwrap();
-        let route = metadata.create_group_under(&[1], Some(main)).unwrap();
-        metadata
-            .set_group_program(
-                route,
-                FaceGroupProgram::IfNeighbor(RadialNeighborState::Route),
-            )
-            .unwrap();
 
-        let preview = route_neighbor_preview_mesh(&mesh, &metadata, 0)
-            .unwrap()
-            .unwrap();
-        let centroid = preview
-            .vertices
-            .iter()
-            .map(|vertex| vertex.position)
-            .sum::<Vec3>()
-            / preview.vertices.len() as f32;
-        let expected = 7.0 * std::f32::consts::PI / 6.0;
-
-        assert!((centroid.normalize() - vec3(expected.cos(), 0.0, expected.sin())).length() < 1e-5);
+        assert_eq!(
+            mesh_cell_guide_center(&mesh, Some(&metadata)),
+            (Vec3::ZERO - model_center) * scale
+        );
+        metadata.radial_pivot = Some([5.0, 6.0, 7.0]);
+        assert_eq!(
+            mesh_cell_guide_center(&mesh, Some(&metadata)),
+            (vec3(5.0, 6.0, 7.0) - model_center) * scale
+        );
     }
 
     #[test]

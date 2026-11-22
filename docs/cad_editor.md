@@ -51,10 +51,24 @@ the last saved version.
   previews stay in the viewport; errors such as unsupported topology or
   invalid values leave the original mesh unchanged.
 - Use undo/redo while editing; save or discard to finish.
+- Use the **Face Paint** panel in the right sidebar. Select faces or a face
+  group in Face selection mode, then click a palette color to paint the current
+  selection. Double-click the hex field to enter a precise 6-digit RGB or
+  8-digit RGBA color, then press `Enter` to apply it.
+- Painting is available only for selected faces and face groups, not vertex or
+  edge selections. Paint changes use vertex colors stored in the GLB. Face
+  names, groups, and other CAD metadata remain in the `.cad.json` sidecar. Save
+  and discard work the same way as other mesh edits.
 
-The interaction preview assembles a building from six neighboring hexes.
-**Shuffle neighbors** changes the preview conditions. The preview only uses
-building models (not routes or machine blocks).
+The interaction preview assembles the selected building and six surrounding
+cells. Radial neighbors use the selected cell and the two adjacent occupied
+ring cells to choose their six sector variants; their other sectors are Empty.
+The **Same building** condition reuses the selected cell's building type, while
+**Other building** chooses another building or route. **Shuffle neighbors**
+changes the preview conditions. Conditioned geometry is normalized against the
+unconditioned model so changing neighbor conditions does not rescale the shared
+building geometry. Mesh View shows a hex outline for the planet cell boundary
+and frames that guide at the same apparent scale as the interaction preview.
 
 ## Radial Repeat and UCS origin
 

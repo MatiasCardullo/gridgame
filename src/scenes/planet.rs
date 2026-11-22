@@ -24,7 +24,8 @@ use crate::core::map_common::{
     MapOutline, build_panel_layout, handle_window_drag, in_bounds, is_ui_capturing,
 };
 use crate::core::object_assets::{
-    EditableMesh, ObjectCatalog, ObjectId, RadialNeighborState, VariantMode,
+    BUILDING_CELL_FILL_RATIO, EditableMesh, NORMALIZED_MODEL_EXTENT, ObjectCatalog, ObjectId,
+    RadialNeighborState, VariantMode, building_model_scale_for_cell, mesh_center_and_scale,
     radial_sector_state_key,
 };
 use crate::core::planet_grid::{
@@ -3925,16 +3926,49 @@ fn radial_sector_start_angle(first_neighbor_angle: f32, sides: usize) -> f32 {
     first_neighbor_angle - std::f32::consts::PI / sides as f32
 }
 
+fn radial_neighbor_state(
+    owner: PlanetBuildingKind,
+    neighbor: Option<PlanetBuildingKind>,
+) -> RadialNeighborState {
+    match neighbor {
+        Some(neighbor) if neighbor == owner => RadialNeighborState::Route,
+        Some(_) => RadialNeighborState::OtherBuilding,
+        None => RadialNeighborState::Empty,
+    }
+}
+
+fn normalize_building_mesh(mesh: &EditableMesh, reference: &EditableMesh) -> EditableMesh {
+    let (center, scale) = mesh_center_and_scale(reference);
+    let floor_y = mesh
+        .vertices
+        .iter()
+        .map(|vertex| (vertex.position.y - center.y) * scale)
+        .reduce(f32::min)
+        .unwrap_or(0.0);
+    mesh.transformed(|point| {
+        let mut normalized = (point - center) * scale;
+        normalized.y -= floor_y;
+        normalized
+    })
+}
+
+fn normalize_radial_mesh(
+    mesh: &EditableMesh,
+    pivot: Vec3,
+    reference: &EditableMesh,
+) -> EditableMesh {
+    let (_, scale) = mesh_center_and_scale(reference);
+    mesh.transformed(|point| (point - pivot) * scale)
+}
+
 fn draw_sim_buildings(
     visual_grid: &HexGrid,
     _sim_world: Option<&PlanetSimWorld>,
     _config: &PlanetNoiseConfig,
     buildings: &HashMap<u32, PlanetBuildingState>,
     radius: f32,
-    min_cell_edge_dist_unit: f32,
     assets: &ObjectCatalog,
 ) {
-    let target_apothem = (min_cell_edge_dist_unit * 0.9 * 0.62).max(0.0005);
     // Keep buildings above surface but below overlay lines (PLANET_OVERLAY_OFFSET=0.01).
     let surface_lift = 0.0035;
     for (cell_index, building) in buildings.iter() {
@@ -3967,18 +4001,20 @@ fn draw_sim_buildings(
         if tangent_y.length() < 1e-6 {
             continue;
         }
-        let mut ordered: Vec<f32> = centers
+        let mut ordered: Vec<(f32, Vec2)> = centers
             .iter()
             .map(|center| {
                 let p = vec2(center.dot(tangent_x), center.dot(tangent_y));
-                p.y.atan2(p.x)
+                (p.y.atan2(p.x), p)
             })
             .collect();
-        ordered.sort_by(|a, b| a.total_cmp(b));
-        let start_angle = ordered[0];
+        ordered.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let cell_points: Vec<Vec2> = ordered.iter().map(|(_, point)| *point).collect();
+        let Some((target_apothem, outer_radius)) = cell_building_geometry(&cell_points) else {
+            continue;
+        };
+        let start_angle = ordered[0].0;
         let angle_step = std::f32::consts::TAU / sides as f32;
-        let cos_half = (std::f32::consts::PI / sides as f32).cos().max(1e-4);
-        let outer_radius = target_apothem / cos_half;
         let mut outer_dirs: Vec<Vec3> = Vec::with_capacity(sides);
         for i in 0..sides {
             let a = start_angle + i as f32 * angle_step;
@@ -4008,11 +4044,10 @@ fn draw_sim_buildings(
                         continue;
                     };
                     let p = vec2(neighbor_dir.dot(tangent_x), neighbor_dir.dot(tangent_y));
-                    let state = match buildings.get(&candidate).map(|neighbor| neighbor.kind) {
-                        Some(PlanetBuildingKind::Route) => RadialNeighborState::Route,
-                        Some(_) => RadialNeighborState::OtherBuilding,
-                        None => RadialNeighborState::Empty,
-                    };
+                    let state = radial_neighbor_state(
+                        kind,
+                        buildings.get(&candidate).map(|neighbor| neighbor.kind),
+                    );
                     neighbors.push((p.y.atan2(p.x), state));
                 }
             }
@@ -4130,43 +4165,45 @@ fn draw_sim_buildings(
             assets.get(object_id).cloned()
         };
         if let Some(source_mesh) = source_mesh.as_ref() {
+            let reference_mesh = assets.get(object_id).unwrap_or(source_mesh);
             let model_radius = if is_route {
                 radius + surface_lift + 0.0005
             } else {
                 base_radius
             };
-            let height_scale = match kind {
-                PlanetBuildingKind::Route => 0.42,
-                PlanetBuildingKind::Logistics => 0.74,
-                PlanetBuildingKind::Warehouse => 0.70,
-                PlanetBuildingKind::Refuel => 0.78,
-                PlanetBuildingKind::Housing => 0.82,
-                PlanetBuildingKind::Builder => 0.90,
-                PlanetBuildingKind::Mine => 1.00,
-                PlanetBuildingKind::Factory => 1.08,
-                PlanetBuildingKind::Base => 1.15,
-            };
-            let model_height = if is_route {
-                0.00012
-            } else {
-                ((target_apothem * radius * 1.9) * height_scale).max(0.008)
-            };
-            let model_scale = outer_radius * model_radius;
-            let mesh = source_mesh.transformed(|point| {
-                let angle = if is_route {
-                    route_state
-                        .as_ref()
-                        .map(|(_, angle, _)| *angle)
-                        .unwrap_or(0.0)
+            let mesh = if is_route {
+                let angle = route_state
+                    .as_ref()
+                    .map(|(_, angle, _)| *angle)
+                    .unwrap_or(0.0);
+                let (sin, cos) = angle.sin_cos();
+                let route_pivot = if radial_group_program {
+                    assets
+                        .metadata(object_id, None)
+                        .and_then(|metadata| metadata.radial_pivot)
+                        .map(|[x, y, z]| vec3(x, y, z))
+                        .unwrap_or(Vec3::ZERO)
                 } else {
-                    0.0
+                    mesh_center_and_scale(reference_mesh).0
                 };
-                let local_x = point.x * angle.cos() - point.z * angle.sin();
-                let local_z = point.x * angle.sin() + point.z * angle.cos();
-                vertex_dir * (model_radius + point.y * model_height)
-                    + tangent_x * (local_x * model_scale)
-                    + tangent_y * (local_z * model_scale)
-            });
+                let normalized = normalize_radial_mesh(source_mesh, route_pivot, reference_mesh);
+                let route_scale = building_model_scale_for_cell(outer_radius * model_radius);
+                normalized.transformed(|point| {
+                    let local_x = point.x * cos - point.z * sin;
+                    let local_z = point.x * sin + point.z * cos;
+                    vertex_dir * (model_radius + point.y * route_scale)
+                        + tangent_x * (local_x * route_scale)
+                        + tangent_y * (local_z * route_scale)
+                })
+            } else {
+                let normalized = normalize_building_mesh(source_mesh, reference_mesh);
+                let model_scale = building_model_scale_for_cell(outer_radius * model_radius);
+                normalized.transformed(|point| {
+                    vertex_dir * (model_radius + point.y * model_scale)
+                        + tangent_x * (point.x * model_scale)
+                        + tangent_y * (point.z * model_scale)
+                })
+            };
             match mesh.render() {
                 Ok(()) => continue,
                 Err(error) => {
@@ -4280,18 +4317,10 @@ fn draw_sim_buildings(
             continue;
         }
 
-        let height_scale = match kind {
-            PlanetBuildingKind::Route => 0.42,
-            PlanetBuildingKind::Logistics => 0.74,
-            PlanetBuildingKind::Warehouse => 0.70,
-            PlanetBuildingKind::Refuel => 0.78,
-            PlanetBuildingKind::Housing => 0.82,
-            PlanetBuildingKind::Builder => 0.90,
-            PlanetBuildingKind::Mine => 1.00,
-            PlanetBuildingKind::Factory => 1.08,
-            PlanetBuildingKind::Base => 1.15,
-        };
-        let apex_height = ((target_apothem * radius * 1.9) * height_scale).max(0.008);
+        let building_cell_radius = outer_radius * base_radius;
+        let apex_height = (building_model_scale_for_cell(building_cell_radius)
+            * NORMALIZED_MODEL_EXTENT)
+            .max(0.008);
         let apex = vertex_dir * (base_radius + apex_height);
         let base_center = vertex_dir * base_radius;
         let base_color = Color::new(color.r * 0.75, color.g * 0.75, color.b * 0.75, 1.0);
@@ -4299,8 +4328,12 @@ fn draw_sim_buildings(
         let mut indices: Vec<u16> = Vec::with_capacity(sides * 6);
         for i in 0..outer_dirs.len() {
             let j = (i + 1) % outer_dirs.len();
-            let p0 = outer_dirs[i] * base_radius;
-            let p1 = outer_dirs[j] * base_radius;
+            let p0 = vertex_dir * base_radius
+                + (outer_dirs[i] * base_radius - vertex_dir * base_radius)
+                    * (BUILDING_CELL_FILL_RATIO * 0.5);
+            let p1 = vertex_dir * base_radius
+                + (outer_dirs[j] * base_radius - vertex_dir * base_radius)
+                    * (BUILDING_CELL_FILL_RATIO * 0.5);
 
             let tri0 = vertices.len() as u16;
             vertices.push(Vertex::new2(apex, vec2(0.0, 0.0), color));
@@ -4572,18 +4605,9 @@ fn min_cell_edge_distance_unit(hex_grid: &HexGrid) -> f32 {
             .collect();
         ordered.sort_by(|a, b| a.0.total_cmp(&b.0));
 
-        for i in 0..ordered.len() {
-            let a = ordered[i].1;
-            let b = ordered[(i + 1) % ordered.len()].1;
-            let edge = b - a;
-            let denom = edge.length_squared();
-            if denom <= 1e-12 {
-                continue;
-            }
-            let t = (-a).dot(edge) / denom;
-            let t_clamped = t.clamp(0.0, 1.0);
-            let closest = a + edge * t_clamped;
-            min_dist = min_dist.min(closest.length());
+        let points: Vec<Vec2> = ordered.iter().map(|(_, point)| *point).collect();
+        if let Some(apothem) = cell_polygon_apothem(&points) {
+            min_dist = min_dist.min(apothem);
         }
     }
     if min_dist.is_finite() && min_dist > 0.0 {
@@ -4591,6 +4615,34 @@ fn min_cell_edge_distance_unit(hex_grid: &HexGrid) -> f32 {
     } else {
         0.010
     }
+}
+
+fn cell_polygon_apothem(points: &[Vec2]) -> Option<f32> {
+    if points.len() < 3 {
+        return None;
+    }
+
+    let mut min_distance = f32::MAX;
+    for index in 0..points.len() {
+        let a = points[index];
+        let b = points[(index + 1) % points.len()];
+        let edge = b - a;
+        let denom = edge.length_squared();
+        if denom <= 1e-12 {
+            continue;
+        }
+        let t = (-a).dot(edge) / denom;
+        let closest = a + edge * t.clamp(0.0, 1.0);
+        min_distance = min_distance.min(closest.length());
+    }
+
+    (min_distance.is_finite() && min_distance > 0.0).then_some(min_distance)
+}
+
+fn cell_building_geometry(points: &[Vec2]) -> Option<(f32, f32)> {
+    let apothem = cell_polygon_apothem(points)?;
+    let cos_half = (std::f32::consts::PI / points.len() as f32).cos().max(1e-4);
+    Some((apothem, apothem / cos_half))
 }
 
 // Draws a filled triangle into an RGBA8 image buffer.
@@ -5472,7 +5524,6 @@ pub fn run(
             &state.config,
             &state.buildings,
             radius,
-            state.min_cell_edge_dist_unit,
             assets,
         );
         let unit_color = ctx.colors_rt.port_out;
@@ -6641,6 +6692,108 @@ mod tests {
         );
         assert!((hexagon_sector.vertices[0].position.x + 1.0).abs() < 1e-6);
         assert!(hexagon_sector.vertices[0].position.z.abs() < 1e-6);
+    }
+
+    #[test]
+    fn planet_buildings_fill_the_actual_local_cell_at_cad_scale() {
+        for sides in [5, 6] {
+            for radius in [0.7, 1.4] {
+                let points = (0..sides)
+                    .map(|index| {
+                        let angle = std::f32::consts::TAU * index as f32 / sides as f32;
+                        vec2(angle.cos() * radius, angle.sin() * radius)
+                    })
+                    .collect::<Vec<_>>();
+                let (_, cell_radius) = cell_building_geometry(&points).unwrap();
+
+                assert!((cell_radius - radius).abs() < 1e-6);
+                let scaled_extent =
+                    building_model_scale_for_cell(cell_radius) * NORMALIZED_MODEL_EXTENT;
+                assert!((scaled_extent / cell_radius - BUILDING_CELL_FILL_RATIO).abs() < 1e-6);
+            }
+        }
+    }
+
+    #[test]
+    fn planet_building_scale_is_stable_across_conditioned_geometry() {
+        let small = EditableMesh {
+            vertices: vec![
+                Vertex::new2(vec3(-1.0, 2.0, -1.0), Vec2::ZERO, WHITE),
+                Vertex::new2(vec3(1.0, 4.0, 1.0), Vec2::ZERO, WHITE),
+            ],
+            indices: Vec::new(),
+        };
+        let mut large = small.clone();
+        large.vertices.extend([
+            Vertex::new2(vec3(-10.0, 2.0, -10.0), Vec2::ZERO, WHITE),
+            Vertex::new2(vec3(10.0, 4.0, 10.0), Vec2::ZERO, WHITE),
+        ]);
+        let reference = EditableMesh {
+            vertices: vec![
+                Vertex::new2(vec3(-10.0, -5.0, -10.0), Vec2::ZERO, WHITE),
+                Vertex::new2(vec3(10.0, 15.0, 10.0), Vec2::ZERO, WHITE),
+            ],
+            indices: Vec::new(),
+        };
+
+        let small = normalize_building_mesh(&small, &reference);
+        let large = normalize_building_mesh(&large, &reference);
+
+        assert_eq!(small.vertices[0].position, large.vertices[0].position);
+        assert_eq!(small.vertices[1].position, large.vertices[1].position);
+        assert!((small.vertices[0].position.y).abs() < 1e-6);
+        assert!((small.vertices[1].position.y - 0.24).abs() < 1e-6);
+        assert!(
+            (building_model_scale_for_cell(1.0) * NORMALIZED_MODEL_EXTENT
+                - BUILDING_CELL_FILL_RATIO)
+                .abs()
+                < 1e-6
+        );
+    }
+
+    #[test]
+    fn planet_routes_keep_scale_across_conditioned_geometry() {
+        let small = EditableMesh {
+            vertices: vec![
+                Vertex::new2(Vec3::ZERO, Vec2::ZERO, WHITE),
+                Vertex::new2(vec3(2.0, 0.0, 1.0), Vec2::ZERO, WHITE),
+            ],
+            indices: Vec::new(),
+        };
+        let mut large = small.clone();
+        large
+            .vertices
+            .push(Vertex::new2(vec3(8.0, 0.0, 4.0), Vec2::ZERO, WHITE));
+        let reference = large.clone();
+        let pivot = Vec3::ZERO;
+
+        let small = normalize_radial_mesh(&small, pivot, &reference);
+        let large = normalize_radial_mesh(&large, pivot, &reference);
+
+        assert_eq!(small.vertices[0].position, large.vertices[0].position);
+        assert_eq!(small.vertices[1].position, large.vertices[1].position);
+        assert!(
+            (building_model_scale_for_cell(1.0) * NORMALIZED_MODEL_EXTENT
+                - BUILDING_CELL_FILL_RATIO)
+                .abs()
+                < 1e-6
+        );
+    }
+
+    #[test]
+    fn radial_neighbors_distinguish_same_building_from_other_buildings() {
+        assert_eq!(
+            radial_neighbor_state(PlanetBuildingKind::Route, Some(PlanetBuildingKind::Route)),
+            RadialNeighborState::Route
+        );
+        assert_eq!(
+            radial_neighbor_state(PlanetBuildingKind::Route, Some(PlanetBuildingKind::Base)),
+            RadialNeighborState::OtherBuilding
+        );
+        assert_eq!(
+            radial_neighbor_state(PlanetBuildingKind::Route, None),
+            RadialNeighborState::Empty
+        );
     }
 
     #[test]

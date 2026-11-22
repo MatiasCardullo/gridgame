@@ -7,6 +7,34 @@ use serde::{Deserialize, Serialize};
 
 use crate::core::MachineBlockType;
 
+pub const NORMALIZED_MODEL_EXTENT: f32 = 2.4;
+pub const BUILDING_PREVIEW_CELL_RADIUS: f32 = 0.9;
+pub const BUILDING_PREVIEW_SCALE: f32 = 0.28;
+pub const BUILDING_PREVIEW_CELL_GUIDE_RADIUS: f32 =
+    BUILDING_PREVIEW_CELL_RADIUS / BUILDING_PREVIEW_SCALE;
+pub const BUILDING_CELL_FILL_RATIO: f32 =
+    NORMALIZED_MODEL_EXTENT * BUILDING_PREVIEW_SCALE / BUILDING_PREVIEW_CELL_RADIUS;
+
+pub fn mesh_center_and_scale(mesh: &EditableMesh) -> (Vec3, f32) {
+    let Some(first) = mesh.vertices.first() else {
+        return (Vec3::ZERO, 1.0);
+    };
+    let mut min = first.position;
+    let mut max = first.position;
+    for vertex in &mesh.vertices[1..] {
+        min = min.min(vertex.position);
+        max = max.max(vertex.position);
+    }
+    let center = (min + max) * 0.5;
+    let extent = max - min;
+    let scale = NORMALIZED_MODEL_EXTENT / extent.x.max(extent.y).max(extent.z).max(0.001);
+    (center, scale)
+}
+
+pub fn building_model_scale_for_cell(cell_radius: f32) -> f32 {
+    cell_radius * BUILDING_CELL_FILL_RATIO / NORMALIZED_MODEL_EXTENT
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ObjectCategory {
     Buildings,
@@ -394,7 +422,62 @@ pub enum MeshPrimitive {
 }
 
 impl EditableMesh {
-    pub fn paint_vertices(&mut self, indices: &[usize], color: Color) -> Result<(), String> {
+    pub fn paint_faces(&mut self, faces: &[usize], color: Color) -> Result<(), String> {
+        let selected_faces = faces.iter().copied().collect::<HashSet<_>>();
+        if selected_faces.is_empty() {
+            return Err("Select at least one face to paint".to_string());
+        }
+        let face_count = self.face_count();
+        if let Some(face) = selected_faces.iter().find(|&&face| face >= face_count) {
+            return Err(format!("Paint face {face} is out of range"));
+        }
+        let mut selected_vertices = HashSet::new();
+        let mut unselected_vertices = HashSet::new();
+        for (face, triangle) in self.indices.chunks_exact(3).enumerate() {
+            for &index in triangle {
+                if index as usize >= self.vertices.len() {
+                    return Err(format!("Mesh index {index} is out of range"));
+                }
+                if selected_faces.contains(&face) {
+                    selected_vertices.insert(index as usize);
+                } else {
+                    unselected_vertices.insert(index as usize);
+                }
+            }
+        }
+        let shared_vertices = selected_vertices
+            .intersection(&unselected_vertices)
+            .copied()
+            .collect::<Vec<_>>();
+        let mut duplicated = HashMap::with_capacity(shared_vertices.len());
+        for index in shared_vertices {
+            let duplicate = u32::try_from(self.vertices.len())
+                .map_err(|_| "Mesh has too many vertices to paint".to_string())?;
+            self.vertices.push(self.vertices[index]);
+            duplicated.insert(index as u32, duplicate);
+        }
+        for face in selected_faces {
+            let start = face * 3;
+            for index in &mut self.indices[start..start + 3] {
+                if let Some(&duplicate) = duplicated.get(index) {
+                    *index = duplicate;
+                }
+            }
+        }
+        let mut paint_indices = selected_vertices
+            .into_iter()
+            .map(|index| {
+                duplicated
+                    .get(&(index as u32))
+                    .copied()
+                    .unwrap_or(index as u32) as usize
+            })
+            .collect::<Vec<_>>();
+        paint_indices.sort_unstable();
+        self.paint_vertices(&paint_indices, color)
+    }
+
+    fn paint_vertices(&mut self, indices: &[usize], color: Color) -> Result<(), String> {
         let rgba = [
             (color.r.clamp(0.0, 1.0) * 255.0).round() as u8,
             (color.g.clamp(0.0, 1.0) * 255.0).round() as u8,
@@ -3174,6 +3257,39 @@ mod tests {
     use super::*;
 
     #[test]
+    fn shared_building_scale_matches_the_cad_cell_and_normalizes_mesh_extent() {
+        let color = Color::from_rgba(255, 255, 255, 255);
+        let mesh = EditableMesh {
+            vertices: vec![
+                Vertex::new2(vec3(-1.0, 0.0, -2.0), Vec2::ZERO, color),
+                Vertex::new2(vec3(3.0, 2.0, 2.0), Vec2::ZERO, color),
+            ],
+            indices: Vec::new(),
+        };
+        let (center, scale) = mesh_center_and_scale(&mesh);
+
+        assert_eq!(center, vec3(1.0, 1.0, 0.0));
+        assert!((scale - NORMALIZED_MODEL_EXTENT / 4.0).abs() < 1e-6);
+        assert!(
+            (building_model_scale_for_cell(BUILDING_PREVIEW_CELL_RADIUS) - BUILDING_PREVIEW_SCALE)
+                .abs()
+                < 1e-6
+        );
+        assert!(
+            (NORMALIZED_MODEL_EXTENT / BUILDING_PREVIEW_CELL_GUIDE_RADIUS
+                - building_model_scale_for_cell(BUILDING_PREVIEW_CELL_RADIUS)
+                    * NORMALIZED_MODEL_EXTENT
+                    / BUILDING_PREVIEW_CELL_RADIUS)
+                .abs()
+                < 1e-6
+        );
+        assert!(
+            (building_model_scale_for_cell(2.0) / building_model_scale_for_cell(1.0) - 2.0).abs()
+                < 1e-6
+        );
+    }
+
+    #[test]
     fn catalog_has_unique_ids_and_paths() {
         for (index, definition) in OBJECT_DEFINITIONS.iter().enumerate() {
             assert!(
@@ -3901,6 +4017,36 @@ mod tests {
         assert_eq!(mesh.vertices[1].color, [255, 255, 255, 255]);
         assert_eq!(mesh.vertices[2].color, [12, 34, 56, 78]);
         assert_eq!(mesh.indices, original_indices);
+    }
+
+    #[test]
+    fn painting_a_face_does_not_recolor_an_adjacent_face() {
+        let white = Color::from_rgba(255, 255, 255, 255);
+        let red = Color::from_rgba(220, 70, 70, 255);
+        let mut mesh = EditableMesh {
+            vertices: vec![
+                Vertex::new2(Vec3::ZERO, Vec2::ZERO, white),
+                Vertex::new2(Vec3::X, Vec2::ZERO, white),
+                Vertex::new2(Vec3::Y, Vec2::ZERO, white),
+                Vertex::new2(Vec3::Z, Vec2::ZERO, white),
+            ],
+            indices: vec![0, 1, 2, 1, 3, 2],
+        };
+        mesh.paint_faces(&[0], red).unwrap();
+
+        let first = &mesh.indices[..3];
+        let adjacent = &mesh.indices[3..];
+        assert!(
+            first
+                .iter()
+                .all(|&index| mesh.vertices[index as usize].color == [220, 70, 70, 255])
+        );
+        assert!(
+            adjacent
+                .iter()
+                .all(|&index| mesh.vertices[index as usize].color == [255, 255, 255, 255])
+        );
+        assert_eq!(mesh.face_count(), 2);
     }
 
     #[test]

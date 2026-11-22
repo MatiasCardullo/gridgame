@@ -10,6 +10,7 @@ use crate::core::map_common::{
     ConfirmAction, MapOutline, build_panel_layout, confirm_label_for_target, draw_common_hud,
     draw_window_frame, in_bounds, is_ui_capturing, popup_rect_near_mouse, run_confirm_window,
 };
+use crate::core::object_assets::{ObjectCatalog, VariantMode, machine_object_id};
 use crate::core::ui::{WINDOW_TITLE_HEIGHT, WindowState, ui_button};
 use crate::core::{
     AppConfig, Axial, FrameContext, MachineBlock, MachineBlockType, RuntimeColors, Scene,
@@ -390,6 +391,35 @@ fn belt_connection(
     ))
 }
 
+fn conveyor_state_key(interior: &BaseInteriorState, hex: Axial, rotation: u8) -> String {
+    let rotation = rotation as usize % 6;
+    let neighbors = axial_neighbors(hex);
+    let neighbor_rotation = |index: usize| {
+        interior
+            .block_at(neighbors[index])
+            .filter(|block| block.kind == MachineBlockType::ConveyorBelt)
+            .map(|block| (block.rotation as usize + 6 - rotation) % 6 + 1)
+            .unwrap_or(0)
+    };
+    let front = neighbor_rotation(rotation);
+    let back = neighbor_rotation((rotation + 3) % 6);
+    let mut side_mask = 0_u8;
+    for (slot, relative_index) in [1_usize, 2, 4, 5].into_iter().enumerate() {
+        let world_index = (rotation + relative_index) % 6;
+        if let Some(block) = interior
+            .block_at(neighbors[world_index])
+            .filter(|block| block.kind == MachineBlockType::ConveyorBelt)
+        {
+            let neighbor_rotation = (block.rotation as usize + 6 - rotation) % 6;
+            if neighbor_rotation == relative_index || neighbor_rotation == (relative_index + 3) % 6
+            {
+                side_mask |= 1 << slot;
+            }
+        }
+    }
+    format!("f{front}-b{back}-s{side_mask:02x}")
+}
+
 fn belt_side_wall_gaps(
     interior: &BaseInteriorState,
     hex: Axial,
@@ -681,7 +711,19 @@ fn draw_belt_prism(
     fill: Color,
     outline: Color,
     wire_only: bool,
+    assets: &ObjectCatalog,
 ) {
+    if !wire_only && !front_connected && !back_connected {
+        if let Some(source_mesh) = assets.get(machine_object_id(MachineBlockType::ConveyorBelt)) {
+            let side = vec3(-direction.z, 0.0, direction.x);
+            let mesh = source_mesh.transformed(|point| {
+                center + direction * point.x + vec3(0.0, point.y, 0.0) + side * point.z
+            });
+            if mesh.render().is_ok() {
+                return;
+            }
+        }
+    }
     let side = vec3(-direction.z, 0.0, direction.x);
     let top_y = center.y + BELT_HEIGHT;
     let front_negative =
@@ -870,9 +912,54 @@ fn draw_machine_block(
     rotation: u8,
     center: Vec3,
     wire_only: bool,
+    assets: &ObjectCatalog,
 ) {
     let fill = machine_block_color(kind);
     let outline = shade(fill, 0.55);
+    let mut conveyor_state_drawn = false;
+    if !wire_only && kind == MachineBlockType::ConveyorBelt {
+        let state_key = conveyor_state_key(interior, hex, rotation);
+        let object_id = machine_object_id(MachineBlockType::ConveyorBelt);
+        let source_mesh = if assets
+            .variant_config(object_id)
+            .is_some_and(|config| config.mode == VariantMode::Custom)
+        {
+            assets
+                .custom_state_key(object_id, &state_key)
+                .and_then(|custom_key| assets.get_state(object_id, custom_key))
+                .or_else(|| assets.get(object_id))
+        } else {
+            assets.get_state(object_id, &state_key)
+        };
+        if let Some(source_mesh) = source_mesh {
+            let forward = rotation_dir(rotation);
+            let side = vec3(-forward.z, 0.0, forward.x);
+            let mesh = source_mesh.transformed(|point| {
+                center + forward * point.x + vec3(0.0, point.y, 0.0) + side * point.z
+            });
+            match mesh.render() {
+                Ok(()) => conveyor_state_drawn = true,
+                Err(error) => {
+                    eprintln!("GridGame could not render conveyor state {state_key}: {error}")
+                }
+            }
+        }
+    } else if !wire_only {
+        if let Some(source_mesh) = assets.get(machine_object_id(kind)) {
+            let forward = rotation_dir(rotation);
+            let side = vec3(-forward.z, 0.0, forward.x);
+            let mesh = source_mesh.transformed(|point| {
+                center + forward * point.x + vec3(0.0, point.y, 0.0) + side * point.z
+            });
+            match mesh.render() {
+                Ok(()) => return,
+                Err(error) => eprintln!(
+                    "GridGame could not render {} model: {error}",
+                    machine_block_label(kind)
+                ),
+            }
+        }
+    }
     match kind {
         MachineBlockType::ConveyorBelt => {
             let dir = rotation_dir(rotation);
@@ -912,27 +999,30 @@ fn draw_machine_block(
                 })
                 .unwrap_or((BELT_HALF_LENGTH, BELT_HALF_LENGTH));
             let side_wall_gaps = belt_side_wall_gaps(interior, hex, rotation as usize % 6);
-            draw_belt_prism(
-                center,
-                dir,
-                front_lengths,
-                back_lengths,
-                front_connection.is_some(),
-                back_connection.is_some(),
-                fill,
-                outline,
-                wire_only,
-            );
-            draw_belt_walls(
-                center,
-                dir,
-                front_lengths,
-                back_lengths,
-                front_outer_lengths,
-                back_outer_lengths,
-                side_wall_gaps,
-                wire_only,
-            );
+            if !conveyor_state_drawn {
+                draw_belt_prism(
+                    center,
+                    dir,
+                    front_lengths,
+                    back_lengths,
+                    front_connection.is_some(),
+                    back_connection.is_some(),
+                    fill,
+                    outline,
+                    wire_only,
+                    assets,
+                );
+                draw_belt_walls(
+                    center,
+                    dir,
+                    front_lengths,
+                    back_lengths,
+                    front_outer_lengths,
+                    back_outer_lengths,
+                    side_wall_gaps,
+                    wire_only,
+                );
+            }
             let side = vec3(-dir.z, 0.0, dir.x);
             let top = center + vec3(0.0, 4.6, 0.0);
             let arrow_color = Color::from_rgba(255, 220, 0, 255);
@@ -1036,6 +1126,7 @@ fn draw_world(
     camera_center_hex: Axial,
     config: &AppConfig,
     colors: &RuntimeColors,
+    assets: &ObjectCatalog,
 ) {
     for r in (camera_center_hex.r - FLOOR_DRAW_RADIUS)..=(camera_center_hex.r + FLOOR_DRAW_RADIUS) {
         for q in
@@ -1080,7 +1171,15 @@ fn draw_world(
         let hex = block_record.hex;
         let block = &block_record.block;
         let center = hex_world_center(hex, BLOCK_Y);
-        draw_machine_block(interior, hex, block.kind, block.rotation, center, false);
+        draw_machine_block(
+            interior,
+            hex,
+            block.kind,
+            block.rotation,
+            center,
+            false,
+            assets,
+        );
     }
 
     for container in &interior.containers {
@@ -1278,7 +1377,7 @@ fn draw_world(
 
     if let Some((hex, kind, rotation)) = preview {
         let center = hex_world_center(hex, BLOCK_Y);
-        draw_machine_block(interior, hex, kind, rotation, center, true);
+        draw_machine_block(interior, hex, kind, rotation, center, true, assets);
         draw_hex_tile(
             hex,
             0.04,
@@ -1400,6 +1499,7 @@ pub fn run(
     scene: &mut Scene,
     config: &AppConfig,
     colors: &RuntimeColors,
+    assets: &ObjectCatalog,
 ) {
     if state.active_base_interior().is_none() {
         *scene = Scene::Planet;
@@ -1587,6 +1687,7 @@ pub fn run(
         camera_center_hex,
         config,
         colors,
+        assets,
     );
     set_default_camera();
 
@@ -1662,37 +1763,7 @@ pub fn run(
     }
 
     if let Some(tip) = tooltip {
-        let pad = 6.0;
-        let lines: Vec<&str> = tip.lines().collect();
-        let mut max_width: f32 = 0.0;
-        let mut total_height: f32 = 0.0;
-        for line in &lines {
-            let dim = measure_text(line, None, ctx.font_sm as u16, 1.0);
-            max_width = max_width.max(dim.width);
-            total_height += dim.height.max(ctx.font_sm);
-        }
-        let x = (ctx.mouse.x + 14.0).min(screen_width() - max_width - 2.0 * pad);
-        let y = (ctx.mouse.y + 16.0).min(screen_height() - total_height - 2.0 * pad);
-        draw_rectangle(
-            x,
-            y,
-            max_width + 2.0 * pad,
-            total_height + 2.0 * pad,
-            colors.tooltip_bg,
-        );
-        draw_rectangle_lines(
-            x,
-            y,
-            max_width + 2.0 * pad,
-            total_height + 2.0 * pad,
-            config.line_thickness.max(1.0),
-            colors.tooltip_border,
-        );
-        let mut line_y = y + pad + ctx.font_sm - 2.0;
-        for line in lines {
-            draw_text(line, x + pad, line_y, ctx.font_sm, colors.text_primary);
-            line_y += ctx.font_sm;
-        }
+        crate::core::ui::draw_tooltip(&tip, ctx.mouse, ctx.font_sm, 6.0, colors);
     }
 
     if window.open {
@@ -2119,6 +2190,40 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn conveyor_state_key_tracks_front_back_and_side_connections() {
+        let hex = Axial { q: 0, r: 0 };
+        let neighbors = axial_neighbors(hex);
+        let mut interior = BaseInteriorState::default();
+        interior.blocks.clear();
+        interior.upsert_block(
+            neighbors[0],
+            MachineBlock {
+                kind: MachineBlockType::ConveyorBelt,
+                rotation: 0,
+            },
+        );
+        assert_eq!(conveyor_state_key(&interior, hex, 0), "f1-b0-s00");
+
+        interior.upsert_block(
+            neighbors[1],
+            MachineBlock {
+                kind: MachineBlockType::ConveyorBelt,
+                rotation: 1,
+            },
+        );
+        assert_eq!(conveyor_state_key(&interior, hex, 0), "f1-b0-s01");
+
+        interior.upsert_block(
+            neighbors[3],
+            MachineBlock {
+                kind: MachineBlockType::ConveyorBelt,
+                rotation: 3,
+            },
+        );
+        assert_eq!(conveyor_state_key(&interior, hex, 0), "f1-b4-s01");
     }
 
     #[test]

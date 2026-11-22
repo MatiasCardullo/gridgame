@@ -159,8 +159,7 @@ pub fn draw_log_panel(
     border: Color,
     text: Color,
 ) {
-    draw_rectangle(rect.x, rect.y, rect.w, rect.h, bg);
-    draw_rectangle_lines(rect.x, rect.y, rect.w, rect.h, 1.2, border);
+    draw_panel_frame(rect, 1.2, bg, border);
     let line_height = font_size + 4.0;
     let mut y = rect.y + font_size + 6.0;
     for line in lines.iter() {
@@ -170,6 +169,80 @@ pub fn draw_log_panel(
         draw_text(line, rect.x + 8.0, y, font_size, text);
         y += line_height;
     }
+}
+
+// Draw a consistently styled panel frame.
+pub fn draw_panel_frame(rect: Rect, line_thickness: f32, bg: Color, border: Color) {
+    draw_rectangle(rect.x, rect.y, rect.w, rect.h, bg);
+    draw_rectangle_lines(
+        rect.x,
+        rect.y,
+        rect.w,
+        rect.h,
+        line_thickness.max(1.0),
+        border,
+    );
+}
+
+// Draw single- or multi-line tooltip text near the mouse and return its rectangle.
+pub fn draw_tooltip(
+    text: &str,
+    mouse: Vec2,
+    font_size: f32,
+    pad: f32,
+    colors: &RuntimeColors,
+) -> Rect {
+    let mut max_width: f32 = 0.0;
+    let mut line_count = 0usize;
+    for line in text.lines() {
+        let dim = measure_text(line, None, font_size as u16, 1.0);
+        max_width = max_width.max(dim.width);
+        line_count += 1;
+    }
+    if line_count == 0 {
+        return Rect::new(mouse.x, mouse.y, 0.0, 0.0);
+    }
+
+    let line_height = font_size;
+    let height = line_height * line_count as f32;
+    let rect = Rect::new(
+        (mouse.x + 14.0).min((screen_width() - max_width - pad * 2.0).max(0.0)),
+        (mouse.y + 16.0).min((screen_height() - height - pad * 2.0).max(0.0)),
+        max_width + pad * 2.0,
+        height + pad * 2.0,
+    );
+    draw_panel_frame(rect, 1.0, colors.tooltip_bg, colors.tooltip_border);
+
+    let mut y = rect.y + pad + font_size - 2.0;
+    for line in text.lines() {
+        draw_text(line, rect.x + pad, y, font_size, colors.text_primary);
+        y += line_height;
+    }
+    rect
+}
+
+// Fit text to a maximum width, appending an ellipsis when truncation is needed.
+pub fn fit_status_text(text: &str, max_width: f32, font_size: u16) -> String {
+    if measure_text(text, None, font_size, 1.0).width <= max_width {
+        return text.to_string();
+    }
+    let ellipsis = "...";
+    if max_width <= measure_text(ellipsis, None, font_size, 1.0).width {
+        return String::new();
+    }
+
+    let mut fitted = String::new();
+    for character in text.chars() {
+        let mut candidate = fitted.clone();
+        candidate.push(character);
+        candidate.push_str(ellipsis);
+        if measure_text(&candidate, None, font_size, 1.0).width > max_width {
+            break;
+        }
+        fitted.push(character);
+    }
+    fitted.push_str(ellipsis);
+    fitted
 }
 
 // Friendly label for a color target in UI.

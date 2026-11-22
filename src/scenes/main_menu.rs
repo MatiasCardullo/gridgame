@@ -1,6 +1,6 @@
 use macroquad::prelude::*;
 
-use crate::core::ui::{draw_log_panel, draw_progress_bar, ui_button};
+use crate::core::ui::{draw_log_panel, draw_panel_frame, draw_progress_bar, ui_button};
 use crate::core::{Axial, FrameContext, PlacedBlock, Scene, TileData, Unit, save_map};
 use std::collections::HashMap;
 
@@ -67,6 +67,13 @@ pub fn run(
     }
     y += btn_h + 12.0;
 
+    let rect_cad = Rect::new((screen_width() - btn_w) * 0.5, y, btn_w, btn_h);
+    let (clicked_cad, _) = ui_button(rect_cad, "CAD", ctx.mouse, ctx.font_md, ctx.button_colors);
+    if clicked_cad {
+        *scene = Scene::Cad;
+    }
+    y += btn_h + 12.0;
+
     let rect_exit = Rect::new((screen_width() - btn_w) * 0.5, y, btn_w, btn_h);
     let (clicked_exit, _) = ui_button(
         rect_exit,
@@ -106,13 +113,10 @@ fn draw_planet_loading_panel(
         return;
     }
     let panel = Rect::new(24.0, screen_height() - 220.0, 420.0, 190.0);
-    draw_rectangle(panel.x, panel.y, panel.w, panel.h, ctx.colors_rt.panel_bg);
-    draw_rectangle_lines(
-        panel.x,
-        panel.y,
-        panel.w,
-        panel.h,
+    draw_panel_frame(
+        panel,
         1.5,
+        ctx.colors_rt.panel_bg,
         ctx.colors_rt.panel_border,
     );
     draw_text(

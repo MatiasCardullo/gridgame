@@ -394,6 +394,23 @@ pub enum MeshPrimitive {
 }
 
 impl EditableMesh {
+    pub fn paint_vertices(&mut self, indices: &[usize], color: Color) -> Result<(), String> {
+        let rgba = [
+            (color.r.clamp(0.0, 1.0) * 255.0).round() as u8,
+            (color.g.clamp(0.0, 1.0) * 255.0).round() as u8,
+            (color.b.clamp(0.0, 1.0) * 255.0).round() as u8,
+            (color.a.clamp(0.0, 1.0) * 255.0).round() as u8,
+        ];
+        for &index in indices {
+            let vertex = self
+                .vertices
+                .get_mut(index)
+                .ok_or_else(|| format!("Paint vertex {index} is out of range"))?;
+            vertex.color = rgba;
+        }
+        Ok(())
+    }
+
     pub fn primitive(primitive: MeshPrimitive) -> Self {
         let color = Color::from_rgba(205, 190, 160, 255);
         match primitive {
@@ -3863,6 +3880,27 @@ mod tests {
         assert!(!saved.contains("loose_lines"));
         fs::remove_file(legacy_path).unwrap();
         fs::remove_dir(directory).unwrap();
+    }
+
+    #[test]
+    fn painting_vertices_changes_color_without_changing_topology() {
+        let white = Color::from_rgba(255, 255, 255, 255);
+        let mut mesh = EditableMesh {
+            vertices: vec![
+                Vertex::new2(Vec3::ZERO, Vec2::ZERO, white),
+                Vertex::new2(Vec3::X, Vec2::ZERO, white),
+                Vertex::new2(Vec3::Y, Vec2::ZERO, white),
+            ],
+            indices: vec![0, 1, 2],
+        };
+        let original_indices = mesh.indices.clone();
+        mesh.paint_vertices(&[0, 2], Color::from_rgba(12, 34, 56, 78))
+            .unwrap();
+
+        assert_eq!(mesh.vertices[0].color, [12, 34, 56, 78]);
+        assert_eq!(mesh.vertices[1].color, [255, 255, 255, 255]);
+        assert_eq!(mesh.vertices[2].color, [12, 34, 56, 78]);
+        assert_eq!(mesh.indices, original_indices);
     }
 
     #[test]

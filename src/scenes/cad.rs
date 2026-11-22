@@ -246,6 +246,11 @@ pub struct CadSceneState {
     operation_value: String,
     operation_value_focused: bool,
     operation_value_selected: bool,
+    paint_active: bool,
+    paint_color: Color,
+    paint_hex: String,
+    paint_hex_focused: bool,
+    paint_hex_selected: bool,
     primitive_placement: Option<PrimitivePlacement>,
     grid_snap: bool,
     grid_spacing: f32,
@@ -308,6 +313,11 @@ impl Default for CadSceneState {
             operation_value: "0.1".to_string(),
             operation_value_focused: false,
             operation_value_selected: false,
+            paint_active: false,
+            paint_color: Color::from_rgba(205, 190, 160, 255),
+            paint_hex: "CDBEA0".to_string(),
+            paint_hex_focused: false,
+            paint_hex_selected: false,
             primitive_placement: None,
             grid_snap: false,
             grid_spacing: 0.5,
@@ -1940,6 +1950,23 @@ fn apply_mirror(
     })
 }
 
+fn parse_paint_hex(text: &str) -> Result<Color, String> {
+    let text = text.trim().trim_start_matches('#');
+    if text.len() != 6 && text.len() != 8 {
+        return Err("Enter a 6-digit or 8-digit hex color".to_string());
+    }
+    let bytes = text
+        .as_bytes()
+        .chunks_exact(2)
+        .map(|pair| {
+            let pair = std::str::from_utf8(pair).map_err(|_| "Invalid hex color".to_string())?;
+            u8::from_str_radix(pair, 16).map_err(|_| "Enter a valid hex color".to_string())
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let alpha = if bytes.len() == 4 { bytes[3] } else { 255 };
+    Ok(Color::from_rgba(bytes[0], bytes[1], bytes[2], alpha))
+}
+
 fn parse_operation_distance(text: &str, label: &str) -> Result<f32, String> {
     let value = text
         .trim()
@@ -1956,6 +1983,76 @@ fn apply_offset(catalog: &mut ObjectCatalog, state: &mut CadSceneState) -> Resul
     copy_faces_with_operation(catalog, state, |mesh, faces| {
         mesh.copy_faces_offset(faces, distance)
     })
+}
+
+fn apply_paint_pick(
+    catalog: &mut ObjectCatalog,
+    state: &mut CadSceneState,
+    camera: &Camera3D,
+    mouse: Vec2,
+    mesh: &EditableMesh,
+    blocked_faces: &HashSet<usize>,
+) -> Result<(), String> {
+    let vertex_indices = match state.selection_mode {
+        SelectionMode::Vertex => {
+            let index = pick_vertex(camera, mouse, mesh, blocked_faces)
+                .ok_or_else(|| "Click a mesh vertex to paint".to_string())?;
+            state.selected_vertices = vec![index];
+            state.selected_edges.clear();
+            state.selected_faces.clear();
+            state.selected_group = None;
+            vec![index]
+        }
+        SelectionMode::Edge => {
+            let edge = pick_edge(camera, mouse, mesh, blocked_faces)
+                .ok_or_else(|| "Click a mesh edge to paint".to_string())?;
+            state.selected_edges = vec![edge];
+            state.selected_vertices.clear();
+            state.selected_faces.clear();
+            state.selected_group = None;
+            vec![edge.0, edge.1]
+        }
+        SelectionMode::Face => {
+            let (origin, direction) = mouse_ray(camera, mouse)
+                .ok_or_else(|| "Could not create a mouse ray".to_string())?;
+            let face = mesh_ray_hit_excluding(origin, direction, mesh, blocked_faces)
+                .ok_or_else(|| "Click a mesh face to paint".to_string())?;
+            ensure_faces_editable(
+                selected_metadata(catalog, state)
+                    .ok_or_else(|| "Selected face metadata is unavailable".to_string())?,
+                &[face],
+            )?;
+            state.selected_faces = vec![face];
+            state.selected_vertices.clear();
+            state.selected_edges.clear();
+            state.selected_group = None;
+            let start = face
+                .checked_mul(3)
+                .ok_or_else(|| "Invalid face index".to_string())?;
+            let triangle = mesh
+                .indices
+                .get(start..start + 3)
+                .ok_or_else(|| "Selected face is outside the mesh".to_string())?;
+            triangle.iter().map(|&index| index as usize).collect()
+        }
+    };
+    if vertex_indices.is_empty() {
+        return Err("Selected paint target is empty".to_string());
+    }
+    let snapshot = capture_snapshot(catalog, state)?;
+    let mesh = selected_mesh_mut(catalog, state)
+        .ok_or_else(|| "Selected object is unavailable".to_string())?;
+    let mut unique_indices = vertex_indices;
+    unique_indices.sort_unstable();
+    unique_indices.dedup();
+    let result = mesh.paint_vertices(&unique_indices, state.paint_color);
+    if result.is_err() {
+        return result;
+    }
+    push_undo(state, snapshot);
+    state.dirty = true;
+    state.error = None;
+    Ok(())
 }
 
 fn apply_fillet(catalog: &mut ObjectCatalog, state: &mut CadSceneState) -> Result<(), String> {
@@ -2017,6 +2114,104 @@ fn pick_edge(
         }
     }
     closest.map(|(_, edge)| edge)
+}
+
+fn draw_paint_panel(ctx: &FrameContext, panel: Rect, state: &mut CadSceneState) {
+    if !state.editing {
+        return;
+    }
+    let paint_panel = panel;
+    draw_rectangle(
+        paint_panel.x,
+        paint_panel.y,
+        paint_panel.w,
+        paint_panel.h,
+        ctx.colors_rt.panel_bg,
+    );
+    draw_rectangle_lines(
+        paint_panel.x,
+        paint_panel.y,
+        paint_panel.w,
+        paint_panel.h,
+        1.5,
+        ctx.colors_rt.panel_border,
+    );
+    draw_text(
+        "Paint Color",
+        paint_panel.x + 12.0,
+        paint_panel.y + 20.0,
+        ctx.font_sm,
+        ctx.colors_rt.text_primary,
+    );
+    let swatches = [
+        Color::from_rgba(205, 190, 160, 255),
+        Color::from_rgba(220, 70, 70, 255),
+        Color::from_rgba(220, 150, 60, 255),
+        Color::from_rgba(210, 210, 70, 255),
+        Color::from_rgba(70, 190, 120, 255),
+        Color::from_rgba(70, 150, 220, 255),
+        Color::from_rgba(150, 90, 210, 255),
+        Color::from_rgba(220, 220, 220, 255),
+    ];
+    for (index, &color) in swatches.iter().enumerate() {
+        let column = index % 4;
+        let row = index / 4;
+        let rect = Rect::new(
+            paint_panel.x + 12.0 + column as f32 * 41.0,
+            paint_panel.y + 34.0 + row as f32 * 34.0,
+            32.0,
+            26.0,
+        );
+        draw_rectangle(rect.x, rect.y, rect.w, rect.h, color);
+        draw_rectangle_lines(
+            rect.x,
+            rect.y,
+            rect.w,
+            rect.h,
+            1.5,
+            ctx.colors_rt.panel_border,
+        );
+        if is_mouse_button_pressed(MouseButton::Left) && rect.contains(ctx.mouse) {
+            state.paint_active = true;
+            state.paint_color = color;
+            state.paint_hex = format!(
+                "{:02X}{:02X}{:02X}",
+                (color.r * 255.0).round() as u8,
+                (color.g * 255.0).round() as u8,
+                (color.b * 255.0).round() as u8
+            );
+            state.paint_hex_focused = false;
+            state.paint_hex_selected = false;
+        }
+    }
+    let input = Rect::new(paint_panel.x + 12.0, paint_panel.y + 104.0, 166.0, 28.0);
+    draw_rectangle(
+        input.x,
+        input.y,
+        input.w,
+        input.h,
+        ctx.colors_rt.button_base,
+    );
+    draw_rectangle_lines(
+        input.x,
+        input.y,
+        input.w,
+        input.h,
+        1.5,
+        ctx.colors_rt.panel_border,
+    );
+    draw_text(
+        &format!("#{}", state.paint_hex),
+        input.x + 8.0,
+        input.y + 19.0,
+        ctx.font_sm,
+        ctx.colors_rt.text_primary,
+    );
+    if is_mouse_button_pressed(MouseButton::Left) && input.contains(ctx.mouse) {
+        state.paint_active = true;
+        state.paint_hex_focused = true;
+        state.paint_hex_selected = true;
+    }
 }
 
 fn draw_view_controls(
@@ -2450,6 +2645,9 @@ fn restore_original_mesh(
 fn close_editor(state: &mut CadSceneState) {
     state.editing = false;
     state.dirty = false;
+    state.paint_active = false;
+    state.paint_hex_focused = false;
+    state.paint_hex_selected = false;
     state.original_mesh = None;
     state.original_metadata = None;
     state.selection_mode = SelectionMode::Vertex;
@@ -3025,6 +3223,9 @@ fn primitive_group_name(primitive: MeshPrimitive) -> &'static str {
 }
 
 fn start_primitive_placement(state: &mut CadSceneState, primitive: MeshPrimitive) {
+    state.paint_active = false;
+    state.paint_hex_focused = false;
+    state.paint_hex_selected = false;
     state.primitive_placement = Some(PrimitivePlacement {
         primitive,
         center: None,
@@ -4022,6 +4223,12 @@ pub fn run(
         190.0,
         if state.editing { 390.0 } else { 155.0 },
     );
+    let paint_panel = Rect::new(
+        view_panel.x,
+        view_panel.y + view_panel.h + 8.0,
+        view_panel.w,
+        142.0,
+    );
     if is_key_pressed(KeyCode::Escape) {
         if state.exit_confirmation_open {
             state.exit_confirmation_open = false;
@@ -4064,6 +4271,11 @@ pub fn run(
             state.offset_active = false;
             state.operation_value_focused = false;
             state.operation_value_selected = false;
+            state.error = None;
+        } else if state.paint_active {
+            state.paint_active = false;
+            state.paint_hex_focused = false;
+            state.paint_hex_selected = false;
             state.error = None;
         } else if state.editing {
             if state.dirty {
@@ -4175,6 +4387,57 @@ pub fn run(
             state.error = None;
         }
     }
+    if !modal_open && state.paint_active && state.paint_hex_focused {
+        let mut changed = false;
+        while let Some(character) = get_char_pressed() {
+            if character.is_ascii_hexdigit() {
+                if state.paint_hex_selected {
+                    state.paint_hex.clear();
+                    state.paint_hex_selected = false;
+                }
+                if state.paint_hex.chars().count() < 8 {
+                    state.paint_hex.push(character.to_ascii_uppercase());
+                    changed = true;
+                }
+            }
+        }
+        if is_key_pressed(KeyCode::Backspace) && !state.paint_hex.is_empty() {
+            if state.paint_hex_selected {
+                state.paint_hex.clear();
+                state.paint_hex_selected = false;
+            } else {
+                state.paint_hex.pop();
+            }
+            changed = true;
+        }
+        if is_key_pressed(KeyCode::Enter) {
+            match parse_paint_hex(&state.paint_hex) {
+                Ok(color) => {
+                    state.paint_active = true;
+                    state.paint_color = color;
+                    state.paint_hex = format!(
+                        "{:02X}{:02X}{:02X}",
+                        (color.r * 255.0).round() as u8,
+                        (color.g * 255.0).round() as u8,
+                        (color.b * 255.0).round() as u8,
+                    );
+                    state.paint_hex_focused = false;
+                    state.paint_hex_selected = false;
+                    state.error = None;
+                }
+                Err(error) => state.error = Some(error),
+            }
+        }
+        if changed {
+            match parse_paint_hex(&state.paint_hex) {
+                Ok(color) => {
+                    state.paint_color = color;
+                    state.error = None;
+                }
+                Err(_) => {}
+            }
+        }
+    }
     if !modal_open
         && state.numeric_transform_open
         && state.numeric_transform_focused
@@ -4278,6 +4541,7 @@ pub fn run(
     let mut ui_capturing = sidebar.contains(ctx.mouse)
         || toolbar.contains(ctx.mouse)
         || view_panel.contains(ctx.mouse)
+        || paint_panel.contains(ctx.mouse)
         || state
             .primitive_placement
             .as_ref()
@@ -4897,6 +5161,9 @@ pub fn run(
                         Some("Select mesh edges to fillet before starting the tool".into());
                 } else {
                     clear_trim_state(state);
+                    state.paint_active = false;
+                    state.paint_hex_focused = false;
+                    state.paint_hex_selected = false;
                     state.mirror_active = label == "Mirror";
                     state.mirror_points.clear();
                     state.fillet_active = label == "Fillet";
@@ -5472,6 +5739,22 @@ pub fn run(
                     state.error =
                         Some("Click the mesh or construction plane to set the mirror plane".into());
                 }
+            } else if state.paint_active {
+                if let Some(source_mesh) = current_mesh.as_ref() {
+                    match apply_paint_pick(
+                        catalog,
+                        state,
+                        &camera,
+                        ctx.mouse,
+                        source_mesh,
+                        &blocked_faces,
+                    ) {
+                        Ok(()) => state.error = None,
+                        Err(error) => state.error = Some(error),
+                    }
+                } else {
+                    state.error = Some("Selected mesh is unavailable".to_string());
+                }
             } else if ensure_selection_unlocked(catalog, state).is_ok()
                 && let Some(source_mesh) = current_mesh.as_ref()
                 && let Some((_, handle_size)) = gizmo_center_and_size(source_mesh, state)
@@ -5714,6 +5997,7 @@ pub fn run(
         metadata.and_then(|metadata| metadata.radial_pivot),
     );
     draw_object_snap_panel(ctx, view_panel, state);
+    draw_paint_panel(ctx, paint_panel, state);
 
     draw_group_config_dialog(ctx, catalog, state);
     draw_numeric_transform_panel(ctx, catalog, state);
@@ -6029,6 +6313,19 @@ pub fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn paint_hex_accepts_rgb_and_rgba() {
+        let rgb = parse_paint_hex("#12ab34").unwrap();
+        assert_eq!((rgb.r * 255.0).round() as u8, 18);
+        assert_eq!((rgb.g * 255.0).round() as u8, 171);
+        assert_eq!((rgb.b * 255.0).round() as u8, 52);
+        assert_eq!((rgb.a * 255.0).round() as u8, 255);
+
+        let rgba = parse_paint_hex("12ab34cd").unwrap();
+        assert_eq!((rgba.a * 255.0).round() as u8, 205);
+        assert!(parse_paint_hex("xyz").is_err());
+    }
 
     #[test]
     fn status_bar_reports_trim_instructions_and_prioritizes_errors() {

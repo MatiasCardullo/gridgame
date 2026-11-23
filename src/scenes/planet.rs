@@ -25,13 +25,17 @@ use crate::core::map_common::{
 };
 use crate::core::object_assets::{
     BUILDING_CELL_FILL_RATIO, EditableMesh, NORMALIZED_MODEL_EXTENT, ObjectCatalog, ObjectId,
-    RadialNeighborState, VariantMode, building_model_scale_for_cell, mesh_center_and_scale,
-    radial_sector_state_key,
+    PlacementProfile, RadialNeighborState, VariantMode, building_model_scale_for_cell,
+    mesh_center_and_scale,
 };
 use crate::core::planet_grid::{
     HexGrid, align_vertices_to_poles, build_faces, build_frequency_geodesic, build_geodesic_sphere,
     build_hex_grid_from_data, build_vertex_neighbors, icosahedron_edges, icosahedron_vertices,
     load_hex_grid_cache, save_hex_grid_cache,
+};
+use crate::core::planet_placement::{
+    BuildingSlot, CellRadius, NetworkAnchor, NetworkKind, NetworkPlacement, NetworkSegment,
+    building_slot_available,
 };
 use crate::core::planet_resources::{
     PlanetCellState, PlanetResourceKind, PlanetSimWorld, PlanetSurfaceClass,
@@ -63,6 +67,7 @@ const PLANET_NOISE_PATH: &str = "planet_data/planet_noise.json";
 const SIM_GRID_CACHE_PATH: &str = "planet_data/planet_sim_grid.bin";
 const PLANET_RESOURCES_PATH: &str = "planet_data/planet_resources.bin";
 const PLANET_BUILDINGS_PATH: &str = "planet_data/planet_buildings.json";
+const PLANET_NETWORKS_PATH: &str = "planet_data/planet_networks.json";
 const PLANET_UNITS_PATH: &str = "planet_data/planet_units.json";
 const HEIGHTMAP_SIZE: u16 = 2048;
 const TEXTURE_BASE_SUBDIVISIONS: usize = 2;
@@ -457,7 +462,14 @@ enum PlanetBuildingKind {
     Warehouse,
     Refuel,
     Logistics,
-    Route,
+    #[serde(other)]
+    LegacyRoute,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PlanetTool {
+    Building(PlanetBuildingKind),
+    RouteLine,
 }
 
 impl PlanetBuildingKind {
@@ -471,7 +483,7 @@ impl PlanetBuildingKind {
             PlanetBuildingKind::Warehouse => "Warehouse",
             PlanetBuildingKind::Refuel => "Refuel",
             PlanetBuildingKind::Logistics => "Logistics",
-            PlanetBuildingKind::Route => "Route",
+            PlanetBuildingKind::LegacyRoute => "Legacy route",
         }
     }
 }
@@ -500,8 +512,8 @@ fn unit_preset_name(preset: PlanetUnitPresetId) -> &'static str {
     }
 }
 
-fn building_object_id(kind: PlanetBuildingKind) -> ObjectId {
-    match kind {
+fn building_object_id(kind: PlanetBuildingKind) -> Option<ObjectId> {
+    Some(match kind {
         PlanetBuildingKind::Base => ObjectId::PlanetBase,
         PlanetBuildingKind::Builder => ObjectId::PlanetBuilder,
         PlanetBuildingKind::Housing => ObjectId::PlanetHousing,
@@ -510,8 +522,8 @@ fn building_object_id(kind: PlanetBuildingKind) -> ObjectId {
         PlanetBuildingKind::Warehouse => ObjectId::PlanetWarehouse,
         PlanetBuildingKind::Refuel => ObjectId::PlanetRefuel,
         PlanetBuildingKind::Logistics => ObjectId::PlanetLogistics,
-        PlanetBuildingKind::Route => ObjectId::PlanetRoute,
-    }
+        PlanetBuildingKind::LegacyRoute => return None,
+    })
 }
 
 fn interior_block_name(kind: MachineBlockType) -> &'static str {
@@ -612,7 +624,7 @@ fn building_storage_capacity(kind: PlanetBuildingKind) -> u32 {
         PlanetBuildingKind::Warehouse => 4_000,
         PlanetBuildingKind::Refuel => 300,
         PlanetBuildingKind::Logistics => 900,
-        PlanetBuildingKind::Route => 200,
+        PlanetBuildingKind::LegacyRoute => 0,
     }
 }
 
@@ -627,7 +639,7 @@ fn planet_build_time(kind: PlanetBuildingKind) -> f32 {
         PlanetBuildingKind::Warehouse => 7.0,
         PlanetBuildingKind::Refuel => 6.0,
         PlanetBuildingKind::Logistics => 8.0,
-        PlanetBuildingKind::Route => 0.5,
+        PlanetBuildingKind::LegacyRoute => 0.0,
     }
 }
 
@@ -717,10 +729,7 @@ fn planet_build_requirements(kind: PlanetBuildingKind) -> Vec<PlanetResourceStac
                 amount: 6,
             },
         ],
-        PlanetBuildingKind::Route => vec![PlanetResourceStack {
-            resource_id: resource_kind_to_id(PlanetResourceKind::Stone),
-            amount: 3,
-        }],
+        PlanetBuildingKind::LegacyRoute => vec![],
     }
 }
 
@@ -749,6 +758,8 @@ fn planet_is_under_construction(building: &PlanetBuildingState) -> bool {
 struct PlanetBuildingRecord {
     #[serde(default, alias = "visual_cell")]
     cell_index: u32,
+    #[serde(default)]
+    triangle_index: u8,
     kind: PlanetBuildingKind,
     #[serde(default)]
     mine_extra: Vec<u32>,
@@ -1167,7 +1178,10 @@ fn sync_info_window_layout(state: &mut PlanetState) {
     let Some(cell_index) = state.info_target_cell else {
         return;
     };
-    let Some(building) = state.buildings.get(&cell_index) else {
+    let Some(building) = state.buildings.get(&BuildingSlot {
+        cell_index,
+        triangle_index: state.info_target_triangle,
+    }) else {
         return;
     };
     if !matches!(
@@ -1230,10 +1244,22 @@ fn expandable_mine_cells(
 }
 
 fn is_route_kind(kind: PlanetBuildingKind) -> bool {
-    kind == PlanetBuildingKind::Route
+    kind == PlanetBuildingKind::LegacyRoute
 }
 
-fn unit_ops() -> UnitOps<PlanetBuildingKind> {
+fn unit_ops(
+    network_segments: &[NetworkSegment],
+    neighbors: &[Vec<u32>],
+    faces: &[[u32; 3]],
+) -> UnitOps<PlanetBuildingKind> {
+    let route_edges = network_segments
+        .iter()
+        .filter(|segment| {
+            segment.kind == NetworkKind::Route
+                && segment.placement.is_valid_for_topology(neighbors, faces)
+        })
+        .flat_map(|segment| segment.placement.connected_cell_edges(neighbors, faces))
+        .collect();
     UnitOps {
         is_route: is_route_kind,
         is_builder: |kind| kind == PlanetBuildingKind::Builder,
@@ -1242,13 +1268,25 @@ fn unit_ops() -> UnitOps<PlanetBuildingKind> {
         is_refuel: |kind| kind == PlanetBuildingKind::Refuel,
         build_requirements: planet_build_requirements,
         storage_capacity: building_storage_capacity,
+        route_edges,
     }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct PlanetBuildingsSnapshot {
     #[serde(default)]
+    format_version: u32,
+    #[serde(default)]
     buildings: Vec<PlanetBuildingRecord>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct PlanetNetworksSnapshot {
+    format_version: u32,
+    #[serde(default)]
+    next_id: u32,
+    #[serde(default)]
+    segments: Vec<NetworkSegment>,
 }
 
 pub struct PlanetLoader {
@@ -1291,10 +1329,16 @@ pub struct PlanetState {
     sim_world: Option<PlanetSimWorld>,
     sim_world_rx: Option<Receiver<SimWorldBuildResult>>,
     sim_world_generation: u64,
-    selected_build_tool: Option<PlanetBuildingKind>,
+    selected_build_tool: Option<PlanetTool>,
+    selected_network_kind: NetworkKind,
+    network_chain_start: Option<NetworkAnchor>,
+    selected_network_id: Option<u32>,
     panel_collapsed: bool,
-    buildings: HashMap<u32, PlanetBuildingState>,
+    buildings: HashMap<BuildingSlot, PlanetBuildingState>,
+    network_segments: Vec<NetworkSegment>,
+    next_network_id: u32,
     buildings_dirty: bool,
+    networks_dirty: bool,
     units: Vec<PlanetUnit>,
     units_dirty: bool,
     spawn_pickup_node: Option<u32>,
@@ -1302,14 +1346,17 @@ pub struct PlanetState {
     spawn_refuel_node: Option<u32>,
     spawn_construction_node: Option<u32>,
     node_pick: Option<UnitNodePick>,
-    mine_progress: HashMap<u32, f32>,
+    mine_progress: HashMap<BuildingSlot, f32>,
     min_cell_edge_dist_unit: f32,
     info_window: WindowState,
     info_target_cell: Option<u32>,
+    info_target_triangle: u8,
     editing_base_cell: Option<u32>,
     interior_pick_mode: Option<InteriorPickMode>,
     confirm_window: WindowState,
     confirm_target_cell: Option<u32>,
+    confirm_target_triangle: u8,
+    confirm_target_network: Option<u32>,
     relief_cache: HashMap<ReliefCacheKey, ReliefCacheEntry>,
     pending_relief_key: Option<ReliefCacheKey>,
     regen_rx: Option<Receiver<RegenMessage>>,
@@ -1332,6 +1379,7 @@ impl PlanetState {
             sim_world.save_if_dirty(PLANET_RESOURCES_PATH);
         }
         self.save_buildings_if_dirty(PLANET_BUILDINGS_PATH);
+        self.save_networks_if_dirty(PLANET_NETWORKS_PATH);
         self.save_units_if_dirty(PLANET_UNITS_PATH);
     }
 
@@ -1352,6 +1400,7 @@ impl PlanetState {
                     "planet_ready": self.sim_world.is_some() && self.sim_grid.is_some(),
                     "cell_count": self.sim_world.as_ref().map(|world| world.cells.len()),
                     "building_count": self.buildings.len(),
+                    "network_count": self.network_segments.len(),
                     "unit_count": self.units.len(),
                 }),
             ),
@@ -1373,8 +1422,23 @@ impl PlanetState {
                             let position = self
                                 .sim_grid
                                 .as_ref()
-                                .and_then(|grid| grid.face_centers.get(index))
+                                .and_then(|grid| grid.vertices.get(index))
                                 .map(|point| serde_json::json!([point.x, point.y, point.z]));
+                            let network_anchors = self
+                                .sim_grid
+                                .as_ref()
+                                .and_then(|grid| {
+                                    network_anchor_candidates(grid, u32::try_from(index).ok()?)
+                                })
+                                .unwrap_or_default()
+                                .into_iter()
+                                .map(|(anchor, point)| {
+                                    serde_json::json!({
+                                        "anchor": anchor,
+                                        "position": [point.x, point.y, point.z]
+                                    })
+                                })
+                                .collect::<Vec<_>>();
                             let neighbors = self
                                 .sim_neighbors
                                 .as_ref()
@@ -1385,12 +1449,20 @@ impl PlanetState {
                                 "cell_index": index,
                                 "neighbors": neighbors,
                                 "position": position,
+                                "network_anchors": network_anchors,
                                 "surface": surface_label(cell.surface),
                                 "height": cell.height,
                                 "slope": cell.slope,
                                 "buildable": cell.buildable,
-                                "building": self.buildings.get(&(index as u32))
+                                "building": self.building_for_cell(index as u32)
                                     .map(|building| building.kind.label().to_lowercase()),
+                                "buildings": self.buildings.iter()
+                                    .filter(|(slot, _)| slot.cell_index == index as u32)
+                                    .map(|(slot, building)| serde_json::json!({
+                                        "triangle_index": slot.triangle_index,
+                                        "kind": building.kind.label().to_lowercase(),
+                                    }))
+                                    .collect::<Vec<_>>(),
                                 "deposits": cell.deposits.iter().map(|deposit| {
                                     serde_json::json!({
                                         "kind": resource_name(deposit.kind),
@@ -1421,12 +1493,12 @@ impl PlanetState {
                         "planet simulation is still loading",
                     );
                 }
-                let mut indices = self.buildings.keys().copied().collect::<Vec<_>>();
-                indices.sort_unstable();
-                let buildings = indices
+                let mut slots = self.buildings.keys().copied().collect::<Vec<_>>();
+                slots.sort_by_key(|slot| (slot.cell_index, slot.triangle_index));
+                let buildings = slots
                     .into_iter()
-                    .filter_map(|cell_index| {
-                        let building = self.buildings.get(&cell_index)?;
+                    .filter_map(|slot| {
+                        let building = self.buildings.get(&slot)?;
                         let mut storage = building
                             .storage
                             .iter()
@@ -1434,7 +1506,8 @@ impl PlanetState {
                             .collect::<Vec<_>>();
                         storage.sort_by_key(|(kind, _)| *kind);
                         Some(serde_json::json!({
-                            "cell_index": cell_index,
+                            "cell_index": slot.cell_index,
+                            "triangle_index": slot.triangle_index,
                             "kind": building.kind.label().to_lowercase(),
                             "build_progress": building.build_progress,
                             "build_time": building.build_time,
@@ -1446,6 +1519,18 @@ impl PlanetState {
                     })
                     .collect::<Vec<_>>();
                 ApiReply::json(200, serde_json::json!({ "buildings": buildings }))
+            }
+            ApiCommand::Networks => {
+                if self.sim_world.is_none() {
+                    return ApiReply::error(
+                        503,
+                        "planet_not_ready",
+                        "planet simulation is still loading",
+                    );
+                }
+                let mut segments = self.network_segments.clone();
+                segments.sort_by_key(|segment| segment.id);
+                ApiReply::json(200, serde_json::json!({ "networks": segments }))
             }
             ApiCommand::Units => {
                 if self.sim_world.is_none() {
@@ -1488,7 +1573,11 @@ impl PlanetState {
                     .collect::<Vec<_>>();
                 ApiReply::json(200, serde_json::json!({ "units": units }))
             }
-            ApiCommand::PlaceBuilding { cell, kind } => {
+            ApiCommand::PlaceBuilding {
+                cell,
+                triangle_index,
+                kind,
+            } => {
                 let Some(world) = self.sim_world.as_ref() else {
                     return ApiReply::error(
                         503,
@@ -1512,24 +1601,27 @@ impl PlanetState {
                     ApiBuildingKind::Warehouse => PlanetBuildingKind::Warehouse,
                     ApiBuildingKind::Refuel => PlanetBuildingKind::Refuel,
                     ApiBuildingKind::Logistics => PlanetBuildingKind::Logistics,
-                    ApiBuildingKind::Route => PlanetBuildingKind::Route,
                 };
-                if !self.place_building(cell, kind) {
+                if !self.place_building(cell, triangle_index, kind) {
                     return ApiReply::error(
                         409,
                         "building_not_allowed",
-                        "cell is occupied, not buildable, or has no deposit for a mine",
+                        "triangle slot is occupied, not buildable, or has no deposit for a mine",
                     );
                 }
                 ApiReply::json(
                     201,
                     serde_json::json!({
                         "cell_index": cell,
+                        "triangle_index": triangle_index,
                         "kind": kind.label().to_lowercase(),
                     }),
                 )
             }
-            ApiCommand::RemoveBuilding { cell } => {
+            ApiCommand::RemoveBuilding {
+                cell,
+                triangle_index,
+            } => {
                 if self.sim_world.is_none() {
                     return ApiReply::error(
                         503,
@@ -1537,17 +1629,84 @@ impl PlanetState {
                         "planet simulation is still loading",
                     );
                 }
-                if !self.remove_building(cell) {
+                if !self.remove_building(cell, triangle_index) {
                     return ApiReply::error(
                         404,
                         "building_not_found",
-                        "no building exists at that cell",
+                        "no building exists in that triangle slot",
                     );
                 }
                 ApiReply::json(
                     200,
-                    serde_json::json!({ "removed": true, "cell_index": cell }),
+                    serde_json::json!({
+                        "removed": true,
+                        "cell_index": cell,
+                        "triangle_index": triangle_index
+                    }),
                 )
+            }
+            ApiCommand::PlaceNetwork { kind, placement } => {
+                let placement = placement.canonicalized();
+                let Some(world) = self.sim_world.as_ref() else {
+                    return ApiReply::error(
+                        503,
+                        "planet_not_ready",
+                        "planet simulation is still loading",
+                    );
+                };
+                let Some(neighbors) = self.sim_neighbors.as_deref() else {
+                    return ApiReply::error(
+                        503,
+                        "planet_not_ready",
+                        "planet topology is still loading",
+                    );
+                };
+                let Some(grid) = self.sim_grid.as_ref() else {
+                    return ApiReply::error(
+                        503,
+                        "planet_not_ready",
+                        "planet placement grid is still loading",
+                    );
+                };
+                let cell_count = world.cells.len();
+                if !placement.is_valid(cell_count) {
+                    return ApiReply::error(
+                        400,
+                        "invalid_network_placement",
+                        "network placement references invalid or identical cells",
+                    );
+                }
+                if !placement.is_valid_for_topology(neighbors, &grid.faces) {
+                    return ApiReply::error(
+                        400,
+                        "invalid_network_endpoints",
+                        "network endpoints must refer to adjacent cells",
+                    );
+                }
+                let Some(id) = self.place_network(kind, placement) else {
+                    return ApiReply::error(
+                        409,
+                        "network_not_allowed",
+                        "an identical network segment already exists or network IDs are exhausted",
+                    );
+                };
+                ApiReply::json(
+                    201,
+                    serde_json::json!({ "id": id, "kind": kind, "placement": placement }),
+                )
+            }
+            ApiCommand::RemoveNetwork { id } => {
+                if self.sim_world.is_none() {
+                    return ApiReply::error(
+                        503,
+                        "planet_not_ready",
+                        "planet simulation is still loading",
+                    );
+                }
+                if !self.remove_network(id) {
+                    return ApiReply::error(404, "network_not_found", "network ID does not exist");
+                }
+                ApiReply::json(200, serde_json::json!({ "removed": true, "id": id }))
             }
             ApiCommand::SpawnUnit {
                 depot,
@@ -1583,7 +1742,7 @@ impl PlanetState {
     }
 
     fn api_base_interior(&self, base_cell: u32) -> Result<&BaseInteriorState, ApiReply> {
-        let Some(building) = self.buildings.get(&base_cell) else {
+        let Some(building) = self.building_for_cell(base_cell) else {
             return Err(ApiReply::error(
                 404,
                 "building_not_found",
@@ -1610,7 +1769,7 @@ impl PlanetState {
         &mut self,
         base_cell: u32,
     ) -> Result<&mut BaseInteriorState, ApiReply> {
-        let Some(building) = self.buildings.get_mut(&base_cell) else {
+        let Some(building) = self.building_for_cell_mut(base_cell) else {
             return Err(ApiReply::error(
                 404,
                 "building_not_found",
@@ -1989,7 +2148,7 @@ impl PlanetState {
             ApiUnitPreset::Hauler | ApiUnitPreset::Shuttle => PlanetBuildingKind::Logistics,
             ApiUnitPreset::BuilderSupply => PlanetBuildingKind::Builder,
         };
-        if self.buildings.get(&depot).map(|building| building.kind) != Some(expected_depot) {
+        if self.building_of_kind(depot, expected_depot).is_none() {
             return ApiReply::error(
                 409,
                 "invalid_depot",
@@ -2027,7 +2186,7 @@ impl PlanetState {
             node_config.wait,
         ];
         if referenced_nodes.into_iter().flatten().any(|cell| {
-            world.cells.get(cell as usize).is_none() || !self.buildings.contains_key(&cell)
+            world.cells.get(cell as usize).is_none() || self.first_building_slot(cell).is_none()
         }) {
             return ApiReply::error(
                 404,
@@ -2036,8 +2195,9 @@ impl PlanetState {
             );
         }
         if let Some(refuel) = node_config.refuel {
-            if self.buildings.get(&refuel).map(|building| building.kind)
-                != Some(PlanetBuildingKind::Refuel)
+            if self
+                .building_of_kind(refuel, PlanetBuildingKind::Refuel)
+                .is_none()
             {
                 return ApiReply::error(
                     409,
@@ -2051,8 +2211,9 @@ impl PlanetState {
             ApiUnitPreset::BuilderSupply => PlanetUnitDefinitionId::BuilderTender,
             ApiUnitPreset::Shuttle => PlanetUnitDefinitionId::SiteShuttle,
         };
+        let mut unit_buildings = self.unit_buildings_by_cell();
         let (unit_index, kit_consumed) = match create_planet_unit(
-            &mut self.buildings,
+            &mut unit_buildings,
             &mut self.units,
             definition_id,
             depot,
@@ -2074,6 +2235,9 @@ impl PlanetState {
                 );
             }
         };
+        if kit_consumed {
+            self.sync_unit_buildings(unit_buildings);
+        }
         self.units_dirty = true;
         if kit_consumed {
             self.buildings_dirty = true;
@@ -2184,10 +2348,16 @@ impl PlanetState {
             sim_world: None,
             sim_world_rx: None,
             sim_world_generation: 0,
-            selected_build_tool: Some(PlanetBuildingKind::Mine),
+            selected_build_tool: Some(PlanetTool::Building(PlanetBuildingKind::Mine)),
+            selected_network_kind: NetworkKind::Route,
+            network_chain_start: None,
+            selected_network_id: None,
             panel_collapsed: false,
             buildings: HashMap::new(),
+            network_segments: Vec::new(),
+            next_network_id: 0,
             buildings_dirty: false,
+            networks_dirty: false,
             units: Vec::new(),
             units_dirty: false,
             spawn_pickup_node: None,
@@ -2207,6 +2377,7 @@ impl PlanetState {
                 show_units: false,
             },
             info_target_cell: None,
+            info_target_triangle: 0,
             editing_base_cell: None,
             interior_pick_mode: None,
             confirm_window: WindowState {
@@ -2219,6 +2390,8 @@ impl PlanetState {
                 show_units: false,
             },
             confirm_target_cell: None,
+            confirm_target_triangle: 0,
+            confirm_target_network: None,
             relief_cache: HashMap::new(),
             pending_relief_key: None,
             regen_rx: None,
@@ -2235,6 +2408,7 @@ impl PlanetState {
             regen_generation: Arc::new(AtomicU64::new(0)),
         };
         state.load_buildings_snapshot(PLANET_BUILDINGS_PATH);
+        state.load_networks_snapshot(PLANET_NETWORKS_PATH);
         state.load_units_snapshot(PLANET_UNITS_PATH);
         state
     }
@@ -2281,10 +2455,10 @@ impl PlanetState {
     }
 
     pub fn begin_base_interior_edit(&mut self, cell_index: u32) -> bool {
-        let Some(building) = self.buildings.get(&cell_index) else {
-            return false;
-        };
-        if building.kind != PlanetBuildingKind::Base {
+        if self
+            .building_of_kind(cell_index, PlanetBuildingKind::Base)
+            .is_none()
+        {
             return false;
         }
         self.editing_base_cell = Some(cell_index);
@@ -2298,12 +2472,16 @@ impl PlanetState {
 
     pub fn active_base_interior(&self) -> Option<&BaseInteriorState> {
         let cell_index = self.editing_base_cell?;
-        self.buildings.get(&cell_index)?.interior.as_ref()
+        self.building_of_kind(cell_index, PlanetBuildingKind::Base)?
+            .interior
+            .as_ref()
     }
 
     pub fn active_base_interior_mut(&mut self) -> Option<&mut BaseInteriorState> {
         let cell_index = self.editing_base_cell?;
-        self.buildings.get_mut(&cell_index)?.interior.as_mut()
+        self.building_of_kind_mut(cell_index, PlanetBuildingKind::Base)?
+            .interior
+            .as_mut()
     }
 
     pub fn active_base_cell(&self) -> Option<u32> {
@@ -2440,8 +2618,20 @@ impl PlanetState {
         let Ok(snapshot) = serde_json::from_str::<PlanetBuildingsSnapshot>(&contents) else {
             return;
         };
+        if snapshot.format_version != 2 {
+            eprintln!(
+                "GridGame ignored incompatible building save (version {}); recreate building placements",
+                snapshot.format_version
+            );
+            return;
+        }
         self.buildings.clear();
+        let mut ignored_legacy_route = false;
         for record in snapshot.buildings.into_iter() {
+            if record.kind == PlanetBuildingKind::LegacyRoute {
+                ignored_legacy_route = true;
+                continue;
+            }
             let mut storage: HashMap<PlanetResourceKind, u32> = HashMap::new();
             for entry in record.storage.into_iter() {
                 let Some(kind) = resource_kind_from_id(entry.resource_id) else {
@@ -2467,7 +2657,10 @@ impl PlanetState {
                 None
             };
             self.buildings.insert(
-                record.cell_index,
+                BuildingSlot {
+                    cell_index: record.cell_index,
+                    triangle_index: record.triangle_index,
+                },
                 PlanetBuildingState {
                     kind: record.kind,
                     mine_extra: record.mine_extra,
@@ -2486,7 +2679,7 @@ impl PlanetState {
                 },
             );
         }
-        self.buildings_dirty = false;
+        self.buildings_dirty = ignored_legacy_route;
     }
 
     fn save_buildings_if_dirty(&mut self, path: &str) {
@@ -2495,11 +2688,13 @@ impl PlanetState {
         }
         ensure_planet_data_dir();
         let snapshot = PlanetBuildingsSnapshot {
+            format_version: 2,
             buildings: self
                 .buildings
                 .iter()
-                .map(|(cell_index, building)| PlanetBuildingRecord {
-                    cell_index: *cell_index,
+                .map(|(slot, building)| PlanetBuildingRecord {
+                    cell_index: slot.cell_index,
+                    triangle_index: slot.triangle_index,
                     kind: building.kind,
                     mine_extra: building.mine_extra.clone(),
                     storage: building
@@ -2525,9 +2720,56 @@ impl PlanetState {
                 })
                 .collect(),
         };
-        if let Ok(json) = serde_json::to_string_pretty(&snapshot) {
-            let _ = fs::write(path, json);
-            self.buildings_dirty = false;
+        match serde_json::to_string_pretty(&snapshot) {
+            Ok(json) => match fs::write(path, json) {
+                Ok(()) => self.buildings_dirty = false,
+                Err(error) => eprintln!("GridGame could not save planet buildings: {error}"),
+            },
+            Err(error) => eprintln!("GridGame could not serialize planet buildings: {error}"),
+        }
+    }
+
+    fn load_networks_snapshot(&mut self, path: &str) {
+        let Ok(contents) = fs::read_to_string(path) else {
+            return;
+        };
+        let Ok(snapshot) = serde_json::from_str::<PlanetNetworksSnapshot>(&contents) else {
+            return;
+        };
+        if snapshot.format_version != 1 {
+            eprintln!(
+                "GridGame ignored incompatible network save (version {})",
+                snapshot.format_version
+            );
+            return;
+        }
+        self.network_segments = snapshot.segments;
+        self.next_network_id = snapshot.next_id.max(
+            self.network_segments
+                .iter()
+                .map(|segment| segment.id.saturating_add(1))
+                .max()
+                .unwrap_or(0),
+        );
+        self.networks_dirty = false;
+    }
+
+    fn save_networks_if_dirty(&mut self, path: &str) {
+        if !self.networks_dirty {
+            return;
+        }
+        ensure_planet_data_dir();
+        let snapshot = PlanetNetworksSnapshot {
+            format_version: 1,
+            next_id: self.next_network_id,
+            segments: self.network_segments.clone(),
+        };
+        match serde_json::to_string_pretty(&snapshot) {
+            Ok(json) => match fs::write(path, json) {
+                Ok(()) => self.networks_dirty = false,
+                Err(error) => eprintln!("GridGame could not save planet networks: {error}"),
+            },
+            Err(error) => eprintln!("GridGame could not serialize planet networks: {error}"),
         }
     }
 
@@ -2611,8 +2853,123 @@ impl PlanetState {
         }
     }
 
-    fn can_place_building(&self, cell_index: u32, kind: PlanetBuildingKind) -> bool {
-        if self.buildings.contains_key(&cell_index) {
+    fn building_slot_exists(&self, slot: BuildingSlot) -> bool {
+        self.buildings.contains_key(&slot)
+    }
+
+    fn first_building_slot(&self, cell_index: u32) -> Option<BuildingSlot> {
+        self.buildings
+            .keys()
+            .filter(|slot| slot.cell_index == cell_index)
+            .filter(|slot| {
+                self.buildings
+                    .get(slot)
+                    .is_some_and(|building| building.kind != PlanetBuildingKind::LegacyRoute)
+            })
+            .min_by_key(|slot| slot.triangle_index)
+            .copied()
+            .or_else(|| {
+                self.buildings
+                    .keys()
+                    .filter(|slot| slot.cell_index == cell_index)
+                    .min_by_key(|slot| slot.triangle_index)
+                    .copied()
+            })
+    }
+
+    fn building_for_cell(&self, cell_index: u32) -> Option<&PlanetBuildingState> {
+        let slot = self.first_building_slot(cell_index)?;
+        self.buildings.get(&slot)
+    }
+
+    fn building_for_cell_mut(&mut self, cell_index: u32) -> Option<&mut PlanetBuildingState> {
+        let slot = self.first_building_slot(cell_index)?;
+        self.buildings.get_mut(&slot)
+    }
+
+    fn building_of_kind(
+        &self,
+        cell_index: u32,
+        kind: PlanetBuildingKind,
+    ) -> Option<&PlanetBuildingState> {
+        self.buildings
+            .iter()
+            .find(|(slot, building)| slot.cell_index == cell_index && building.kind == kind)
+            .map(|(_, building)| building)
+    }
+
+    fn building_of_kind_mut(
+        &mut self,
+        cell_index: u32,
+        kind: PlanetBuildingKind,
+    ) -> Option<&mut PlanetBuildingState> {
+        let slot = self
+            .buildings
+            .iter()
+            .find(|(slot, building)| slot.cell_index == cell_index && building.kind == kind)
+            .map(|(slot, _)| *slot)?;
+        self.buildings.get_mut(&slot)
+    }
+
+    fn unit_buildings_by_cell(&self) -> HashMap<u32, PlanetBuildingState> {
+        let mut buildings = HashMap::new();
+        let mut slots = self.buildings.keys().copied().collect::<Vec<_>>();
+        slots.sort_by_key(|slot| (slot.cell_index, slot.triangle_index));
+        for slot in slots {
+            if let Some(building) = self.buildings.get(&slot)
+                && building.kind != PlanetBuildingKind::LegacyRoute
+            {
+                buildings
+                    .entry(slot.cell_index)
+                    .or_insert_with(|| building.clone());
+            }
+        }
+        buildings
+    }
+
+    fn sync_unit_buildings(&mut self, buildings: HashMap<u32, PlanetBuildingState>) {
+        for (cell_index, building) in buildings {
+            if let Some(slot) = self
+                .buildings
+                .iter()
+                .filter(|(slot, building)| {
+                    slot.cell_index == cell_index
+                        && building.kind != PlanetBuildingKind::LegacyRoute
+                })
+                .min_by_key(|(slot, _)| slot.triangle_index)
+                .map(|(slot, _)| *slot)
+            {
+                self.buildings.insert(slot, building);
+            }
+        }
+    }
+
+    fn side_count_for_cell(&self, cell_index: u32) -> Option<usize> {
+        self.sim_grid
+            .as_ref()?
+            .vertex_faces
+            .get(cell_index as usize)
+            .map(Vec::len)
+            .filter(|&sides| sides == 5 || sides == 6)
+    }
+
+    fn can_place_building(
+        &self,
+        cell_index: u32,
+        triangle_index: u8,
+        kind: PlanetBuildingKind,
+    ) -> bool {
+        if kind == PlanetBuildingKind::LegacyRoute {
+            return false;
+        }
+        let slot = BuildingSlot {
+            cell_index,
+            triangle_index,
+        };
+        let Some(side_count) = self.side_count_for_cell(cell_index) else {
+            return false;
+        };
+        if !building_slot_available(slot, side_count, self.buildings.keys().copied()) {
             return false;
         }
         if !self.can_build_on_sim_cell(cell_index) {
@@ -2632,8 +2989,13 @@ impl PlanetState {
         }
     }
 
-    fn place_building(&mut self, cell_index: u32, kind: PlanetBuildingKind) -> bool {
-        if !self.can_place_building(cell_index, kind) {
+    fn place_building(
+        &mut self,
+        cell_index: u32,
+        triangle_index: u8,
+        kind: PlanetBuildingKind,
+    ) -> bool {
+        if !self.can_place_building(cell_index, triangle_index, kind) {
             return false;
         }
         let mut storage = HashMap::new();
@@ -2649,8 +3011,12 @@ impl PlanetState {
             add_storage_amount(&mut storage, PlanetResourceKind::Lead, 20);
             add_storage_amount(&mut storage, PlanetResourceKind::Zinc, 10);
         }
-        self.buildings.insert(
+        let slot = BuildingSlot {
             cell_index,
+            triangle_index,
+        };
+        self.buildings.insert(
+            slot,
             PlanetBuildingState {
                 kind,
                 mine_extra: Vec::new(),
@@ -2672,26 +3038,86 @@ impl PlanetState {
         true
     }
 
-    fn remove_building(&mut self, cell_index: u32) -> bool {
-        let removed = self.buildings.remove(&cell_index).is_some();
+    fn remove_building(&mut self, cell_index: u32, triangle_index: u8) -> bool {
+        let slot = BuildingSlot {
+            cell_index,
+            triangle_index,
+        };
+        let removed = self.buildings.remove(&slot).is_some();
         if removed {
-            if self.editing_base_cell == Some(cell_index) {
+            if self.editing_base_cell == Some(cell_index)
+                && self
+                    .building_of_kind(cell_index, PlanetBuildingKind::Base)
+                    .is_none()
+            {
                 self.editing_base_cell = None;
             }
-            self.mine_progress.remove(&cell_index);
-            let before = self.units.len();
-            self.units.retain(|unit| !unit.references_cell(cell_index));
-            if self.units.len() != before {
-                self.units_dirty = true;
+            self.mine_progress.remove(&slot);
+            if self.first_building_slot(cell_index).is_none() {
+                let before = self.units.len();
+                self.units.retain(|unit| !unit.references_cell(cell_index));
+                if self.units.len() != before {
+                    self.units_dirty = true;
+                }
             }
             self.buildings_dirty = true;
         }
         removed
     }
 
+    fn can_place_network(&self, kind: NetworkKind, placement: NetworkPlacement) -> bool {
+        let placement = placement.canonicalized();
+        let Some(cell_count) = self.sim_world.as_ref().map(|world| world.cells.len()) else {
+            return false;
+        };
+        let Some(neighbors) = self.sim_neighbors.as_ref() else {
+            return false;
+        };
+        let Some(grid) = self.sim_grid.as_ref() else {
+            return false;
+        };
+        self.next_network_id.checked_add(1).is_some()
+            && placement.is_valid(cell_count)
+            && placement.is_valid_for_topology(neighbors, &grid.faces)
+            && !self
+                .network_segments
+                .iter()
+                .any(|segment| segment.kind == kind && segment.placement == placement)
+    }
+
+    fn place_network(&mut self, kind: NetworkKind, placement: NetworkPlacement) -> Option<u32> {
+        let placement = placement.canonicalized();
+        if !self.can_place_network(kind, placement) {
+            return None;
+        }
+        let id = self.next_network_id;
+        self.next_network_id = self.next_network_id.checked_add(1)?;
+        self.network_segments.push(NetworkSegment {
+            id,
+            kind,
+            placement,
+        });
+        self.networks_dirty = true;
+        if kind == NetworkKind::Route {
+            self.units_dirty = true;
+        }
+        Some(id)
+    }
+
+    fn remove_network(&mut self, id: u32) -> bool {
+        let before = self.network_segments.len();
+        self.network_segments.retain(|segment| segment.id != id);
+        if self.network_segments.len() == before {
+            return false;
+        }
+        self.networks_dirty = true;
+        self.units_dirty = true;
+        true
+    }
+
     // Returns available storage capacity for a placed building.
-    fn storage_space_left(&self, cell_index: u32) -> u32 {
-        let Some(building) = self.buildings.get(&cell_index) else {
+    fn storage_space_left(&self, slot: BuildingSlot) -> u32 {
+        let Some(building) = self.buildings.get(&slot) else {
             return 0;
         };
         let capacity = building_storage_capacity(building.kind);
@@ -2702,11 +3128,11 @@ impl PlanetState {
     // Stores mined units into one building inventory, capped by its capacity.
     fn push_to_building_storage(
         &mut self,
-        cell_index: u32,
+        slot: BuildingSlot,
         resource: PlanetResourceKind,
         amount: u32,
     ) -> u32 {
-        let Some(building) = self.buildings.get_mut(&cell_index) else {
+        let Some(building) = self.buildings.get_mut(&slot) else {
             return 0;
         };
         let capacity = building_storage_capacity(building.kind);
@@ -2720,12 +3146,17 @@ impl PlanetState {
     }
 
     fn expand_mine_area(&mut self, cell_index: u32) -> bool {
-        let Some(building) = self.buildings.get(&cell_index) else {
+        let Some(building) = self.building_of_kind(cell_index, PlanetBuildingKind::Mine) else {
             return false;
         };
-        if building.kind != PlanetBuildingKind::Mine {
-            return false;
-        }
+        let slot = self
+            .buildings
+            .iter()
+            .find(|(slot, building)| {
+                slot.cell_index == cell_index && building.kind == PlanetBuildingKind::Mine
+            })
+            .map(|(slot, _)| *slot);
+        let Some(slot) = slot else { return false };
         let Some(sim_world) = self.sim_world.as_ref() else {
             return false;
         };
@@ -2736,7 +3167,7 @@ impl PlanetState {
         if to_add.is_empty() {
             return false;
         }
-        let Some(building) = self.buildings.get_mut(&cell_index) else {
+        let Some(building) = self.buildings.get_mut(&slot) else {
             return false;
         };
         for neighbor in to_add.into_iter() {
@@ -2752,45 +3183,50 @@ impl PlanetState {
         let Some(sim_grid) = self.sim_grid.as_ref() else {
             return;
         };
-        let Some(builder) = self.buildings.get(&builder_cell) else {
+        let Some(builder) = self.building_of_kind(builder_cell, PlanetBuildingKind::Builder) else {
             return;
         };
-        if builder.kind != PlanetBuildingKind::Builder || planet_is_under_construction(builder) {
+        if planet_is_under_construction(builder) {
             return;
         }
+        let auto_pick_build = builder.auto_pick_build;
+        let auto_pick_source = builder.auto_pick_source;
+        let auto_pick_refuel = builder.auto_pick_refuel;
 
-        let build_target = if builder.auto_pick_build {
+        let build_target = if auto_pick_build {
             self.buildings
                 .iter()
-                .filter(|(cell, building)| {
-                    **cell != builder_cell
+                .filter(|(slot, building)| {
+                    slot.cell_index != builder_cell
+                        && building.kind != PlanetBuildingKind::LegacyRoute
                         && planet_is_under_construction(building)
                         && !building.build_paid
                 })
                 .min_by(|(a, _), (b, _)| {
-                    planet_cell_distance(sim_grid, builder_cell, **a)
-                        .total_cmp(&planet_cell_distance(sim_grid, builder_cell, **b))
+                    planet_cell_distance(sim_grid, builder_cell, a.cell_index)
+                        .total_cmp(&planet_cell_distance(sim_grid, builder_cell, b.cell_index))
                 })
-                .map(|(cell, _)| *cell)
+                .map(|(slot, _)| slot.cell_index)
         } else {
             self.spawn_construction_node
         };
 
-        if builder.auto_pick_build {
+        if auto_pick_build {
             self.spawn_construction_node = build_target;
         }
 
-        if builder.auto_pick_source {
+        if auto_pick_source {
             self.spawn_pickup_node = build_target.and_then(|target| {
                 let reqs = self
-                    .buildings
-                    .get(&target)
+                    .building_for_cell(target)
                     .map(|building| planet_build_requirements(building.kind))
                     .unwrap_or_default();
                 self.buildings
                     .iter()
-                    .filter(|(_, building)| {
-                        !planet_is_under_construction(building)
+                    .filter(|(slot, building)| {
+                        building.kind != PlanetBuildingKind::LegacyRoute
+                            && slot.cell_index != builder_cell
+                            && !planet_is_under_construction(building)
                             && matches!(
                                 building.kind,
                                 PlanetBuildingKind::Base
@@ -2807,26 +3243,28 @@ impl PlanetState {
                             })
                     })
                     .min_by(|(a, _), (b, _)| {
-                        planet_cell_distance(sim_grid, target, **a)
-                            .total_cmp(&planet_cell_distance(sim_grid, target, **b))
+                        planet_cell_distance(sim_grid, target, a.cell_index)
+                            .total_cmp(&planet_cell_distance(sim_grid, target, b.cell_index))
                     })
-                    .map(|(cell, _)| *cell)
+                    .map(|(slot, _)| slot.cell_index)
             });
         }
 
-        if builder.auto_pick_refuel {
+        if auto_pick_refuel {
             self.spawn_refuel_node = self
                 .buildings
                 .iter()
-                .filter(|(_, building)| {
-                    !planet_is_under_construction(building)
+                .filter(|(slot, building)| {
+                    building.kind != PlanetBuildingKind::LegacyRoute
+                        && slot.cell_index != builder_cell
+                        && !planet_is_under_construction(building)
                         && building.kind == PlanetBuildingKind::Refuel
                 })
                 .min_by(|(a, _), (b, _)| {
-                    planet_cell_distance(sim_grid, builder_cell, **a)
-                        .total_cmp(&planet_cell_distance(sim_grid, builder_cell, **b))
+                    planet_cell_distance(sim_grid, builder_cell, a.cell_index)
+                        .total_cmp(&planet_cell_distance(sim_grid, builder_cell, b.cell_index))
                 })
-                .map(|(cell, _)| *cell);
+                .map(|(slot, _)| slot.cell_index);
         }
     }
 
@@ -2834,30 +3272,31 @@ impl PlanetState {
         if self.sim_world.is_none() {
             return;
         };
-        let mine_cells: Vec<u32> = self
+        let mine_slots: Vec<BuildingSlot> = self
             .buildings
             .iter()
-            .filter_map(|(cell_index, building)| {
+            .filter_map(|(slot, building)| {
                 if building.kind == PlanetBuildingKind::Mine
                     && !planet_is_under_construction(building)
                 {
-                    Some(*cell_index)
+                    Some(*slot)
                 } else {
                     None
                 }
             })
             .collect();
-        for cell_index in mine_cells.into_iter() {
-            let mut progress = self.mine_progress.get(&cell_index).copied().unwrap_or(0.0);
+        for slot in mine_slots.into_iter() {
+            let cell_index = slot.cell_index;
+            let mut progress = self.mine_progress.get(&slot).copied().unwrap_or(0.0);
             progress += dt * MINE_EXTRACT_RATE_PER_SEC;
             let units = progress.floor() as u32;
             if units == 0 {
-                self.mine_progress.insert(cell_index, progress);
+                self.mine_progress.insert(slot, progress);
                 continue;
             }
             let targets = self
                 .buildings
-                .get(&cell_index)
+                .get(&slot)
                 .map(|building| mine_target_cells(cell_index, building))
                 .unwrap_or_else(|| vec![cell_index]);
             let mut remaining_units = units;
@@ -2878,7 +3317,7 @@ impl PlanetState {
                 }) else {
                     break;
                 };
-                let available = self.storage_space_left(cell_index);
+                let available = self.storage_space_left(slot);
                 if available == 0 {
                     break;
                 }
@@ -2893,8 +3332,7 @@ impl PlanetState {
                 }
                 let mut stored_total = 0u32;
                 for (resource_kind, mined_amount) in mined.into_iter() {
-                    let stored =
-                        self.push_to_building_storage(cell_index, resource_kind, mined_amount);
+                    let stored = self.push_to_building_storage(slot, resource_kind, mined_amount);
                     stored_total += stored;
                     if stored < mined_amount {
                         break;
@@ -2907,7 +3345,7 @@ impl PlanetState {
                 remaining_units = remaining_units.saturating_sub(stored_total);
             }
             progress -= extracted_total as f32;
-            self.mine_progress.insert(cell_index, progress);
+            self.mine_progress.insert(slot, progress);
             if extracted_total > 0 {
                 self.buildings_dirty = true;
             }
@@ -2923,15 +3361,22 @@ impl PlanetState {
             return;
         };
         let before_states = self.capture_builder_unit_debug_states();
-        let ops = unit_ops();
+        let network_segments: &[NetworkSegment] = if self.units.is_empty() {
+            &[]
+        } else {
+            &self.network_segments
+        };
+        let ops = unit_ops(network_segments, neighbors, &sim_grid.faces);
+        let mut unit_buildings = self.unit_buildings_by_cell();
         let result = update_units_and_construction(
             &mut self.units,
-            &mut self.buildings,
+            &mut unit_buildings,
             sim_grid,
             neighbors,
             dt,
             &ops,
         );
+        self.sync_unit_buildings(unit_buildings);
         self.log_builder_unit_changes(&before_states);
         if result.units_dirty {
             self.units_dirty = true;
@@ -2947,10 +3392,8 @@ impl PlanetState {
             .filter(|unit| {
                 unit.preset_id == PlanetUnitPresetId::BuilderSupply
                     && self
-                        .buildings
-                        .get(&unit.depot)
-                        .map(|building| building.kind == PlanetBuildingKind::Builder)
-                        .unwrap_or(false)
+                        .building_of_kind(unit.depot, PlanetBuildingKind::Builder)
+                        .is_some()
             })
             .map(builder_unit_debug_state)
             .collect()
@@ -3907,25 +4350,6 @@ fn draw_global_hex_cell(
     Some(best_index)
 }
 
-fn rotate_radial_sector(
-    mesh: &EditableMesh,
-    sector: usize,
-    sides: usize,
-    pivot: Vec3,
-) -> EditableMesh {
-    let angle = std::f32::consts::TAU * sector as f32 / sides as f32;
-    mesh.transformed(|point| {
-        let relative = point - pivot;
-        let x = relative.x * angle.cos() - relative.z * angle.sin();
-        let z = relative.x * angle.sin() + relative.z * angle.cos();
-        vec3(x, relative.y, z) + pivot
-    })
-}
-
-fn radial_sector_start_angle(first_neighbor_angle: f32, sides: usize) -> f32 {
-    first_neighbor_angle - std::f32::consts::PI / sides as f32
-}
-
 fn radial_neighbor_state(
     owner: PlanetBuildingKind,
     neighbor: Option<PlanetBuildingKind>,
@@ -3952,32 +4376,450 @@ fn normalize_building_mesh(mesh: &EditableMesh, reference: &EditableMesh) -> Edi
     })
 }
 
-fn normalize_radial_mesh(
-    mesh: &EditableMesh,
-    pivot: Vec3,
-    reference: &EditableMesh,
-) -> EditableMesh {
-    let (_, scale) = mesh_center_and_scale(reference);
-    mesh.transformed(|point| (point - pivot) * scale)
+fn triangle_slot_for_direction(
+    visual_grid: &HexGrid,
+    cell_index: u32,
+    direction: Vec3,
+) -> Option<u8> {
+    let vertex_dir = visual_grid
+        .vertices
+        .get(cell_index as usize)?
+        .normalize_or_zero();
+    let face_list = visual_grid.vertex_faces.get(cell_index as usize)?;
+    if face_list.len() < 3 || face_list.len() > u8::MAX as usize {
+        return None;
+    }
+    let mut tangent_x = Vec3::ZERO;
+    for &face_index in face_list {
+        let center = *visual_grid.face_centers.get(face_index as usize)?;
+        let candidate = center - vertex_dir * vertex_dir.dot(center);
+        if candidate.length() > 1e-6 {
+            tangent_x = candidate.normalize();
+            break;
+        }
+    }
+    if tangent_x.length() < 1e-6 {
+        return None;
+    }
+    let tangent_y = vertex_dir.cross(tangent_x).normalize_or_zero();
+    if tangent_y.length() < 1e-6 {
+        return None;
+    }
+    let mut angles = face_list
+        .iter()
+        .filter_map(|&face_index| {
+            let center = *visual_grid.face_centers.get(face_index as usize)?;
+            let point = vec2(center.dot(tangent_x), center.dot(tangent_y));
+            Some(point.y.atan2(point.x))
+        })
+        .collect::<Vec<_>>();
+    if angles.len() != face_list.len() {
+        return None;
+    }
+    angles.sort_by(f32::total_cmp);
+    let hit = direction.normalize_or_zero();
+    let point = vec2(hit.dot(tangent_x), hit.dot(tangent_y));
+    if point.length_squared() < 1e-8 {
+        return None;
+    }
+    let angle = point.y.atan2(point.x);
+    let relative = (angle - angles[0]).rem_euclid(std::f32::consts::TAU);
+    let sector = (relative / (std::f32::consts::TAU / angles.len() as f32)).floor() as usize;
+    Some((sector % angles.len()) as u8)
+}
+
+fn triangle_slot_frame(
+    visual_grid: &HexGrid,
+    slot: BuildingSlot,
+) -> Option<(Vec3, Vec3, Vec3, f32)> {
+    let vertex_dir = visual_grid
+        .vertices
+        .get(slot.cell_index as usize)?
+        .normalize_or_zero();
+    let face_list = visual_grid.vertex_faces.get(slot.cell_index as usize)?;
+    if !slot.is_valid(face_list.len()) {
+        return None;
+    }
+    let mut tangent_x = Vec3::ZERO;
+    let mut ordered = Vec::with_capacity(face_list.len());
+    for &face_index in face_list {
+        let center = *visual_grid.face_centers.get(face_index as usize)?;
+        let candidate = center - vertex_dir * vertex_dir.dot(center);
+        if tangent_x.length() < 1e-6 && candidate.length() > 1e-6 {
+            tangent_x = candidate.normalize();
+        }
+        ordered.push(center);
+    }
+    let tangent_y = vertex_dir.cross(tangent_x).normalize_or_zero();
+    if tangent_x.length() < 1e-6 || tangent_y.length() < 1e-6 {
+        return None;
+    }
+    let mut points = ordered
+        .iter()
+        .map(|center| {
+            let point = vec2(center.dot(tangent_x), center.dot(tangent_y));
+            (point.y.atan2(point.x), point)
+        })
+        .collect::<Vec<_>>();
+    points.sort_by(|left, right| left.0.total_cmp(&right.0));
+    let cell_points = points.iter().map(|(_, point)| *point).collect::<Vec<_>>();
+    let (_, outer_radius) = cell_building_geometry(&cell_points)?;
+    let angle_step = std::f32::consts::TAU / points.len() as f32;
+    let slot_angle = points[0].0 + (f32::from(slot.triangle_index) + 0.5) * angle_step;
+    let slot_radial = tangent_x * slot_angle.cos() + tangent_y * slot_angle.sin();
+    let slot_center = (vertex_dir + slot_radial * outer_radius * 0.46).normalize();
+    let slot_tangent_x = (tangent_x - slot_center * tangent_x.dot(slot_center)).normalize_or_zero();
+    let slot_tangent_y = slot_center.cross(slot_tangent_x).normalize_or_zero();
+    Some((slot_center, slot_tangent_x, slot_tangent_y, outer_radius))
+}
+
+fn draw_building_ghost(
+    visual_grid: &HexGrid,
+    slot: BuildingSlot,
+    kind: PlanetBuildingKind,
+    radius: f32,
+    assets: &ObjectCatalog,
+    valid: bool,
+) {
+    let Some((anchor_dir, anchor_x, anchor_y, outer_radius)) =
+        triangle_slot_frame(visual_grid, slot)
+    else {
+        return;
+    };
+    let Some(object_id) = building_object_id(kind) else {
+        return;
+    };
+    let Some(source_mesh) = assets.get(object_id) else {
+        return;
+    };
+    let reference_mesh = assets.get(object_id).unwrap_or(source_mesh);
+    let normalized = normalize_building_mesh(source_mesh, reference_mesh);
+    let model_radius = radius + 0.0035;
+    let model_scale = building_model_scale_for_cell(outer_radius * 0.36 * model_radius);
+    let mut ghost = normalized.transformed(|point| {
+        anchor_dir * (model_radius + point.y * model_scale)
+            + anchor_x * (point.x * model_scale)
+            + anchor_y * (point.z * model_scale)
+    });
+    let tint = if valid {
+        Color::from_rgba(80, 255, 150, 170)
+    } else {
+        Color::from_rgba(255, 80, 80, 170)
+    };
+    for vertex in &mut ghost.vertices {
+        vertex.color = tint.into();
+    }
+    if let Err(error) = ghost.render() {
+        eprintln!("GridGame could not render building placement preview: {error}");
+    }
+}
+
+fn network_anchor_candidates(
+    visual_grid: &HexGrid,
+    cell_index: u32,
+) -> Option<Vec<(NetworkAnchor, Vec3)>> {
+    let vertex_dir = visual_grid
+        .vertices
+        .get(cell_index as usize)?
+        .normalize_or_zero();
+    let face_list = visual_grid.vertex_faces.get(cell_index as usize)?;
+    let mut tangent_x = Vec3::ZERO;
+    for &face_index in face_list {
+        let center = *visual_grid.face_centers.get(face_index as usize)?;
+        let candidate = center - vertex_dir * vertex_dir.dot(center);
+        if candidate.length() > 1e-6 {
+            tangent_x = candidate.normalize();
+            break;
+        }
+    }
+    let tangent_y = vertex_dir.cross(tangent_x).normalize_or_zero();
+    if tangent_x.length() < 1e-6 || tangent_y.length() < 1e-6 {
+        return None;
+    }
+    let mut corners = face_list
+        .iter()
+        .filter_map(|&face_index| {
+            let point = *visual_grid.face_centers.get(face_index as usize)?;
+            let local = vec2(point.dot(tangent_x), point.dot(tangent_y));
+            Some((local.y.atan2(local.x), face_index, point.normalize()))
+        })
+        .collect::<Vec<_>>();
+    if corners.len() != face_list.len() {
+        return None;
+    }
+    corners.sort_by(|left, right| left.0.total_cmp(&right.0));
+
+    let mut candidates = Vec::with_capacity(corners.len() * 2 + 1);
+    candidates.push((NetworkAnchor::CellCenter { cell_index }, vertex_dir));
+    candidates.extend(corners.iter().map(|(_, face_index, point)| {
+        (
+            NetworkAnchor::CellCorner {
+                face_index: *face_index,
+            },
+            *point,
+        )
+    }));
+    for index in 0..corners.len() {
+        let first = corners[index];
+        let second = corners[(index + 1) % corners.len()];
+        let midpoint = (first.2 + second.2).normalize_or_zero();
+        candidates.push((
+            NetworkAnchor::SideMidpoint {
+                first_face: first.1,
+                second_face: second.1,
+            }
+            .canonicalized(),
+            midpoint,
+        ));
+    }
+    Some(candidates)
+}
+
+fn snapped_network_anchor(
+    visual_grid: &HexGrid,
+    cell_index: u32,
+    hit_direction: Vec3,
+) -> Option<NetworkAnchor> {
+    let hit = hit_direction.normalize_or_zero();
+    network_anchor_candidates(visual_grid, cell_index)?
+        .into_iter()
+        .min_by(|left, right| (1.0 - hit.dot(left.1)).total_cmp(&(1.0 - hit.dot(right.1))))
+        .map(|(anchor, _)| anchor)
+}
+
+fn shared_side_vertices(grid: &HexGrid, first_cell: u32, second_cell: u32) -> Option<(Vec3, Vec3)> {
+    let first_faces = grid.vertex_faces.get(first_cell as usize)?;
+    let second_faces = grid.vertex_faces.get(second_cell as usize)?;
+    let mut shared = first_faces
+        .iter()
+        .filter(|face| second_faces.contains(face))
+        .filter_map(|&face| grid.face_centers.get(face as usize).copied());
+    Some((shared.next()?.normalize(), shared.next()?.normalize()))
+}
+
+fn network_segment_points(grid: &HexGrid, placement: NetworkPlacement) -> Option<(Vec3, Vec3)> {
+    match placement {
+        NetworkPlacement::SharedSide {
+            first_cell,
+            second_cell,
+        } => shared_side_vertices(grid, first_cell, second_cell),
+        NetworkPlacement::MidpointSegment {
+            cell_index,
+            first_neighbor,
+            second_neighbor,
+        } => {
+            let first = shared_side_vertices(grid, cell_index, first_neighbor)?;
+            let second = shared_side_vertices(grid, cell_index, second_neighbor)?;
+            Some((
+                (first.0 + first.1).normalize(),
+                (second.0 + second.1).normalize(),
+            ))
+        }
+        NetworkPlacement::RadialSpan {
+            cell_index,
+            neighbor_cell,
+            radius,
+        } => {
+            let center = *grid.vertices.get(cell_index as usize)?;
+            let side = shared_side_vertices(grid, cell_index, neighbor_cell)?;
+            let side_midpoint = (side.0 + side.1).normalize();
+            let fraction = match radius {
+                CellRadius::Short => 0.48,
+                CellRadius::Long => 0.9,
+            };
+            Some((
+                center.normalize(),
+                center.normalize().lerp(side_midpoint, fraction).normalize(),
+            ))
+        }
+        NetworkPlacement::AnchorSegment { start, end } => Some((
+            network_anchor_position(grid, start)?,
+            network_anchor_position(grid, end)?,
+        )),
+    }
+}
+
+fn network_anchor_position(grid: &HexGrid, anchor: NetworkAnchor) -> Option<Vec3> {
+    match anchor {
+        NetworkAnchor::CellCenter { cell_index } => grid
+            .vertices
+            .get(cell_index as usize)
+            .map(|point| point.normalize()),
+        NetworkAnchor::CellCorner { face_index } => grid
+            .face_centers
+            .get(face_index as usize)
+            .map(|point| point.normalize()),
+        NetworkAnchor::SideMidpoint {
+            first_face,
+            second_face,
+        } => {
+            let first = grid.face_centers.get(first_face as usize)?;
+            let second = grid.face_centers.get(second_face as usize)?;
+            Some((*first + *second).normalize())
+        }
+    }
+}
+
+fn advance_network_chain(
+    start: Option<NetworkAnchor>,
+    clicked: NetworkAnchor,
+) -> (Option<NetworkAnchor>, Option<NetworkPlacement>) {
+    match start {
+        None => (Some(clicked), None),
+        Some(start) if start != clicked => (
+            Some(clicked),
+            Some(NetworkPlacement::AnchorSegment {
+                start,
+                end: clicked,
+            }),
+        ),
+        Some(start) => (Some(start), None),
+    }
+}
+
+fn network_anchor_marker_radius(min_cell_edge: f32, planet_radius: f32) -> f32 {
+    (min_cell_edge * planet_radius * 0.2).clamp(0.0015, 0.004)
+}
+
+fn network_overlay_radius(planet_radius: f32) -> f32 {
+    planet_radius + PLANET_OVERLAY_OFFSET
+}
+
+fn draw_network_segments(
+    grid: &HexGrid,
+    segments: &[NetworkSegment],
+    radius: f32,
+    subdivisions: usize,
+    hovered_id: Option<u32>,
+    selected_id: Option<u32>,
+) {
+    for segment in segments {
+        let Some((start, end)) = network_segment_points(grid, segment.placement) else {
+            continue;
+        };
+        let color = if Some(segment.id) == selected_id {
+            Color::from_rgba(255, 255, 255, 255)
+        } else if Some(segment.id) == hovered_id {
+            Color::from_rgba(255, 170, 72, 255)
+        } else {
+            match segment.kind {
+                NetworkKind::Route => Color::from_rgba(236, 218, 112, 255),
+                NetworkKind::RailTrack => Color::from_rgba(188, 198, 208, 255),
+            }
+        };
+        let arc_subdivisions = network_arc_subdivisions(start, end, subdivisions);
+        draw_arc_on_sphere(
+            start,
+            end,
+            network_overlay_radius(radius),
+            arc_subdivisions,
+            color,
+        );
+    }
+}
+
+fn network_arc_subdivisions(start: Vec3, end: Vec3, max_subdivisions: usize) -> usize {
+    let max_subdivisions = max_subdivisions.max(1);
+    ((start.angle_between(end) * max_subdivisions as f32).ceil() as usize)
+        .clamp(1, max_subdivisions)
+}
+
+fn should_hit_test_network_segments(
+    selected_build_tool: Option<PlanetTool>,
+    right_click_pressed: bool,
+    delete_pressed: bool,
+    backspace_pressed: bool,
+) -> bool {
+    selected_build_tool.is_none()
+        || (selected_build_tool != Some(PlanetTool::RouteLine) && right_click_pressed)
+        || delete_pressed
+        || backspace_pressed
+}
+
+fn network_segment_hit_distance(
+    grid: &HexGrid,
+    segment: NetworkSegment,
+    camera: &Camera3D,
+    mouse: Vec2,
+    radius: f32,
+) -> Option<f32> {
+    let (start, end) = network_segment_points(grid, segment.placement)?;
+    let line_radius = network_overlay_radius(radius);
+    let mut previous: Option<Vec2> = None;
+    let mut closest = f32::INFINITY;
+    for step in 0..=16 {
+        let direction = great_circle_point(start, end, step as f32 / 16.0);
+        if camera.position.dot(direction) <= line_radius {
+            previous = None;
+            continue;
+        }
+        let current = project_to_screen(camera, direction * line_radius);
+        if let (Some(previous), Some(current)) = (previous, current) {
+            let line = current - previous;
+            let amount = if line.length_squared() <= f32::EPSILON {
+                0.0
+            } else {
+                ((mouse - previous).dot(line) / line.length_squared()).clamp(0.0, 1.0)
+            };
+            closest = closest.min(mouse.distance(previous + line * amount));
+        }
+        let Some(current) = current else {
+            previous = None;
+            continue;
+        };
+        previous = Some(current);
+    }
+    closest.is_finite().then_some(closest)
+}
+
+fn hovered_network_segment(
+    grid: &HexGrid,
+    segments: &[NetworkSegment],
+    camera: &Camera3D,
+    mouse: Vec2,
+    radius: f32,
+) -> Option<u32> {
+    segments
+        .iter()
+        .filter_map(|segment| {
+            let distance = network_segment_hit_distance(grid, *segment, camera, mouse, radius)?;
+            (distance <= 12.0).then_some((distance, segment.id))
+        })
+        .min_by(|left, right| left.0.total_cmp(&right.0))
+        .map(|(_, id)| id)
 }
 
 fn draw_sim_buildings(
     visual_grid: &HexGrid,
     _sim_world: Option<&PlanetSimWorld>,
     _config: &PlanetNoiseConfig,
-    buildings: &HashMap<u32, PlanetBuildingState>,
+    buildings: &HashMap<BuildingSlot, PlanetBuildingState>,
     radius: f32,
     assets: &ObjectCatalog,
 ) {
     // Keep buildings above surface but below overlay lines (PLANET_OVERLAY_OFFSET=0.01).
     let surface_lift = 0.0035;
-    for (cell_index, building) in buildings.iter() {
+    for (slot, building) in buildings.iter() {
+        let cell_index = slot.cell_index;
         let kind = building.kind;
-        let Some(vertex_dir) = visual_grid.vertices.get(*cell_index as usize) else {
+        if kind == PlanetBuildingKind::LegacyRoute {
+            continue;
+        }
+        let Some(sides) = visual_grid
+            .vertex_faces
+            .get(cell_index as usize)
+            .map(Vec::len)
+        else {
+            continue;
+        };
+        if !slot.is_valid(sides) {
+            continue;
+        }
+        let Some(vertex_dir) = visual_grid.vertices.get(cell_index as usize) else {
             continue;
         };
         let vertex_dir = vertex_dir.normalize();
-        let face_list = &visual_grid.vertex_faces[*cell_index as usize];
+        let face_list = &visual_grid.vertex_faces[cell_index as usize];
         let sides = face_list.len();
         if sides < 3 {
             continue;
@@ -4010,11 +4852,17 @@ fn draw_sim_buildings(
             .collect();
         ordered.sort_by(|a, b| a.0.total_cmp(&b.0));
         let cell_points: Vec<Vec2> = ordered.iter().map(|(_, point)| *point).collect();
-        let Some((target_apothem, outer_radius)) = cell_building_geometry(&cell_points) else {
+        let Some((_, outer_radius)) = cell_building_geometry(&cell_points) else {
             continue;
         };
         let start_angle = ordered[0].0;
         let angle_step = std::f32::consts::TAU / sides as f32;
+        let slot_angle = start_angle + (slot.triangle_index as f32 + 0.5) * angle_step;
+        let slot_radial = tangent_x * slot_angle.cos() + tangent_y * slot_angle.sin();
+        let slot_center_dir = (vertex_dir + slot_radial * outer_radius * 0.46).normalize();
+        let slot_tangent_x =
+            (tangent_x - slot_center_dir * tangent_x.dot(slot_center_dir)).normalize_or_zero();
+        let slot_tangent_y = slot_center_dir.cross(slot_tangent_x).normalize_or_zero();
         let mut outer_dirs: Vec<Vec3> = Vec::with_capacity(sides);
         for i in 0..sides {
             let a = start_angle + i as f32 * angle_step;
@@ -4022,14 +4870,20 @@ fn draw_sim_buildings(
             outer_dirs.push((vertex_dir + ring * outer_radius).normalize());
         }
 
-        let object_id = building_object_id(kind);
+        let Some(object_id) = building_object_id(kind) else {
+            continue;
+        };
+        let placement_profile = assets
+            .placement_profile(object_id)
+            .unwrap_or(PlacementProfile::TriangleSlots);
+        if placement_profile == PlacementProfile::NetworkSegments {
+            continue;
+        }
         let variant_mode = assets
             .variant_config(object_id)
             .map(|config| config.mode)
             .unwrap_or(VariantMode::None);
-        let route_state = if kind == PlanetBuildingKind::Route
-            || variant_mode == VariantMode::Custom
-        {
+        let custom_condition_key = if variant_mode == VariantMode::Custom {
             let mut seen_neighbors = HashSet::new();
             let mut neighbors = Vec::new();
             for &face_index in face_list {
@@ -4037,7 +4891,7 @@ fn draw_sim_buildings(
                     continue;
                 };
                 for &candidate in face {
-                    if candidate == *cell_index || !seen_neighbors.insert(candidate) {
+                    if candidate == cell_index || !seen_neighbors.insert(candidate) {
                         continue;
                     }
                     let Some(neighbor_dir) = visual_grid.vertices.get(candidate as usize) else {
@@ -4046,14 +4900,17 @@ fn draw_sim_buildings(
                     let p = vec2(neighbor_dir.dot(tangent_x), neighbor_dir.dot(tangent_y));
                     let state = radial_neighbor_state(
                         kind,
-                        buildings.get(&candidate).map(|neighbor| neighbor.kind),
+                        buildings
+                            .iter()
+                            .find(|(neighbor_slot, _)| neighbor_slot.cell_index == candidate)
+                            .map(|(_, neighbor)| neighbor.kind),
                     );
                     neighbors.push((p.y.atan2(p.x), state));
                 }
             }
             neighbors.sort_by(|left, right| left.0.total_cmp(&right.0));
             (neighbors.len() == sides).then(|| {
-                let key = format!(
+                format!(
                     "p{}-{}",
                     sides,
                     neighbors
@@ -4064,17 +4921,6 @@ fn draw_sim_buildings(
                             RadialNeighborState::Route => '2',
                         })
                         .collect::<String>()
-                );
-                (
-                    key,
-                    neighbors
-                        .first()
-                        .map(|(angle, _)| radial_sector_start_angle(*angle, sides))
-                        .unwrap_or(0.0),
-                    neighbors
-                        .into_iter()
-                        .map(|(_, state)| state)
-                        .collect::<Vec<_>>(),
                 )
             })
         } else {
@@ -4090,233 +4936,35 @@ fn draw_sim_buildings(
             PlanetBuildingKind::Warehouse => Color::from_rgba(116, 176, 224, 255),
             PlanetBuildingKind::Refuel => Color::from_rgba(120, 230, 160, 255),
             PlanetBuildingKind::Logistics => Color::from_rgba(255, 128, 128, 255),
-            PlanetBuildingKind::Route => Color::from_rgba(220, 220, 120, 255),
+            PlanetBuildingKind::LegacyRoute => Color::from_rgba(220, 220, 120, 255),
         };
         let base_radius = radius + surface_lift;
-        let is_route = kind == PlanetBuildingKind::Route;
-        let radial_group_program = assets
-            .metadata(object_id, None)
-            .is_some_and(|metadata| metadata.radial_main_group_id().is_some());
-        let source_mesh = if is_route && radial_group_program {
-            route_state
-                .as_ref()
-                .and_then(|(_, _, neighbors)| {
-                    let metadata = assets.metadata(object_id, None)?;
-                    let base_mesh = assets.get(object_id)?;
-                    let pivot = metadata
-                        .radial_pivot
-                        .map(|[x, y, z]| vec3(x, y, z))
-                        .unwrap_or(Vec3::ZERO);
-                    let mut composite = EditableMesh {
-                        vertices: Vec::new(),
-                        indices: Vec::new(),
-                    };
-                    for (sector_index, condition) in neighbors.iter().copied().enumerate() {
-                        let sector_mesh = match metadata.radial_sector_mesh(base_mesh, condition) {
-                            Ok(Some(sector_mesh)) => sector_mesh,
-                            Ok(None) => return None,
-                            Err(error) => {
-                                eprintln!("GridGame could not build route sector: {error}");
-                                return None;
-                            }
-                        };
-                        let sector_mesh =
-                            rotate_radial_sector(&sector_mesh, sector_index, sides, pivot);
-                        if let Err(error) = composite.append(&sector_mesh) {
-                            eprintln!("GridGame could not compose route sector: {error}");
-                            return None;
-                        }
-                    }
-                    Some(composite)
-                })
-                .or_else(|| assets.get(object_id).cloned())
-        } else if is_route && variant_mode == VariantMode::Radial {
-            route_state
-                .as_ref()
-                .and_then(|(_, _, neighbors)| {
-                    let mut composite = EditableMesh {
-                        vertices: Vec::new(),
-                        indices: Vec::new(),
-                    };
-                    for (sector, condition) in neighbors.iter().copied().enumerate() {
-                        let key = radial_sector_state_key(sides, sector, condition);
-                        let state_mesh = assets.get_state(ObjectId::PlanetRoute, &key)?;
-                        if let Err(error) = composite.append(state_mesh) {
-                            eprintln!("GridGame could not compose route state {key}: {error}");
-                            return None;
-                        }
-                    }
-                    Some(composite)
-                })
-                .or_else(|| assets.get(object_id).cloned())
-        } else if variant_mode == VariantMode::Custom {
-            route_state
-                .as_ref()
-                .and_then(|(key, _, _)| assets.custom_state_key(object_id, key))
+        let source_mesh = if variant_mode == VariantMode::Custom {
+            custom_condition_key
+                .as_deref()
+                .and_then(|key| assets.custom_state_key(object_id, key))
                 .and_then(|key| assets.get_state(object_id, key))
                 .cloned()
                 .or_else(|| assets.get(object_id).cloned())
-        } else if is_route {
-            route_state
-                .as_ref()
-                .and_then(|(key, _, _)| assets.get_state(ObjectId::PlanetRoute, key))
-                .cloned()
         } else {
             assets.get(object_id).cloned()
         };
         if let Some(source_mesh) = source_mesh.as_ref() {
             let reference_mesh = assets.get(object_id).unwrap_or(source_mesh);
-            let model_radius = if is_route {
-                radius + surface_lift + 0.0005
-            } else {
-                base_radius
-            };
-            let mesh = if is_route {
-                let angle = route_state
-                    .as_ref()
-                    .map(|(_, angle, _)| *angle)
-                    .unwrap_or(0.0);
-                let (sin, cos) = angle.sin_cos();
-                let route_pivot = if radial_group_program {
-                    assets
-                        .metadata(object_id, None)
-                        .and_then(|metadata| metadata.radial_pivot)
-                        .map(|[x, y, z]| vec3(x, y, z))
-                        .unwrap_or(Vec3::ZERO)
-                } else {
-                    mesh_center_and_scale(reference_mesh).0
-                };
-                let normalized = normalize_radial_mesh(source_mesh, route_pivot, reference_mesh);
-                let route_scale = building_model_scale_for_cell(outer_radius * model_radius);
-                normalized.transformed(|point| {
-                    let local_x = point.x * cos - point.z * sin;
-                    let local_z = point.x * sin + point.z * cos;
-                    vertex_dir * (model_radius + point.y * route_scale)
-                        + tangent_x * (local_x * route_scale)
-                        + tangent_y * (local_z * route_scale)
-                })
-            } else {
-                let normalized = normalize_building_mesh(source_mesh, reference_mesh);
-                let model_scale = building_model_scale_for_cell(outer_radius * model_radius);
-                normalized.transformed(|point| {
-                    vertex_dir * (model_radius + point.y * model_scale)
-                        + tangent_x * (point.x * model_scale)
-                        + tangent_y * (point.z * model_scale)
-                })
-            };
+            let normalized = normalize_building_mesh(source_mesh, reference_mesh);
+            let model_scale = building_model_scale_for_cell(outer_radius * 0.36 * base_radius);
+            let mesh = normalized.transformed(|point| {
+                slot_center_dir * (base_radius + point.y * model_scale)
+                    + slot_tangent_x * (point.x * model_scale)
+                    + slot_tangent_y * (point.z * model_scale)
+            });
             match mesh.render() {
                 Ok(()) => continue,
                 Err(error) => {
                     eprintln!("GridGame could not render {} model: {error}", kind.label())
                 }
             }
-            if !is_route {
-                continue;
-            }
         }
-        if kind == PlanetBuildingKind::Route {
-            let route_lift = surface_lift + 0.0005;
-            let route_radius = radius + route_lift;
-            let route_base_color = color;
-
-            let mut vertices: Vec<Vertex> = Vec::with_capacity(sides * 3 + 72);
-            let mut indices: Vec<u16> = Vec::with_capacity(sides * 3 + 144);
-
-            // Flat route plate on top of the cell (replaces old pyramid shape).
-            let plate_center = vertex_dir * route_radius + 0.0001;
-            let plate_center_ix = vertices.len() as u16;
-            vertices.push(Vertex::new2(plate_center, vec2(0.0, 0.0), route_base_color));
-            for dir in outer_dirs.iter() {
-                vertices.push(Vertex::new2(
-                    *dir * route_radius,
-                    vec2(0.0, 0.0),
-                    route_base_color,
-                ));
-            }
-            for i in 0..sides {
-                let a = plate_center_ix + 1 + i as u16;
-                let b = plate_center_ix + 1 + ((i + 1) % sides) as u16;
-                indices.extend_from_slice(&[plate_center_ix, a, b]);
-            }
-
-            // Build flat rectangular strips toward neighboring occupied cells.
-            let mut neighbors: Vec<u32> = Vec::new();
-            let mut seen_neighbors: std::collections::HashSet<u32> =
-                std::collections::HashSet::new();
-            for &face_index in face_list.iter() {
-                let Some(face) = visual_grid.faces.get(face_index as usize) else {
-                    continue;
-                };
-                for &candidate in face.iter() {
-                    if candidate == *cell_index {
-                        continue;
-                    }
-                    if !seen_neighbors.insert(candidate) {
-                        continue;
-                    }
-                    if let Some(neighbor_building) = buildings.get(&candidate) {
-                        // Avoid duplicate strip for route-route pairs.
-                        if neighbor_building.kind == PlanetBuildingKind::Route
-                            && candidate < *cell_index
-                        {
-                            continue;
-                        }
-                        neighbors.push(candidate);
-                    }
-                }
-            }
-
-            let strip_half_width = (target_apothem * radius * 0.05).max(0.001125);
-            let strip_color = Color::new(color.r * 0.96, color.g * 0.96, color.b * 0.96, 1.0);
-            for neighbor in neighbors.into_iter() {
-                let Some(neighbor_dir) = visual_grid.vertices.get(neighbor as usize) else {
-                    continue;
-                };
-                let neighbor_dir = neighbor_dir.normalize();
-                let start = vertex_dir * route_radius;
-                let end = neighbor_dir * route_radius;
-                let strip_mid_dir = (vertex_dir + neighbor_dir).normalize();
-                let strip_forward = (end - start).normalize();
-                let strip_forward =
-                    (strip_forward - strip_mid_dir * strip_forward.dot(strip_mid_dir)).normalize();
-                if strip_forward.length() < 1e-6 {
-                    continue;
-                }
-                let strip_side = strip_mid_dir.cross(strip_forward).normalize();
-                if strip_side.length() < 1e-6 {
-                    continue;
-                }
-
-                let p0 = start + strip_side * strip_half_width;
-                let p1 = start - strip_side * strip_half_width;
-                let p2 = end - strip_side * strip_half_width;
-                let p3 = end + strip_side * strip_half_width;
-                let start_ix = vertices.len() as u16;
-                vertices.push(Vertex::new2(p0, vec2(0.0, 0.0), strip_color));
-                vertices.push(Vertex::new2(p1, vec2(0.0, 0.0), strip_color));
-                vertices.push(Vertex::new2(p2, vec2(0.0, 0.0), strip_color));
-                vertices.push(Vertex::new2(p3, vec2(0.0, 0.0), strip_color));
-                indices.extend_from_slice(&[
-                    start_ix,
-                    start_ix + 1,
-                    start_ix + 2,
-                    start_ix,
-                    start_ix + 2,
-                    start_ix + 3,
-                ]);
-            }
-
-            if !indices.is_empty() {
-                let mesh = Mesh {
-                    vertices,
-                    indices,
-                    texture: None,
-                };
-                draw_mesh(&mesh);
-            }
-            continue;
-        }
-
         let building_cell_radius = outer_radius * base_radius;
         let apex_height = (building_model_scale_for_cell(building_cell_radius)
             * NORMALIZED_MODEL_EXTENT)
@@ -5162,6 +5810,7 @@ pub fn run(
     }
     if now - state.last_buildings_save_at > 5.0 {
         state.save_buildings_if_dirty(PLANET_BUILDINGS_PATH);
+        state.save_networks_if_dirty(PLANET_NETWORKS_PATH);
         state.last_buildings_save_at = now;
     }
     if now - state.last_units_save_at > 5.0 {
@@ -5210,31 +5859,44 @@ pub fn run(
         state.selected_build_tool = None;
     }
     if is_key_pressed(KeyCode::Key2) {
-        state.selected_build_tool = Some(PlanetBuildingKind::Base);
+        state.selected_build_tool = Some(PlanetTool::Building(PlanetBuildingKind::Base));
     }
     if is_key_pressed(KeyCode::Key3) {
-        state.selected_build_tool = Some(PlanetBuildingKind::Builder);
+        state.selected_build_tool = Some(PlanetTool::Building(PlanetBuildingKind::Builder));
     }
     if is_key_pressed(KeyCode::Key4) {
-        state.selected_build_tool = Some(PlanetBuildingKind::Housing);
+        state.selected_build_tool = Some(PlanetTool::Building(PlanetBuildingKind::Housing));
     }
     if is_key_pressed(KeyCode::Key5) {
-        state.selected_build_tool = Some(PlanetBuildingKind::Factory);
+        state.selected_build_tool = Some(PlanetTool::Building(PlanetBuildingKind::Factory));
     }
     if is_key_pressed(KeyCode::Key6) {
-        state.selected_build_tool = Some(PlanetBuildingKind::Mine);
+        state.selected_build_tool = Some(PlanetTool::Building(PlanetBuildingKind::Mine));
     }
     if is_key_pressed(KeyCode::Key7) {
-        state.selected_build_tool = Some(PlanetBuildingKind::Warehouse);
+        state.selected_build_tool = Some(PlanetTool::Building(PlanetBuildingKind::Warehouse));
     }
     if is_key_pressed(KeyCode::Key8) {
-        state.selected_build_tool = Some(PlanetBuildingKind::Refuel);
+        state.selected_build_tool = Some(PlanetTool::Building(PlanetBuildingKind::Refuel));
     }
     if is_key_pressed(KeyCode::Key9) {
-        state.selected_build_tool = Some(PlanetBuildingKind::Logistics);
+        state.selected_build_tool = Some(PlanetTool::Building(PlanetBuildingKind::Logistics));
     }
     if is_key_pressed(KeyCode::Key0) {
-        state.selected_build_tool = Some(PlanetBuildingKind::Route);
+        state.selected_build_tool = Some(PlanetTool::RouteLine);
+    }
+    if is_key_pressed(KeyCode::T) && state.selected_build_tool == Some(PlanetTool::RouteLine) {
+        state.selected_network_kind = match state.selected_network_kind {
+            NetworkKind::Route => NetworkKind::RailTrack,
+            NetworkKind::RailTrack => NetworkKind::Route,
+        };
+        state.network_chain_start = None;
+    }
+    if is_key_pressed(KeyCode::Enter) && state.selected_build_tool == Some(PlanetTool::RouteLine) {
+        state.network_chain_start = None;
+    }
+    if state.selected_build_tool != Some(PlanetTool::RouteLine) {
+        state.network_chain_start = None;
     }
     state.update_units_and_construction(frame_time);
     state.tick_mining(frame_time);
@@ -5427,6 +6089,17 @@ pub fn run(
             }
         }
     }
+    let hovered_triangle_index = state
+        .sim_grid
+        .as_ref()
+        .and_then(|grid| {
+            Some(triangle_slot_for_direction(
+                grid,
+                hovered_cell?,
+                hover_hit?.normalize(),
+            )?)
+        })
+        .unwrap_or(0);
     if let Some(face_index) = hovered_base_face {
         let face = base_faces[face_index];
         let a = projected_base[face[0]];
@@ -5445,17 +6118,35 @@ pub fn run(
         draw_arc_on_sphere(b, c, line_radius, segments, hover_color);
         draw_arc_on_sphere(c, a, line_radius, segments, hover_color);
     }
-    let panel_buttons: [(Option<PlanetBuildingKind>, &'static str); 10] = [
+    let panel_buttons: [(Option<PlanetTool>, &'static str); 10] = [
         (None, "Demolish"),
-        (Some(PlanetBuildingKind::Base), "Base"),
-        (Some(PlanetBuildingKind::Builder), "Builder"),
-        (Some(PlanetBuildingKind::Housing), "Housing"),
-        (Some(PlanetBuildingKind::Factory), "Factory"),
-        (Some(PlanetBuildingKind::Mine), "Mine"),
-        (Some(PlanetBuildingKind::Warehouse), "Warehouse"),
-        (Some(PlanetBuildingKind::Refuel), "Refuel"),
-        (Some(PlanetBuildingKind::Logistics), "Logistics"),
-        (Some(PlanetBuildingKind::Route), "Route"),
+        (Some(PlanetTool::Building(PlanetBuildingKind::Base)), "Base"),
+        (
+            Some(PlanetTool::Building(PlanetBuildingKind::Builder)),
+            "Builder",
+        ),
+        (
+            Some(PlanetTool::Building(PlanetBuildingKind::Housing)),
+            "Housing",
+        ),
+        (
+            Some(PlanetTool::Building(PlanetBuildingKind::Factory)),
+            "Factory",
+        ),
+        (Some(PlanetTool::Building(PlanetBuildingKind::Mine)), "Mine"),
+        (
+            Some(PlanetTool::Building(PlanetBuildingKind::Warehouse)),
+            "Warehouse",
+        ),
+        (
+            Some(PlanetTool::Building(PlanetBuildingKind::Refuel)),
+            "Refuel",
+        ),
+        (
+            Some(PlanetTool::Building(PlanetBuildingKind::Logistics)),
+            "Logistics",
+        ),
+        (Some(PlanetTool::RouteLine), "Route Line"),
     ];
     let panel_layout = build_panel_layout(panel_buttons.len(), state.panel_collapsed);
     sync_info_window_layout(state);
@@ -5465,20 +6156,55 @@ pub fn run(
         &state.confirm_window,
         mouse,
     );
+    let hovered_network_id = if should_hit_test_network_segments(
+        state.selected_build_tool,
+        is_mouse_button_pressed(MouseButton::Right),
+        is_key_pressed(KeyCode::Delete),
+        is_key_pressed(KeyCode::Backspace),
+    ) {
+        state.sim_grid.as_ref().and_then(|grid| {
+            hovered_network_segment(grid, &state.network_segments, &active_camera, mouse, radius)
+        })
+    } else {
+        None
+    };
+    let hovered_network_anchor =
+        if !ui_capturing && state.selected_build_tool == Some(PlanetTool::RouteLine) {
+            state
+                .sim_grid
+                .as_ref()
+                .zip(hovered_cell)
+                .zip(hover_hit)
+                .and_then(|((grid, cell_index), hit)| {
+                    snapped_network_anchor(grid, cell_index, hit.normalize())
+                })
+        } else {
+            None
+        };
     let show_hover_grid = hovered_cell.is_some();
-    if !state.debug_camera.enabled && is_mouse_button_pressed(MouseButton::Left) && !ui_capturing {
-        if let Some(cell_index) = hovered_cell {
+    if !state.debug_camera.enabled
+        && is_mouse_button_pressed(MouseButton::Left)
+        && !ui_capturing
+        && state.selected_build_tool != Some(PlanetTool::RouteLine)
+    {
+        if state.selected_build_tool.is_none()
+            && let Some(network_id) = hovered_network_id
+        {
+            state.selected_network_id = Some(network_id);
+            state.info_window.open = false;
+            state.info_target_cell = None;
+        } else if let Some(cell_index) = hovered_cell {
+            state.selected_network_id = None;
             if let Some(pick) = state.node_pick {
-                if let Some(building) = state.buildings.get(&cell_index) {
+                if let Some(building) = state.building_for_cell(cell_index) {
                     let can_pick = match pick {
                         UnitNodePick::Construction => true,
                         UnitNodePick::Pickup | UnitNodePick::Dropoff => {
                             !planet_is_under_construction(building)
                         }
-                        UnitNodePick::Refuel => {
-                            !planet_is_under_construction(building)
-                                && building.kind == PlanetBuildingKind::Refuel
-                        }
+                        UnitNodePick::Refuel => state
+                            .building_of_kind(cell_index, PlanetBuildingKind::Refuel)
+                            .is_some_and(|building| !planet_is_under_construction(building)),
                     };
                     if can_pick {
                         match pick {
@@ -5492,11 +6218,15 @@ pub fn run(
                         state.node_pick = None;
                     }
                 }
-            } else if let Some(building) = state.buildings.get(&cell_index) {
+            } else if let Some(building) = state.buildings.get(&BuildingSlot {
+                cell_index,
+                triangle_index: hovered_triangle_index,
+            }) {
                 state.info_window.title = building.kind.label().to_string();
                 state.info_window.rect = Rect::new(mouse.x + 12.0, mouse.y + 12.0, 280.0, 190.0);
                 state.info_window.open = true;
                 state.info_target_cell = Some(cell_index);
+                state.info_target_triangle = hovered_triangle_index;
                 state.info_window.show_units = false;
             } else if let Some(face_index) = hovered_subface {
                 let face = faces[face_index];
@@ -5518,6 +6248,46 @@ pub fn run(
         }
     }
     if let Some(sim_grid) = state.sim_grid.as_ref() {
+        draw_network_segments(
+            sim_grid,
+            &state.network_segments,
+            radius,
+            segments,
+            hovered_network_id,
+            state.selected_network_id,
+        );
+        if state.selected_build_tool == Some(PlanetTool::RouteLine) {
+            if let Some(anchor) = hovered_network_anchor
+                && let Some(point) = network_anchor_position(sim_grid, anchor)
+            {
+                draw_sphere(
+                    point * (radius + 0.007),
+                    network_anchor_marker_radius(state.min_cell_edge_dist_unit, radius),
+                    None,
+                    Color::from_rgba(255, 188, 80, 255),
+                );
+            }
+            if let (Some(start), Some(end)) = (state.network_chain_start, hovered_network_anchor)
+                && start != end
+            {
+                let placement = NetworkPlacement::AnchorSegment { start, end };
+                if let Some((start, end)) = network_segment_points(sim_grid, placement) {
+                    let preview_color =
+                        if state.can_place_network(state.selected_network_kind, placement) {
+                            Color::from_rgba(255, 235, 138, 220)
+                        } else {
+                            Color::from_rgba(255, 92, 82, 220)
+                        };
+                    draw_arc_on_sphere(
+                        start,
+                        end,
+                        network_overlay_radius(radius),
+                        segments,
+                        preview_color,
+                    );
+                }
+            }
+        }
         draw_sim_buildings(
             sim_grid,
             state.sim_world.as_ref(),
@@ -5526,6 +6296,23 @@ pub fn run(
             radius,
             assets,
         );
+        if let Some(PlanetTool::Building(kind)) =
+            state.selected_build_tool.filter(|_| !ui_capturing)
+            && let Some(cell_index) = hovered_cell
+        {
+            let slot = BuildingSlot {
+                cell_index,
+                triangle_index: hovered_triangle_index,
+            };
+            draw_building_ghost(
+                sim_grid,
+                slot,
+                kind,
+                radius,
+                assets,
+                state.can_place_building(cell_index, hovered_triangle_index, kind),
+            );
+        }
         let unit_color = ctx.colors_rt.port_out;
         let unit_outline = ctx.colors_rt.text_primary;
         let target_apothem = (state.min_cell_edge_dist_unit * 0.9 * 0.62).max(0.0005);
@@ -5594,21 +6381,59 @@ pub fn run(
         }
     }
     if !state.debug_camera.enabled && is_mouse_button_pressed(MouseButton::Right) && !ui_capturing {
-        if let Some(cell_index) = hovered_cell {
-            if let Some(kind) = state.selected_build_tool {
-                let _ = state.place_building(cell_index, kind);
-            } else if state.buildings.contains_key(&cell_index) {
+        if state.selected_build_tool == Some(PlanetTool::RouteLine) {
+            if let Some(anchor) = hovered_network_anchor {
+                let (next_start, segment) =
+                    advance_network_chain(state.network_chain_start, anchor);
+                if let Some(segment) = segment {
+                    if let Some(id) = state.place_network(state.selected_network_kind, segment) {
+                        state.network_chain_start = next_start;
+                        state.selected_network_id = Some(id);
+                    }
+                } else {
+                    state.network_chain_start = next_start;
+                }
+            }
+        } else if let Some(network_id) = hovered_network_id {
+            state.confirm_window.open = true;
+            state.confirm_window.title = "Confirm".to_string();
+            state.confirm_window.rect = Rect::new(mouse.x + 12.0, mouse.y + 12.0, 250.0, 120.0);
+            state.confirm_target_cell = None;
+            state.confirm_target_network = Some(network_id);
+        } else if let Some(cell_index) = hovered_cell {
+            if let Some(PlanetTool::Building(kind)) = state.selected_build_tool {
+                let _ = state.place_building(cell_index, hovered_triangle_index, kind);
+            } else if state.building_slot_exists(BuildingSlot {
+                cell_index,
+                triangle_index: hovered_triangle_index,
+            }) {
                 state.confirm_window.open = true;
                 state.confirm_window.title = "Confirm".to_string();
                 state.confirm_window.rect = Rect::new(mouse.x + 12.0, mouse.y + 12.0, 250.0, 120.0);
                 state.confirm_target_cell = Some(cell_index);
+                state.confirm_target_triangle = hovered_triangle_index;
+                state.confirm_target_network = None;
             }
         }
     }
     if !state.debug_camera.enabled && is_key_pressed(KeyCode::Delete) {
-        if let Some(cell_index) = hovered_cell {
-            let _ = state.remove_building(cell_index);
+        if let Some(network_id) = state.selected_network_id.or(hovered_network_id) {
+            if state.remove_network(network_id) {
+                state.selected_network_id = None;
+            }
+        } else if let Some(cell_index) = hovered_cell {
+            let _ = state.remove_building(cell_index, hovered_triangle_index);
         }
+    }
+    if !state.debug_camera.enabled
+        && is_key_pressed(KeyCode::Backspace)
+        && let Some(network_id) = state.selected_network_id.or(hovered_network_id)
+    {
+        state.confirm_window.open = true;
+        state.confirm_window.title = "Confirm".to_string();
+        state.confirm_window.rect = Rect::new(mouse.x + 12.0, mouse.y + 12.0, 250.0, 120.0);
+        state.confirm_target_cell = None;
+        state.confirm_target_network = Some(network_id);
     }
     if is_key_pressed(KeyCode::P) {
         save_test_triangle_hex_grid_png(
@@ -5619,6 +6444,32 @@ pub fn run(
         planet_perf_log("saved test triangle hex png 160");
     }
     set_default_camera();
+    if state.selected_build_tool == Some(PlanetTool::RouteLine) {
+        draw_text(
+            &format!(
+                "{} line (T: type; right-click snapped anchors; Enter: finish; select another tool to finish)",
+                match state.selected_network_kind {
+                    NetworkKind::Route => "Route",
+                    NetworkKind::RailTrack => "RailTrack",
+                },
+            ),
+            20.0,
+            66.0,
+            18.0,
+            ctx.colors_rt.text_secondary,
+        );
+    } else if let Some(network_id) = state.selected_network_id {
+        draw_text(
+            &format!(
+                "Network {} selected (Delete or Backspace to remove)",
+                network_id
+            ),
+            20.0,
+            66.0,
+            18.0,
+            ctx.colors_rt.text_secondary,
+        );
+    }
     if show_hover_grid {
         if let Some(sim_grid) = state.sim_grid.as_ref() {
             let _ = draw_global_hex_cell(
@@ -5638,14 +6489,17 @@ pub fn run(
         draw_selected_unit_overlay(
             &active_camera,
             sim_grid,
-            &state.buildings,
+            &state.unit_buildings_by_cell(),
             &state.units,
             state.info_target_cell,
             radius,
             state.min_cell_edge_dist_unit,
         );
         if let Some(selected_cell) = state.info_target_cell {
-            if let Some(building) = state.buildings.get(&selected_cell) {
+            if let Some(building) = state.buildings.get(&BuildingSlot {
+                cell_index: selected_cell,
+                triangle_index: state.info_target_triangle,
+            }) {
                 if building.kind == PlanetBuildingKind::Mine {
                     for target in mine_target_cells(selected_cell, building).into_iter() {
                         let _ = draw_global_hex_cell(
@@ -5673,16 +6527,19 @@ pub fn run(
         &ctx.colors_rt,
         &panel_buttons,
         state.selected_build_tool,
-        |kind| match kind {
-            PlanetBuildingKind::Base => Color::from_rgba(80, 220, 220, 255),
-            PlanetBuildingKind::Builder => Color::from_rgba(255, 214, 102, 255),
-            PlanetBuildingKind::Housing => Color::from_rgba(118, 203, 152, 255),
-            PlanetBuildingKind::Factory => Color::from_rgba(170, 170, 196, 255),
-            PlanetBuildingKind::Mine => Color::from_rgba(240, 170, 90, 255),
-            PlanetBuildingKind::Warehouse => Color::from_rgba(116, 176, 224, 255),
-            PlanetBuildingKind::Refuel => Color::from_rgba(120, 230, 160, 255),
-            PlanetBuildingKind::Logistics => Color::from_rgba(255, 128, 128, 255),
-            PlanetBuildingKind::Route => Color::from_rgba(220, 220, 120, 255),
+        |tool| match tool {
+            PlanetTool::RouteLine => Color::from_rgba(220, 220, 120, 255),
+            PlanetTool::Building(kind) => match kind {
+                PlanetBuildingKind::Base => Color::from_rgba(80, 220, 220, 255),
+                PlanetBuildingKind::Builder => Color::from_rgba(255, 214, 102, 255),
+                PlanetBuildingKind::Housing => Color::from_rgba(118, 203, 152, 255),
+                PlanetBuildingKind::Factory => Color::from_rgba(170, 170, 196, 255),
+                PlanetBuildingKind::Mine => Color::from_rgba(240, 170, 90, 255),
+                PlanetBuildingKind::Warehouse => Color::from_rgba(116, 176, 224, 255),
+                PlanetBuildingKind::Refuel => Color::from_rgba(120, 230, 160, 255),
+                PlanetBuildingKind::Logistics => Color::from_rgba(255, 128, 128, 255),
+                PlanetBuildingKind::LegacyRoute => Color::from_rgba(220, 220, 120, 255),
+            },
         },
     );
     if panel_result.toggled {
@@ -5690,6 +6547,9 @@ pub fn run(
     }
     if let Some(option) = panel_result.clicked_option {
         state.selected_build_tool = option;
+        if option != Some(PlanetTool::RouteLine) {
+            state.network_chain_start = None;
+        }
     }
     if let Some(tip) = panel_result.hovered_tip {
         draw_tooltip(tip, mouse, ctx.font_sm, 8.0, &ctx.colors_rt);
@@ -5718,7 +6578,10 @@ pub fn run(
             let tx = state.info_window.rect.x + 10.0;
             let mut ty = state.info_window.rect.y + WINDOW_TITLE_HEIGHT + 18.0;
             if let Some(cell_index) = state.info_target_cell {
-                if let Some(building) = state.buildings.get_mut(&cell_index) {
+                if let Some(building) = state.buildings.get_mut(&BuildingSlot {
+                    cell_index,
+                    triangle_index: state.info_target_triangle,
+                }) {
                     let under_construction = planet_is_under_construction(building);
                     draw_text(
                         &format!("Cell: {}", cell_index),
@@ -6500,6 +7363,8 @@ pub fn run(
                     if clicked {
                         state.confirm_window.open = true;
                         state.confirm_target_cell = Some(cell_index);
+                        state.confirm_target_triangle = state.info_target_triangle;
+                        state.confirm_target_network = None;
                     }
                 }
             }
@@ -6514,13 +7379,17 @@ pub fn run(
         }
     }
     if let Some((depot, definition_id, nodes)) = spawn_request {
+        let mut unit_buildings = state.unit_buildings_by_cell();
         if let Ok((_, kit_consumed)) = create_planet_unit(
-            &mut state.buildings,
+            &mut unit_buildings,
             &mut state.units,
             definition_id,
             depot,
             nodes,
         ) {
+            if kit_consumed {
+                state.sync_unit_buildings(unit_buildings);
+            }
             state.units_dirty = true;
             if kit_consumed {
                 state.buildings_dirty = true;
@@ -6544,11 +7413,17 @@ pub fn run(
         if close {
             state.confirm_window.open = false;
             state.confirm_target_cell = None;
+            state.confirm_target_network = None;
         } else {
             let tx = state.confirm_window.rect.x + 10.0;
             let ty = state.confirm_window.rect.y + WINDOW_TITLE_HEIGHT + 22.0;
-            let label = if let Some(cell) = state.confirm_target_cell {
-                format!("Demolish building in cell {}?", cell)
+            let label = if let Some(id) = state.confirm_target_network {
+                format!("Remove network segment {}?", id)
+            } else if let Some(cell) = state.confirm_target_cell {
+                format!(
+                    "Demolish building in cell {}, slot {}?",
+                    cell, state.confirm_target_triangle
+                )
             } else {
                 "Demolish building?".to_string()
             };
@@ -6562,13 +7437,19 @@ pub fn run(
             if clicked_cancel {
                 state.confirm_window.open = false;
                 state.confirm_target_cell = None;
+                state.confirm_target_network = None;
             }
             if clicked_ok {
-                if let Some(cell) = state.confirm_target_cell {
-                    let _ = state.remove_building(cell);
+                if let Some(id) = state.confirm_target_network {
+                    if state.remove_network(id) {
+                        state.selected_network_id = None;
+                    }
+                } else if let Some(cell) = state.confirm_target_cell {
+                    let _ = state.remove_building(cell, state.confirm_target_triangle);
                 }
                 state.confirm_window.open = false;
                 state.confirm_target_cell = None;
+                state.confirm_target_network = None;
             }
         }
     }
@@ -6674,24 +7555,132 @@ mod tests {
     };
 
     #[test]
-    fn radial_sector_rotation_positions_geometry_in_five_and_six_slots() {
-        let mesh = EditableMesh {
-            vertices: vec![Vertex::new2(Vec3::X, Vec2::ZERO, WHITE)],
-            indices: Vec::new(),
+    fn network_cursor_snaps_to_center_corner_and_side_midpoint() {
+        let face_centers = (0..6)
+            .map(|index| {
+                let angle = std::f32::consts::TAU * index as f32 / 6.0;
+                vec3(angle.cos() * 0.3, angle.sin() * 0.3, 0.95).normalize()
+            })
+            .collect::<Vec<_>>();
+        let grid = HexGrid {
+            freq: 0,
+            vertices: vec![Vec3::Z],
+            faces: Vec::new(),
+            face_centers: face_centers.clone(),
+            vertex_faces: vec![(0..6).collect()],
+            base_face_buckets: Vec::new(),
+            base_face_neighbors: Vec::new(),
         };
-        let pentagon_sector = rotate_radial_sector(&mesh, 1, 5, Vec3::ZERO);
-        let hexagon_sector = rotate_radial_sector(&mesh, 3, 6, Vec3::ZERO);
+        assert_eq!(
+            snapped_network_anchor(&grid, 0, Vec3::Z),
+            Some(NetworkAnchor::CellCenter { cell_index: 0 })
+        );
+        assert_eq!(
+            snapped_network_anchor(&grid, 0, face_centers[2]),
+            Some(NetworkAnchor::CellCorner { face_index: 2 })
+        );
+        let midpoint = (face_centers[0] + face_centers[1]).normalize();
+        assert_eq!(
+            snapped_network_anchor(&grid, 0, midpoint),
+            Some(NetworkAnchor::SideMidpoint {
+                first_face: 0,
+                second_face: 1
+            })
+        );
+    }
 
-        assert!(
-            (pentagon_sector.vertices[0].position.x - (std::f32::consts::TAU / 5.0).cos()).abs()
-                < 1e-6
+    #[test]
+    fn network_arc_detail_scales_with_angular_length() {
+        let short_end = vec3(0.99995, 0.0, 0.01).normalize();
+        let medium_end = vec3(0.98, 0.0, 0.2).normalize();
+
+        assert_eq!(network_arc_subdivisions(Vec3::X, short_end, 32), 1);
+        assert!(network_arc_subdivisions(Vec3::X, medium_end, 32) < 32);
+        assert_eq!(network_arc_subdivisions(Vec3::X, Vec3::NEG_X, 32), 32);
+        assert_eq!(network_arc_subdivisions(Vec3::X, short_end, 0), 1);
+    }
+
+    #[test]
+    fn network_lines_render_above_the_planet_surface() {
+        let radius = 1.6;
+
+        assert!(network_overlay_radius(radius) > radius + TEXTURE_LAYER_OFFSET);
+    }
+
+    #[test]
+    fn network_hit_testing_runs_only_for_selection_or_network_actions() {
+        assert!(!should_hit_test_network_segments(
+            Some(PlanetTool::RouteLine),
+            false,
+            false,
+            false
+        ));
+        assert!(!should_hit_test_network_segments(
+            Some(PlanetTool::RouteLine),
+            true,
+            false,
+            false
+        ));
+        assert!(should_hit_test_network_segments(
+            Some(PlanetTool::RouteLine),
+            false,
+            true,
+            false
+        ));
+        assert!(should_hit_test_network_segments(
+            Some(PlanetTool::RouteLine),
+            false,
+            false,
+            true
+        ));
+        assert!(!should_hit_test_network_segments(
+            Some(PlanetTool::Building(PlanetBuildingKind::Housing)),
+            false,
+            false,
+            false
+        ));
+        assert!(should_hit_test_network_segments(
+            Some(PlanetTool::Building(PlanetBuildingKind::Housing)),
+            true,
+            false,
+            false
+        ));
+        assert!(should_hit_test_network_segments(None, false, false, false));
+    }
+
+    #[test]
+    fn route_chain_clicks_add_consecutive_segments_and_small_anchor_markers() {
+        let start = NetworkAnchor::CellCenter { cell_index: 3 };
+        let corner = NetworkAnchor::CellCorner { face_index: 7 };
+        let midpoint = NetworkAnchor::SideMidpoint {
+            first_face: 7,
+            second_face: 9,
+        };
+
+        assert_eq!(advance_network_chain(None, start), (Some(start), None));
+        assert_eq!(
+            advance_network_chain(Some(start), corner),
+            (
+                Some(corner),
+                Some(NetworkPlacement::AnchorSegment { start, end: corner })
+            )
         );
-        assert!(
-            (pentagon_sector.vertices[0].position.z - (std::f32::consts::TAU / 5.0).sin()).abs()
-                < 1e-6
+        assert_eq!(
+            advance_network_chain(Some(corner), corner),
+            (Some(corner), None)
         );
-        assert!((hexagon_sector.vertices[0].position.x + 1.0).abs() < 1e-6);
-        assert!(hexagon_sector.vertices[0].position.z.abs() < 1e-6);
+        assert_eq!(
+            advance_network_chain(Some(corner), midpoint),
+            (
+                Some(midpoint),
+                Some(NetworkPlacement::AnchorSegment {
+                    start: corner,
+                    end: midpoint,
+                })
+            )
+        );
+        assert!(network_anchor_marker_radius(0.01, 1.0) < 0.012);
+        assert_eq!(network_anchor_marker_radius(1.0, 1.0), 0.004);
     }
 
     #[test]
@@ -6752,70 +7741,27 @@ mod tests {
     }
 
     #[test]
-    fn planet_routes_keep_scale_across_conditioned_geometry() {
-        let small = EditableMesh {
-            vertices: vec![
-                Vertex::new2(Vec3::ZERO, Vec2::ZERO, WHITE),
-                Vertex::new2(vec3(2.0, 0.0, 1.0), Vec2::ZERO, WHITE),
-            ],
-            indices: Vec::new(),
-        };
-        let mut large = small.clone();
-        large
-            .vertices
-            .push(Vertex::new2(vec3(8.0, 0.0, 4.0), Vec2::ZERO, WHITE));
-        let reference = large.clone();
-        let pivot = Vec3::ZERO;
-
-        let small = normalize_radial_mesh(&small, pivot, &reference);
-        let large = normalize_radial_mesh(&large, pivot, &reference);
-
-        assert_eq!(small.vertices[0].position, large.vertices[0].position);
-        assert_eq!(small.vertices[1].position, large.vertices[1].position);
-        assert!(
-            (building_model_scale_for_cell(1.0) * NORMALIZED_MODEL_EXTENT
-                - BUILDING_CELL_FILL_RATIO)
-                .abs()
-                < 1e-6
-        );
-    }
-
-    #[test]
     fn radial_neighbors_distinguish_same_building_from_other_buildings() {
         assert_eq!(
-            radial_neighbor_state(PlanetBuildingKind::Route, Some(PlanetBuildingKind::Route)),
+            radial_neighbor_state(PlanetBuildingKind::Base, Some(PlanetBuildingKind::Base)),
             RadialNeighborState::Route
         );
         assert_eq!(
-            radial_neighbor_state(PlanetBuildingKind::Route, Some(PlanetBuildingKind::Base)),
+            radial_neighbor_state(PlanetBuildingKind::Base, Some(PlanetBuildingKind::Mine)),
             RadialNeighborState::OtherBuilding
         );
         assert_eq!(
-            radial_neighbor_state(PlanetBuildingKind::Route, None),
+            radial_neighbor_state(PlanetBuildingKind::Base, None),
             RadialNeighborState::Empty
         );
     }
 
     #[test]
-    fn radial_sector_rotation_uses_the_configured_pivot() {
-        let pivot = vec3(2.0, 3.0, 4.0);
-        let mesh = EditableMesh {
-            vertices: vec![Vertex::new2(pivot, Vec2::ZERO, WHITE)],
-            indices: Vec::new(),
-        };
+    fn legacy_route_buildings_deserialize_as_unsupported() {
+        let kind: PlanetBuildingKind = serde_json::from_str("\"Route\"").unwrap();
 
-        let rotated = rotate_radial_sector(&mesh, 1, 6, pivot);
-
-        assert!((rotated.vertices[0].position - pivot).length() < 1e-6);
-    }
-
-    #[test]
-    fn radial_sector_alignment_centers_the_first_wedge_on_its_neighbor() {
-        let neighbor_angle = 0.73;
-        let sector_center_angle =
-            radial_sector_start_angle(neighbor_angle, 6) + std::f32::consts::PI / 6.0;
-
-        assert!((sector_center_angle - neighbor_angle).abs() < 1e-6);
+        assert_eq!(kind, PlanetBuildingKind::LegacyRoute);
+        assert_eq!(building_object_id(kind), None);
     }
 
     fn test_building() -> PlanetBuildingState {

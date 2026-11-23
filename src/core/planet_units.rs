@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
@@ -234,6 +234,7 @@ pub struct UnitOps<K> {
     pub is_refuel: fn(K) -> bool,
     pub build_requirements: fn(K) -> Vec<PlanetResourceStack>,
     pub storage_capacity: fn(K) -> u32,
+    pub route_edges: HashSet<(u32, u32)>,
 }
 
 pub struct UnitUpdateResult {
@@ -809,11 +810,17 @@ pub fn find_route_path_cells<B: PlanetBuildingAccess>(
             if came_from.contains_key(neighbor) {
                 continue;
             }
-            let passable = *neighbor == end
-                || buildings
-                    .get(neighbor)
-                    .map(|b| (ops.is_route)(b.kind()) && !planet_is_under_construction(b))
-                    .unwrap_or(false);
+            let edge = (current.min(*neighbor), current.max(*neighbor));
+            let current_is_legacy_route = buildings.get(&current).is_some_and(|building| {
+                (ops.is_route)(building.kind()) && !planet_is_under_construction(building)
+            });
+            let neighbor_is_legacy_route = buildings.get(neighbor).is_some_and(|building| {
+                (ops.is_route)(building.kind()) && !planet_is_under_construction(building)
+            });
+            let passable = (*neighbor == end && ops.route_edges.is_empty())
+                || ops.route_edges.contains(&edge)
+                || current_is_legacy_route
+                || neighbor_is_legacy_route;
             if !passable {
                 continue;
             }
@@ -1494,6 +1501,7 @@ mod tests {
                 _ => Vec::new(),
             },
             storage_capacity: |_| 100,
+            route_edges: HashSet::new(),
         }
     }
 
@@ -1516,6 +1524,22 @@ mod tests {
         let neighbors = vec![vec![1], vec![0, 2], vec![1]];
         let path = find_route_path_cells(0, 2, &buildings, &neighbors, &test_ops()).unwrap();
         assert_eq!(path, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn route_path_respects_explicit_network_edges() {
+        let buildings: HashMap<u32, TestBuilding> = HashMap::new();
+        let neighbors = vec![vec![1], vec![0, 2], vec![1, 3], vec![2]];
+        let mut ops = test_ops();
+        ops.route_edges.extend([(0, 1), (1, 2)]);
+        assert_eq!(
+            find_route_path_cells(0, 2, &buildings, &neighbors, &ops),
+            Some(vec![0, 1, 2])
+        );
+        assert_eq!(
+            find_route_path_cells(0, 3, &buildings, &neighbors, &ops),
+            None
+        );
     }
 
     #[test]

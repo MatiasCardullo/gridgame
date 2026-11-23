@@ -62,7 +62,6 @@ pub enum ObjectId {
     PlanetWarehouse,
     PlanetRefuel,
     PlanetLogistics,
-    PlanetRoute,
     PlanetUnit,
     ConveyorBelt,
     MechanicArm,
@@ -80,6 +79,16 @@ pub struct ObjectDefinition {
     pub label: &'static str,
     pub path: &'static str,
     pub states_path: Option<&'static str>,
+    pub placement_profile: PlacementProfile,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlacementProfile {
+    #[default]
+    CellCenter,
+    TriangleSlots,
+    NetworkSegments,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -114,20 +123,6 @@ pub enum FaceGroupProgram {
     Geometry,
     RadialRepeat,
     IfNeighbor(RadialNeighborState),
-}
-
-impl RadialNeighborState {
-    pub fn state_key_part(self) -> &'static str {
-        match self {
-            Self::Empty => "empty",
-            Self::Route => "route",
-            Self::OtherBuilding => "building",
-        }
-    }
-}
-
-pub fn radial_sector_state_key(sides: usize, sector: usize, state: RadialNeighborState) -> String {
-    format!("radial-p{sides}-s{sector}-{}", state.state_key_part())
 }
 
 #[cfg(test)]
@@ -165,6 +160,8 @@ pub fn reflected_belt_state_key(key: &str) -> Result<String, String> {
 #[serde(default)]
 pub struct VariantConfig {
     pub mode: VariantMode,
+    #[serde(default)]
+    pub placement_profile: Option<PlacementProfile>,
     pub radial_sector_groups: Vec<RadialSectorGroup>,
     pub mirror_axis: MirrorAxis,
     pub mirror_pairs: Vec<MirrorPair>,
@@ -289,13 +286,13 @@ pub const OBJECT_DEFINITIONS: &[ObjectDefinition] = &[
     building(ObjectId::PlanetWarehouse, "Warehouse", "warehouse.glb"),
     building(ObjectId::PlanetRefuel, "Refuel", "refuel.glb"),
     building(ObjectId::PlanetLogistics, "Logistics", "logistics.glb"),
-    building(ObjectId::PlanetRoute, "Route", "route.glb"),
     ObjectDefinition {
         id: ObjectId::PlanetUnit,
         category: ObjectCategory::Units,
         label: "Planet unit",
         path: "assets/objects/units/planet_unit.glb",
         states_path: None,
+        placement_profile: PlacementProfile::CellCenter,
     },
     machine(
         MachineBlockType::ConveyorBelt,
@@ -346,11 +343,7 @@ const fn building(id: ObjectId, label: &'static str, file_name: &'static str) ->
         id,
         category: ObjectCategory::Buildings,
         label,
-        states_path: if matches!(id, ObjectId::PlanetRoute) {
-            Some("assets/objects/buildings/route/states")
-        } else {
-            None
-        },
+        states_path: None,
         path: match id {
             ObjectId::PlanetBase => "assets/objects/buildings/base.glb",
             ObjectId::PlanetBuilder => "assets/objects/buildings/builder.glb",
@@ -360,9 +353,9 @@ const fn building(id: ObjectId, label: &'static str, file_name: &'static str) ->
             ObjectId::PlanetWarehouse => "assets/objects/buildings/warehouse.glb",
             ObjectId::PlanetRefuel => "assets/objects/buildings/refuel.glb",
             ObjectId::PlanetLogistics => "assets/objects/buildings/logistics.glb",
-            ObjectId::PlanetRoute => "assets/objects/buildings/route.glb",
             _ => file_name,
         },
+        placement_profile: PlacementProfile::TriangleSlots,
     }
 }
 
@@ -392,6 +385,7 @@ const fn machine(
             ObjectId::Crate => "assets/objects/machine_blocks/crate.glb",
             _ => file_name,
         },
+        placement_profile: PlacementProfile::CellCenter,
     }
 }
 
@@ -2696,6 +2690,46 @@ impl ObjectCatalog {
             .map(|entry| &entry.variant_config)
     }
 
+    pub fn placement_profile(&self, id: ObjectId) -> Option<PlacementProfile> {
+        let entry = self
+            .entries
+            .iter()
+            .find(|entry| entry.definition.id == id)?;
+        if entry.definition.category == ObjectCategory::Buildings {
+            return Some(PlacementProfile::TriangleSlots);
+        }
+        Some(
+            entry
+                .variant_config
+                .placement_profile
+                .unwrap_or(entry.definition.placement_profile),
+        )
+    }
+
+    pub fn set_placement_profile(
+        &mut self,
+        id: ObjectId,
+        profile: PlacementProfile,
+    ) -> Result<(), String> {
+        let entry = self
+            .entries
+            .iter_mut()
+            .find(|entry| entry.definition.id == id)
+            .ok_or_else(|| format!("unknown object id {id:?}"))?;
+        if entry.definition.category == ObjectCategory::Buildings {
+            return Err(
+                "planet object placement profiles are fixed by the placement workflow".to_string(),
+            );
+        }
+        let mut config = entry.variant_config.clone();
+        config.placement_profile = Some(profile);
+        config.validate()?;
+        save_variant_config(&object_states_directory(&entry.definition), &config)?;
+        entry.variant_config = config;
+        entry.variant_config_error = None;
+        Ok(())
+    }
+
     pub fn save(&mut self, id: ObjectId, mesh: EditableMesh) -> Result<(), String> {
         let metadata = self
             .metadata(id, None)
@@ -2767,7 +2801,6 @@ fn load_variant_config(states_directory: &Path) -> (VariantConfig, Option<String
     }
 }
 
-#[cfg(test)]
 fn save_variant_config(states_directory: &Path, config: &VariantConfig) -> Result<(), String> {
     let path = variant_config_path(states_directory);
     fs::create_dir_all(states_directory)
@@ -3383,27 +3416,15 @@ mod tests {
     }
 
     #[test]
-    fn route_and_conveyor_neighbor_states_load_from_subfolders() {
+    fn conveyor_neighbor_states_load_from_subfolder() {
         let catalog = ObjectCatalog::load();
-        let route_states = &catalog
-            .entries()
-            .iter()
-            .find(|entry| entry.definition.id == ObjectId::PlanetRoute)
-            .expect("route entry should exist")
-            .states;
         let conveyor_states = &catalog
             .entries()
             .iter()
             .find(|entry| entry.definition.id == ObjectId::ConveyorBelt)
             .expect("conveyor entry should exist")
             .states;
-        assert_eq!(route_states.len(), 972);
         assert_eq!(conveyor_states.len(), 784);
-        assert!(
-            catalog
-                .get_state(ObjectId::PlanetRoute, "p6-000000")
-                .is_some()
-        );
         assert!(
             catalog
                 .get_state(ObjectId::ConveyorBelt, "f0-b0-s00")
@@ -3411,42 +3432,36 @@ mod tests {
         );
         assert!(
             catalog
-                .get_state(ObjectId::PlanetRoute, "p6-100000")
-                .is_some()
-        );
-        assert!(
-            catalog
                 .get_state(ObjectId::ConveyorBelt, "f1-b0-s00")
                 .is_some()
         );
-        for id in [ObjectId::PlanetRoute, ObjectId::ConveyorBelt] {
-            let entry = catalog
-                .entries()
-                .iter()
-                .find(|entry| entry.definition.id == id)
-                .expect("state object should exist");
-            for state in &entry.states {
-                let mesh = state
-                    .mesh
-                    .as_ref()
-                    .unwrap_or_else(|| panic!("{} failed to load: {:?}", state.key, state.error));
+        for state in &catalog
+            .entries()
+            .iter()
+            .find(|entry| entry.definition.id == ObjectId::ConveyorBelt)
+            .expect("conveyor state object should exist")
+            .states
+        {
+            let mesh = state
+                .mesh
+                .as_ref()
+                .unwrap_or_else(|| panic!("{} failed to load: {:?}", state.key, state.error));
+            assert!(
+                mesh.vertices
+                    .iter()
+                    .any(|vertex| vertex.color != [255, 255, 255, 255]),
+                "{} lost its vertex colors",
+                state.key
+            );
+            for triangle in mesh.indices.chunks_exact(3) {
+                let a = mesh.vertices[triangle[0] as usize].position;
+                let b = mesh.vertices[triangle[1] as usize].position;
+                let c = mesh.vertices[triangle[2] as usize].position;
                 assert!(
-                    mesh.vertices
-                        .iter()
-                        .any(|vertex| vertex.color != [255, 255, 255, 255]),
-                    "{} lost its vertex colors",
+                    (b - a).cross(c - a).length_squared() > 1e-10,
+                    "{} contains a degenerate triangle",
                     state.key
                 );
-                for triangle in mesh.indices.chunks_exact(3) {
-                    let a = mesh.vertices[triangle[0] as usize].position;
-                    let b = mesh.vertices[triangle[1] as usize].position;
-                    let c = mesh.vertices[triangle[2] as usize].position;
-                    assert!(
-                        (b - a).cross(c - a).length_squared() > 1e-10,
-                        "{} contains a degenerate triangle",
-                        state.key
-                    );
-                }
             }
         }
     }
@@ -3725,12 +3740,52 @@ mod tests {
     }
 
     #[test]
+    fn placement_profile_round_trips_in_variant_configuration() {
+        let directory =
+            std::env::temp_dir().join(format!("gridgame-placement-profile-{}", std::process::id()));
+        fs::create_dir_all(&directory).unwrap();
+        let config = VariantConfig {
+            placement_profile: Some(PlacementProfile::NetworkSegments),
+            ..VariantConfig::default()
+        };
+        save_variant_config(&directory, &config).unwrap();
+        let (loaded, error) = load_variant_config(&directory);
+        assert!(error.is_none());
+        assert_eq!(
+            loaded.placement_profile,
+            Some(PlacementProfile::NetworkSegments)
+        );
+        fs::remove_file(variant_config_path(&directory)).unwrap();
+        fs::remove_dir(directory).unwrap();
+    }
+
+    #[test]
+    fn planet_buildings_use_triangle_slots() {
+        let mut catalog = ObjectCatalog::load();
+        assert_eq!(
+            catalog.placement_profile(ObjectId::PlanetBase),
+            Some(PlacementProfile::TriangleSlots)
+        );
+        assert!(
+            catalog
+                .entries()
+                .iter()
+                .all(|entry| entry.definition.label != "Route")
+        );
+        assert!(
+            catalog
+                .set_placement_profile(ObjectId::PlanetBase, PlacementProfile::CellCenter)
+                .is_err()
+        );
+    }
+
+    #[test]
     fn custom_variants_require_exact_condition_key_match() {
         let mut catalog = ObjectCatalog::load();
         let entry = catalog
             .entries
             .iter_mut()
-            .find(|entry| entry.definition.id == ObjectId::PlanetRoute)
+            .find(|entry| entry.definition.id == ObjectId::PlanetBase)
             .unwrap();
         entry.variant_config.mode = VariantMode::Custom;
         entry.variant_config.custom_patterns = vec![CustomVariantPattern {
@@ -3740,11 +3795,11 @@ mod tests {
         }];
 
         assert_eq!(
-            catalog.custom_state_key(ObjectId::PlanetRoute, "p6-002200"),
+            catalog.custom_state_key(ObjectId::PlanetBase, "p6-002200"),
             Some("custom-straight-route")
         );
         assert_eq!(
-            catalog.custom_state_key(ObjectId::PlanetRoute, "p6-002201"),
+            catalog.custom_state_key(ObjectId::PlanetBase, "p6-002201"),
             None
         );
     }

@@ -8,6 +8,9 @@ use serde_json::{Value, json};
 use tiny_http::{Header, Request, Response, Server, StatusCode};
 
 use crate::core::Axial;
+#[cfg(test)]
+use crate::core::planet_placement::NetworkAnchor;
+use crate::core::planet_placement::{NetworkKind, NetworkPlacement};
 
 pub const API_ADDRESS: &str = "127.0.0.1:39123";
 const API_PREFIX: &str = "/api/v1";
@@ -26,7 +29,6 @@ pub enum ApiBuildingKind {
     Warehouse,
     Refuel,
     Logistics,
-    Route,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize)]
@@ -92,13 +94,23 @@ pub enum ApiCommand {
         limit: usize,
     },
     Buildings,
+    Networks,
     Units,
     PlaceBuilding {
         cell: u32,
+        triangle_index: u8,
         kind: ApiBuildingKind,
     },
     RemoveBuilding {
         cell: u32,
+        triangle_index: u8,
+    },
+    PlaceNetwork {
+        kind: NetworkKind,
+        placement: NetworkPlacement,
+    },
+    RemoveNetwork {
+        id: u32,
     },
     SpawnUnit {
         depot: u32,
@@ -214,7 +226,15 @@ struct ParseError {
 #[derive(Deserialize)]
 struct PlaceBuildingBody {
     cell_index: u32,
+    #[serde(default)]
+    triangle_index: u8,
     kind: ApiBuildingKind,
+}
+
+#[derive(Deserialize)]
+struct PlaceNetworkBody {
+    kind: NetworkKind,
+    placement: NetworkPlacement,
 }
 
 #[derive(Deserialize)]
@@ -434,6 +454,9 @@ fn parse_request(method: &str, url: &str, body: &[u8]) -> Result<ApiCommand, Par
     if path == format!("{API_PREFIX}/buildings") && method == "GET" {
         return Ok(ApiCommand::Buildings);
     }
+    if path == format!("{API_PREFIX}/networks") && method == "GET" {
+        return Ok(ApiCommand::Networks);
+    }
     if path == format!("{API_PREFIX}/units") && method == "GET" {
         return Ok(ApiCommand::Units);
     }
@@ -441,19 +464,63 @@ fn parse_request(method: &str, url: &str, body: &[u8]) -> Result<ApiCommand, Par
         let payload = parse_json_body::<PlaceBuildingBody>(body)?;
         return Ok(ApiCommand::PlaceBuilding {
             cell: payload.cell_index,
+            triangle_index: payload.triangle_index,
             kind: payload.kind,
+        });
+    }
+    if path == format!("{API_PREFIX}/networks") && method == "POST" {
+        let payload = parse_json_body::<PlaceNetworkBody>(body)?;
+        return Ok(ApiCommand::PlaceNetwork {
+            kind: payload.kind,
+            placement: payload.placement,
         });
     }
     if method == "DELETE" {
         if let Some(cell) = path.strip_prefix(&format!("{API_PREFIX}/buildings/")) {
-            let cell = cell.parse::<u32>().map_err(|_| {
+            let mut parts = cell.split('/');
+            let cell = parts
+                .next()
+                .and_then(|part| part.parse::<u32>().ok())
+                .ok_or_else(|| {
+                    parse_error(
+                        400,
+                        "invalid_cell",
+                        "building path must begin with a cell index",
+                    )
+                })?;
+            let triangle_index = parts
+                .next()
+                .map(str::parse::<u8>)
+                .transpose()
+                .map_err(|_| {
+                    parse_error(
+                        400,
+                        "invalid_triangle_index",
+                        "building path triangle index must be an integer",
+                    )
+                })?
+                .unwrap_or(0);
+            if parts.next().is_some() {
+                return Err(parse_error(
+                    400,
+                    "invalid_building_path",
+                    "building path must be /buildings/{cell_index}/{triangle_index}",
+                ));
+            }
+            return Ok(ApiCommand::RemoveBuilding {
+                cell,
+                triangle_index,
+            });
+        }
+        if let Some(id) = path.strip_prefix(&format!("{API_PREFIX}/networks/")) {
+            let id = id.parse::<u32>().map_err(|_| {
                 parse_error(
                     400,
-                    "invalid_cell",
-                    "building path must end with a cell index",
+                    "invalid_network_id",
+                    "network path must end with an id",
                 )
             })?;
-            return Ok(ApiCommand::RemoveBuilding { cell });
+            return Ok(ApiCommand::RemoveNetwork { id });
         }
     }
     if path == format!("{API_PREFIX}/units") && method == "POST" {
@@ -642,6 +709,10 @@ mod tests {
     #[test]
     fn parses_building_and_unit_commands() {
         assert!(matches!(
+            parse_request("GET", "/api/v1/networks", &[]),
+            Ok(ApiCommand::Networks)
+        ));
+        assert!(matches!(
             parse_request(
                 "POST",
                 "/api/v1/buildings",
@@ -649,8 +720,68 @@ mod tests {
             ),
             Ok(ApiCommand::PlaceBuilding {
                 cell: 12,
+                triangle_index: 0,
                 kind: ApiBuildingKind::Mine
             })
+        ));
+        assert!(
+            parse_request(
+                "POST",
+                "/api/v1/buildings",
+                br#"{"cell_index":12,"kind":"route"}"#
+            )
+            .is_err()
+        );
+        assert!(matches!(
+            parse_request(
+                "POST",
+                "/api/v1/buildings",
+                br#"{"cell_index":12,"triangle_index":5,"kind":"factory"}"#
+            ),
+            Ok(ApiCommand::PlaceBuilding {
+                cell: 12,
+                triangle_index: 5,
+                kind: ApiBuildingKind::Factory
+            })
+        ));
+        assert!(matches!(
+            parse_request(
+                "POST",
+                "/api/v1/networks",
+                br#"{"kind":"route","placement":{"shared_side":{"first_cell":1,"second_cell":2}}}"#
+            ),
+            Ok(ApiCommand::PlaceNetwork {
+                kind: NetworkKind::Route,
+                placement: NetworkPlacement::SharedSide {
+                    first_cell: 1,
+                    second_cell: 2
+                }
+            })
+        ));
+        assert!(matches!(
+            parse_request(
+                "POST",
+                "/api/v1/networks",
+                br#"{"kind":"route","placement":{"anchor_segment":{"start":{"cell_center":{"cell_index":3}},"end":{"cell_corner":{"face_index":8}}}}}"#
+            ),
+            Ok(ApiCommand::PlaceNetwork {
+                kind: NetworkKind::Route,
+                placement: NetworkPlacement::AnchorSegment {
+                    start: NetworkAnchor::CellCenter { cell_index: 3 },
+                    end: NetworkAnchor::CellCorner { face_index: 8 }
+                }
+            })
+        ));
+        assert!(matches!(
+            parse_request("DELETE", "/api/v1/buildings/12/4", &[]),
+            Ok(ApiCommand::RemoveBuilding {
+                cell: 12,
+                triangle_index: 4
+            })
+        ));
+        assert!(matches!(
+            parse_request("DELETE", "/api/v1/networks/7", &[]),
+            Ok(ApiCommand::RemoveNetwork { id: 7 })
         ));
         assert!(matches!(
             parse_request(

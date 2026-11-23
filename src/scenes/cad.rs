@@ -5,7 +5,7 @@ use macroquad::prelude::*;
 use crate::core::object_assets::{
     BUILDING_PREVIEW_CELL_GUIDE_RADIUS, BUILDING_PREVIEW_CELL_RADIUS, EditableMesh,
     FaceGroupProgram, FaceMetadata, MeshPrimitive, ObjectCatalog, ObjectCategory, ObjectId,
-    RadialNeighborState, building_model_scale_for_cell, mesh_center_and_scale,
+    PlacementProfile, RadialNeighborState, building_model_scale_for_cell, mesh_center_and_scale,
 };
 use crate::core::ui::{fit_status_text, ui_button};
 use crate::core::{FrameContext, Scene};
@@ -18,7 +18,7 @@ const CAMERA_MAX_DISTANCE: f32 = 10.0;
 const MESH_VIEW_MIN_PREVIEW_DISTANCE: f32 = 2.0;
 const MESH_VIEW_DISTANCE_SCALE: f32 = 1.8;
 const HISTORY_LIMIT: usize = 100;
-const FACE_LIST_TOP: f32 = 148.0;
+const FACE_LIST_TOP: f32 = 180.0;
 const FACE_ROW_HEIGHT: f32 = 26.0;
 const MAX_TRANSFORM_VALUE: f32 = 1_000_000.0;
 const MAX_SCALE_FACTOR: f32 = 1_000.0;
@@ -2254,6 +2254,7 @@ fn draw_view_controls(
     panel: Rect,
     has_radial_group: bool,
     radial_pivot: Option<[f32; 3]>,
+    triangle_building: bool,
 ) {
     draw_rectangle(panel.x, panel.y, panel.w, panel.h, ctx.colors_rt.panel_bg);
     draw_rectangle_lines(
@@ -2349,24 +2350,34 @@ fn draw_view_controls(
             },
         );
         if state.interaction_preview {
-            let _ = button(ctx, preview_shuffle_rect(panel), "Shuffle neighbors");
-            let neighbors = state
-                .preview_neighbors
-                .iter()
-                .map(|state| match state {
-                    RadialNeighborState::Empty => "Empty",
-                    RadialNeighborState::Route => "Same building",
-                    RadialNeighborState::OtherBuilding => "Building",
-                })
-                .collect::<Vec<_>>()
-                .join(", ");
-            draw_text(
-                &neighbors,
-                panel.x + 12.0,
-                panel.y + panel.h - 7.0,
-                ctx.font_sm,
-                ctx.colors_rt.text_secondary,
-            );
+            if triangle_building {
+                draw_text(
+                    "One building per triangular slot",
+                    panel.x + 12.0,
+                    panel.y + panel.h - 7.0,
+                    ctx.font_sm,
+                    ctx.colors_rt.text_secondary,
+                );
+            } else {
+                let _ = button(ctx, preview_shuffle_rect(panel), "Shuffle neighbors");
+                let neighbors = state
+                    .preview_neighbors
+                    .iter()
+                    .map(|state| match state {
+                        RadialNeighborState::Empty => "Empty",
+                        RadialNeighborState::Route => "Same building",
+                        RadialNeighborState::OtherBuilding => "Building",
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                draw_text(
+                    &neighbors,
+                    panel.x + 12.0,
+                    panel.y + panel.h - 7.0,
+                    ctx.font_sm,
+                    ctx.colors_rt.text_secondary,
+                );
+            }
         }
         if has_radial_group {
             let label = if state.placing_radial_center {
@@ -2542,6 +2553,14 @@ fn selected_mesh<'a>(
     state: &CadSceneState,
 ) -> Option<&'a EditableMesh> {
     catalog.get(state.selected)
+}
+
+fn selected_is_triangle_building(catalog: &ObjectCatalog, state: &CadSceneState) -> bool {
+    catalog
+        .entries()
+        .iter()
+        .find(|entry| entry.definition.id == state.selected)
+        .is_some_and(|entry| entry.definition.category == ObjectCategory::Buildings)
 }
 
 fn selected_mesh_mut<'a>(
@@ -3473,6 +3492,88 @@ fn draw_hex_outline(center: Vec3, radius: f32, color: Color) {
     }
 }
 
+fn draw_triangle_slot_outline(center: Vec3, radius: f32, sides: usize) {
+    let color = Color::from_rgba(255, 225, 90, 255);
+    let corners = (0..sides)
+        .map(|index| {
+            let angle =
+                std::f32::consts::TAU * index as f32 / sides as f32 - std::f32::consts::FRAC_PI_2;
+            center + vec3(angle.cos() * radius, 0.0, angle.sin() * radius)
+        })
+        .collect::<Vec<_>>();
+    for index in 0..sides {
+        draw_line_3d(corners[index], corners[(index + 1) % sides], color);
+        draw_line_3d(center, corners[index], color);
+    }
+}
+
+fn triangle_slot_preview_placements(center: Vec3, radius: f32, sides: usize) -> Vec<(Vec3, f32)> {
+    if !matches!(sides, 5 | 6) {
+        return Vec::new();
+    }
+    (0..sides)
+        .map(|slot| {
+            let angle = std::f32::consts::TAU * (slot as f32 + 0.5) / sides as f32
+                - std::f32::consts::FRAC_PI_2;
+            (
+                center
+                    + vec3(
+                        angle.cos() * radius * 0.46,
+                        0.0,
+                        angle.sin() * radius * 0.46,
+                    ),
+                angle,
+            )
+        })
+        .collect()
+}
+
+fn draw_triangle_slot_preview_mesh(
+    mesh: &EditableMesh,
+    reference: &EditableMesh,
+    center: Vec3,
+    radius: f32,
+    sides: usize,
+) -> Result<(), String> {
+    draw_triangle_slot_outline(center, radius, sides);
+    let normalized = preview_mesh_with_reference(mesh, reference);
+    let scale = building_model_scale_for_cell(radius * 0.36);
+    let min_y = normalized
+        .vertices
+        .iter()
+        .map(|vertex| vertex.position.y)
+        .reduce(f32::min)
+        .unwrap_or(0.0);
+    for (slot_center, angle) in triangle_slot_preview_placements(center, radius, sides) {
+        let rotated = rotate_mesh_y_about(&normalized, angle, Vec3::ZERO);
+        let preview = rotated.transformed(|point| {
+            point * scale + slot_center + vec3(0.0, -min_y * scale + 0.02, 0.0)
+        });
+        preview.render()?;
+    }
+    Ok(())
+}
+
+fn draw_triangle_slot_interaction_preview(
+    catalog: &ObjectCatalog,
+    state: &CadSceneState,
+) -> Result<(), String> {
+    let camera = preview_camera(state);
+    set_camera(&camera);
+    let result = (|| {
+        let mesh = selected_mesh(catalog, state)
+            .ok_or_else(|| "Selected object is unavailable".to_string())?;
+        let radius = BUILDING_PREVIEW_CELL_RADIUS;
+        let pentagon_center = state.target - Vec3::X * radius * 1.65;
+        let hexagon_center = state.target + Vec3::X * radius * 1.65;
+        draw_triangle_slot_preview_mesh(mesh, mesh, pentagon_center, radius, 5)?;
+        draw_triangle_slot_preview_mesh(mesh, mesh, hexagon_center, radius, 6)?;
+        Ok(())
+    })();
+    set_default_camera();
+    result
+}
+
 fn draw_preview_object(
     mesh: &EditableMesh,
     reference: &EditableMesh,
@@ -3554,6 +3655,9 @@ fn preview_camera(state: &CadSceneState) -> Camera3D {
 }
 
 fn draw_interaction_preview(catalog: &ObjectCatalog, state: &CadSceneState) -> Result<(), String> {
+    if selected_is_triangle_building(catalog, state) {
+        return draw_triangle_slot_interaction_preview(catalog, state);
+    }
     let camera = preview_camera(state);
     set_camera(&camera);
     let result = (|| {
@@ -4604,17 +4708,20 @@ pub fn run(
             },
         ) {
             state.interaction_preview = !state.interaction_preview;
-            if state.interaction_preview {
+            if state.interaction_preview && !selected_is_triangle_building(catalog, state) {
                 shuffle_preview_neighbors(state, catalog);
             }
         }
         if state.interaction_preview
+            && !selected_is_triangle_building(catalog, state)
             && button(ctx, preview_shuffle_rect(view_panel), "Shuffle neighbors")
         {
             shuffle_preview_neighbors(state, catalog);
         }
-        let radial_metadata = selected_metadata(catalog, state)
-            .filter(|metadata| metadata.radial_main_group_id().is_some());
+        let radial_metadata = selected_metadata(catalog, state).filter(|metadata| {
+            !selected_is_triangle_building(catalog, state)
+                && metadata.radial_main_group_id().is_some()
+        });
         let radial_pivot = radial_metadata.and_then(|metadata| metadata.radial_pivot);
         let radial_center_label = if state.placing_radial_center {
             "Cancel UCS placement"
@@ -4943,6 +5050,20 @@ pub fn run(
         let rename = Rect::new(130.0, 66.0, 108.0, 30.0);
         let undo_button = Rect::new(12.0, 102.0, 108.0, 30.0);
         let redo_button = Rect::new(130.0, 102.0, 108.0, 30.0);
+        let placement_profiles = if catalog
+            .entries()
+            .iter()
+            .find(|entry| entry.definition.id == state.selected)
+            .is_some_and(|entry| entry.definition.category == ObjectCategory::Buildings)
+        {
+            Vec::new()
+        } else {
+            vec![
+                (PlacementProfile::CellCenter, "Center"),
+                (PlacementProfile::TriangleSlots, "Triangles"),
+                (PlacementProfile::NetworkSegments, "Network"),
+            ]
+        };
         if !modal_open && !rename_dialog_open && button(ctx, add_group, "Add Group") {
             match create_selected_group(catalog, state) {
                 Ok(()) => state.error = None,
@@ -4979,6 +5100,16 @@ pub fn run(
         }
         if !modal_open && !rename_dialog_open && button(ctx, redo_button, "Redo") {
             undo_or_redo(catalog, state, false);
+        }
+        for (index, (profile, label)) in placement_profiles.into_iter().enumerate() {
+            let rect = Rect::new(12.0 + index as f32 * 76.0, 138.0, 72.0, 28.0);
+            if !modal_open
+                && !rename_dialog_open
+                && button(ctx, rect, label)
+                && let Err(error) = catalog.set_placement_profile(state.selected, profile)
+            {
+                state.error = Some(error);
+            }
         }
     }
     let mut action_x = SIDEBAR_WIDTH + 12.0;
@@ -5859,11 +5990,7 @@ pub fn run(
     draw_text(&title, 12.0, 36.0, ctx.font_lg, ctx.colors_rt.text_primary);
     if state.editing {
         draw_text(
-            if state.selected == ObjectId::PlanetRoute {
-                "Radial route program"
-            } else {
-                "Groups and faces"
-            },
+            "Groups and faces",
             12.0,
             140.0,
             ctx.font_md,
@@ -5885,6 +6012,34 @@ pub fn run(
             let _ = button(ctx, rename, "Rename");
             let _ = button(ctx, undo_button, "Undo");
             let _ = button(ctx, redo_button, "Redo");
+            let active_profile = catalog
+                .placement_profile(state.selected)
+                .unwrap_or_else(|| {
+                    selected_entry(catalog, state.selected)
+                        .map(|entry| entry.definition.placement_profile)
+                        .unwrap_or(PlacementProfile::CellCenter)
+                });
+            for (index, (profile, label)) in [
+                (PlacementProfile::CellCenter, "Center"),
+                (PlacementProfile::TriangleSlots, "Triangles"),
+                (PlacementProfile::NetworkSegments, "Network"),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let rect = Rect::new(12.0 + index as f32 * 76.0, 138.0, 72.0, 28.0);
+                let _ = button(ctx, rect, label);
+                if active_profile == profile {
+                    draw_rectangle_lines(
+                        rect.x,
+                        rect.y,
+                        rect.w,
+                        rect.h,
+                        2.0,
+                        Color::from_rgba(27, 119, 105, 255),
+                    );
+                }
+            }
             for row in state.face_scroll..(state.face_scroll + visible_rows).min(items.len()) {
                 let item = items[row];
                 let y = FACE_LIST_TOP + (row - state.face_scroll) as f32 * FACE_ROW_HEIGHT;
@@ -6013,6 +6168,7 @@ pub fn run(
         view_panel,
         metadata.is_some_and(|metadata| metadata.radial_main_group_id().is_some()),
         metadata.and_then(|metadata| metadata.radial_pivot),
+        selected_is_triangle_building(catalog, state),
     );
     draw_object_snap_panel(ctx, view_panel, state);
     draw_paint_panel(ctx, paint_panel, state, catalog);
@@ -6331,6 +6487,19 @@ pub fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn triangle_interaction_preview_has_five_and_six_slots() {
+        let pentagon = triangle_slot_preview_placements(Vec3::ZERO, 1.0, 5);
+        let hexagon = triangle_slot_preview_placements(Vec3::ZERO, 1.0, 6);
+
+        assert_eq!(pentagon.len(), 5);
+        assert_eq!(hexagon.len(), 6);
+        assert!(triangle_slot_preview_placements(Vec3::ZERO, 1.0, 4).is_empty());
+        assert!(hexagon.iter().all(|(center, _)| {
+            ((center.x * center.x + center.z * center.z).sqrt() - 0.46).abs() < 1e-5
+        }));
+    }
 
     #[test]
     fn paint_hex_accepts_rgb_and_rgba() {
@@ -6838,16 +7007,6 @@ mod tests {
         assert_eq!(
             preview_neighbor_for_condition(
                 &catalog,
-                ObjectId::PlanetRoute,
-                1,
-                0,
-                RadialNeighborState::Route,
-            ),
-            Some(ObjectId::PlanetRoute)
-        );
-        assert_eq!(
-            preview_neighbor_for_condition(
-                &catalog,
                 ObjectId::PlanetBase,
                 1,
                 0,
@@ -7002,14 +7161,14 @@ mod tests {
     fn radial_neighbor_preview_uses_the_center_and_two_adjacent_ring_cells() {
         let neighbors = [
             None,
+            Some(ObjectId::PlanetFactory),
             Some(ObjectId::PlanetBase),
-            Some(ObjectId::PlanetRoute),
             None,
-            Some(ObjectId::PlanetRoute),
             Some(ObjectId::PlanetBase),
+            Some(ObjectId::PlanetFactory),
         ];
         let conditions =
-            radial_neighbor_conditions(ObjectId::PlanetRoute, ObjectId::PlanetRoute, &neighbors, 0);
+            radial_neighbor_conditions(ObjectId::PlanetBase, ObjectId::PlanetBase, &neighbors, 0);
 
         assert_eq!(
             conditions,
@@ -7029,8 +7188,8 @@ mod tests {
         };
         for neighbor_index in 0..6 {
             let conditions = radial_neighbor_conditions(
-                ObjectId::PlanetRoute,
-                ObjectId::PlanetRoute,
+                ObjectId::PlanetBase,
+                ObjectId::PlanetBase,
                 &neighbors,
                 neighbor_index,
             );
@@ -7040,11 +7199,11 @@ mod tests {
             );
             assert_eq!(
                 conditions[(neighbor_index + 2) % 6],
-                condition_for(ObjectId::PlanetRoute, neighbors[(neighbor_index + 1) % 6])
+                condition_for(ObjectId::PlanetBase, neighbors[(neighbor_index + 1) % 6])
             );
             assert_eq!(
                 conditions[(neighbor_index + 4) % 6],
-                condition_for(ObjectId::PlanetRoute, neighbors[(neighbor_index + 5) % 6])
+                condition_for(ObjectId::PlanetBase, neighbors[(neighbor_index + 5) % 6])
             );
             for (sector, condition) in conditions.iter().enumerate() {
                 if sector != (neighbor_index + 2) % 6
@@ -7056,8 +7215,12 @@ mod tests {
             }
         }
         assert_eq!(
-            radial_neighbor_conditions(ObjectId::PlanetRoute, ObjectId::PlanetBase, &neighbors, 0)
-                [3],
+            radial_neighbor_conditions(
+                ObjectId::PlanetBase,
+                ObjectId::PlanetFactory,
+                &neighbors,
+                0
+            )[3],
             RadialNeighborState::OtherBuilding
         );
     }
@@ -7090,7 +7253,7 @@ mod tests {
     }
 
     #[test]
-    fn radial_route_groups_appear_as_a_main_group_with_condition_children() {
+    fn radial_neighbor_groups_appear_as_a_main_group_with_condition_children() {
         let mut metadata = FaceMetadata::for_face_count(3);
         let main_id = metadata.create_group(&[0]).unwrap();
         assert_eq!(

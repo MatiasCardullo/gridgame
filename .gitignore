@@ -10,3 +10,4 @@ Cargo.lock
 *.bin
 /autocad
 /.obsidian
+/.vscode

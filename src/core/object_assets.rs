@@ -2756,6 +2756,25 @@ impl ObjectCatalog {
         self.save_with_metadata(id, mesh, metadata)
     }
 
+    pub fn replace_mesh(
+        &mut self,
+        id: ObjectId,
+        mesh: EditableMesh,
+        mut metadata: FaceMetadata,
+    ) -> Result<(), String> {
+        metadata.validate(mesh.face_count())?;
+        let entry = self
+            .entries
+            .iter_mut()
+            .find(|entry| entry.definition.id == id)
+            .ok_or_else(|| format!("unknown object id {id:?}"))?;
+        entry.mesh = Some(mesh);
+        entry.metadata = metadata;
+        entry.metadata_error = None;
+        entry.error = None;
+        Ok(())
+    }
+
     pub fn save_with_metadata(
         &mut self,
         id: ObjectId,
@@ -3383,6 +3402,38 @@ mod tests {
                 entry.definition.path,
                 entry.error
             );
+        }
+    }
+
+    #[test]
+    fn building_models_have_detailed_multicolor_geometry() {
+        let catalog = ObjectCatalog::load();
+        let building_ids = [
+            ObjectId::PlanetBase,
+            ObjectId::PlanetBuilder,
+            ObjectId::PlanetHousing,
+            ObjectId::PlanetFactory,
+            ObjectId::PlanetMine,
+            ObjectId::PlanetWarehouse,
+            ObjectId::PlanetRefuel,
+            ObjectId::PlanetLogistics,
+        ];
+        for id in building_ids {
+            let mesh = catalog
+                .get(id)
+                .expect("building asset should load before checking detail");
+            let color_count = mesh
+                .vertices
+                .iter()
+                .map(|vertex| vertex.color)
+                .collect::<HashSet<_>>()
+                .len();
+            assert!(
+                mesh.face_count() >= 100,
+                "{id:?} only has {} faces",
+                mesh.face_count()
+            );
+            assert!(color_count >= 3, "{id:?} only has {color_count} colors");
         }
     }
 

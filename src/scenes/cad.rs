@@ -210,6 +210,7 @@ struct PrimitiveGeometry {
     sides: usize,
     rotation: Quat,
     parent_id: Option<u64>,
+    color: Option<Color>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -3280,6 +3281,7 @@ fn add_primitive(
             sides,
             rotation,
             parent_id,
+            color: None,
         },
     )?;
     *selected_mesh_mut(catalog, state)
@@ -3319,6 +3321,18 @@ fn append_primitive_geometry(
                     position.z * geometry.dimensions.z,
                 )
     });
+    let mut shape = shape;
+    if let Some(color) = geometry.color {
+        let rgba = [
+            (color.r.clamp(0.0, 1.0) * 255.0).round() as u8,
+            (color.g.clamp(0.0, 1.0) * 255.0).round() as u8,
+            (color.b.clamp(0.0, 1.0) * 255.0).round() as u8,
+            (color.a.clamp(0.0, 1.0) * 255.0).round() as u8,
+        ];
+        for vertex in &mut shape.vertices {
+            vertex.color = rgba;
+        }
+    }
     let first_face = mesh.face_count();
     let face_count = shape.face_count();
     mesh.append(&shape)?;
@@ -4485,6 +4499,8 @@ pub fn handle_api_command(
             dimensions,
             rotation_degrees,
             sides,
+            color,
+            replace,
         } => {
             let sides = if primitive == MeshPrimitive::Polygon {
                 match sides {
@@ -4524,14 +4540,16 @@ pub fn handle_api_command(
                 );
             }
             let id = cad_object_id(kind);
-            let Some(mut mesh) = catalog.get(id).cloned() else {
-                return ApiReply::error(
-                    404,
-                    "cad_building_unavailable",
-                    format!("CAD mesh for '{}' is unavailable", cad_building_name(kind)),
-                );
-            };
-            let Some(mut metadata) = catalog.metadata(id, None).cloned() else {
+            let existing_metadata = catalog.metadata(id, None).cloned();
+            let mut metadata = if replace {
+                let mut metadata = FaceMetadata::for_face_count(0);
+                metadata.radial_pivot = existing_metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata.radial_pivot);
+                metadata
+            } else if let Some(metadata) = existing_metadata {
+                metadata
+            } else {
                 return ApiReply::error(
                     404,
                     "cad_metadata_unavailable",
@@ -4541,36 +4559,40 @@ pub fn handle_api_command(
                     ),
                 );
             };
+            let mut mesh = if replace {
+                EditableMesh {
+                    vertices: Vec::new(),
+                    indices: Vec::new(),
+                }
+            } else if let Some(mesh) = catalog.get(id).cloned() {
+                mesh
+            } else {
+                return ApiReply::error(
+                    404,
+                    "cad_building_unavailable",
+                    format!("CAD mesh for '{}' is unavailable", cad_building_name(kind)),
+                );
+            };
+            let editing_selected = state.editing && state.selected == id;
+            let snapshot = if editing_selected {
+                match capture_snapshot(catalog, state) {
+                    Ok(snapshot) => Some(snapshot),
+                    Err(error) => return ApiReply::error(409, "cad_edit_failed", error),
+                }
+            } else {
+                None
+            };
             let rotation = Quat::from_rotation_y(rotation_degrees[1].to_radians())
                 * Quat::from_rotation_x(rotation_degrees[0].to_radians())
                 * Quat::from_rotation_z(rotation_degrees[2].to_radians());
-            if state.editing && state.selected == id {
-                if let Err(error) = add_primitive(
-                    catalog,
-                    state,
-                    primitive,
-                    vec3(center[0], center[1], center[2]),
-                    vec3(dimensions[0], dimensions[1], dimensions[2]),
-                    sides,
-                    rotation,
-                ) {
-                    return ApiReply::error(400, "cad_edit_failed", error);
-                }
-                let mesh = catalog
-                    .get(id)
-                    .expect("CAD primitive was added to the selected building");
-                return ApiReply::json(
-                    200,
-                    serde_json::json!({
-                        "kind": cad_building_name(kind),
-                        "vertex_count": mesh.vertices.len(),
-                        "face_count": mesh.face_count(),
-                        "saved": false,
-                    }),
-                );
-            }
-            let parent_id = metadata.radial_main_group_id();
-            if let Err(error) = append_primitive_geometry(
+            let parent_id = if editing_selected && !replace {
+                state
+                    .selected_group
+                    .or_else(|| metadata.radial_main_group_id())
+            } else {
+                metadata.radial_main_group_id()
+            };
+            let faces = match append_primitive_geometry(
                 &mut mesh,
                 &mut metadata,
                 PrimitiveGeometry {
@@ -4580,16 +4602,24 @@ pub fn handle_api_command(
                     sides,
                     rotation,
                     parent_id,
+                    color: color.map(|rgba| Color::from_rgba(rgba[0], rgba[1], rgba[2], rgba[3])),
                 },
             ) {
+                Ok(faces) => faces,
+                Err(error) => return ApiReply::error(400, "cad_edit_failed", error),
+            };
+            if let Err(error) = catalog.replace_mesh(id, mesh.clone(), metadata) {
                 return ApiReply::error(400, "cad_edit_failed", error);
             }
-            *catalog
-                .get_mut(id)
-                .expect("catalog mesh was checked before editing") = mesh.clone();
-            *catalog
-                .metadata_mut(id, None)
-                .expect("catalog metadata was checked before editing") = metadata;
+            if let Some(snapshot) = snapshot {
+                push_undo(state, snapshot);
+                state.dirty = true;
+                state.selection_mode = SelectionMode::Face;
+                state.selected_faces = faces;
+                state.selected_vertices.clear();
+                state.selected_edges.clear();
+                state.selected_group = None;
+            }
             ApiReply::json(
                 200,
                 serde_json::json!({
@@ -7803,6 +7833,8 @@ mod tests {
                 dimensions: [2.0, 1.0, 2.0],
                 rotation_degrees: [0.0; 3],
                 sides: Some(5),
+                color: None,
+                replace: false,
             },
         );
         assert_eq!(added.status, 200);
@@ -7835,6 +7867,8 @@ mod tests {
                 dimensions: [1.0; 3],
                 rotation_degrees: [0.0; 3],
                 sides: Some(17),
+                color: None,
+                replace: false,
             },
         );
         assert_eq!(invalid.status, 400);
@@ -7843,6 +7877,42 @@ mod tests {
         assert_eq!(catalog.get(id).unwrap().face_count(), starting_faces + 5);
         assert!(undo(&mut catalog, &mut state).unwrap());
         assert_eq!(catalog.get(id).unwrap().face_count(), starting_faces);
+    }
+
+    #[test]
+    fn cad_api_can_replace_building_geometry_and_set_primitive_color() {
+        let mut catalog = ObjectCatalog::load();
+        let mut state = CadSceneState::default();
+        let id = ObjectId::PlanetFactory;
+        let original_pivot = catalog.metadata(id, None).unwrap().radial_pivot;
+        let reply = handle_api_command(
+            &mut state,
+            &mut catalog,
+            ApiCommand::AddCadPrimitive {
+                kind: ApiBuildingKind::Factory,
+                primitive: MeshPrimitive::Cube,
+                center: [0.0, 0.5, 0.0],
+                dimensions: [2.0, 1.0, 2.0],
+                rotation_degrees: [0.0; 3],
+                sides: None,
+                color: Some([40, 80, 160, 255]),
+                replace: true,
+            },
+        );
+
+        assert_eq!(reply.status, 200);
+        assert_eq!(reply.body["saved"], false);
+        let mesh = catalog.get(id).unwrap();
+        assert_eq!(mesh.face_count(), 12);
+        assert!(
+            mesh.vertices
+                .iter()
+                .all(|vertex| vertex.color == [40, 80, 160, 255])
+        );
+        assert_eq!(
+            catalog.metadata(id, None).unwrap().radial_pivot,
+            original_pivot
+        );
     }
 
     #[test]

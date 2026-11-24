@@ -99,12 +99,17 @@ indices, and the radial pivot. Supported kinds are `base`, `builder`, `housing`,
 | `PATCH /cad/buildings/{kind}/transform` | Transform the whole building mesh. |
 | `PUT /cad/buildings/{kind}/save` | Persist the in-memory CAD mesh and metadata. |
 
+To start a replacement model, set `replace` to `true` on the first primitive. This clears the
+current in-memory geometry before adding that primitive; it does not change the GLB until the
+separate save request succeeds. Optional `color` is an RGBA array with channel values from 0 to
+255.
+
 Add a primitive to a building mesh:
 
 ```powershell
 curl.exe -X POST "http://127.0.0.1:39123/api/v1/cad/buildings/base/primitives" `
   -H "Content-Type: application/json" `
-  -d '{"primitive":"polygon","sides":6,"center":[0,0.5,0],"dimensions":[2,1,2],"rotation_degrees":[0,0,0]}'
+  -d '{"primitive":"polygon","sides":6,"center":[0,0.5,0],"dimensions":[2,1,2],"rotation_degrees":[0,0,0],"color":[70,180,210,255],"replace":true}'
 ```
 
 Primitive names are `cube`, `polygon`, `sphere`, and `cylinder`. `center` is a position in

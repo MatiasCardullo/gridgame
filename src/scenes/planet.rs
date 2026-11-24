@@ -5937,7 +5937,7 @@ pub fn run(
     let (_wx, wy) = mouse_wheel();
     if !state.debug_camera.enabled && wy.abs() > 0.001 {
         state.target_distance =
-            (state.target_distance - wy * 0.001 * state.target_distance).clamp(1.670, 100.0);
+            (state.target_distance - wy * 0.001 * state.target_distance).clamp(1.66, 100.0);
     }
     state.distance +=
         (state.target_distance - state.distance) * (0.01 * state.distance).clamp(0.05, 100.0);

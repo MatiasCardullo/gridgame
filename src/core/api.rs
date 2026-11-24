@@ -157,6 +157,8 @@ pub enum ApiCommand {
         dimensions: [f32; 3],
         rotation_degrees: [f32; 3],
         sides: Option<usize>,
+        color: Option<[u8; 4]>,
+        replace: bool,
     },
     TransformCadBuilding {
         kind: ApiBuildingKind,
@@ -277,6 +279,10 @@ struct CadPrimitiveBody {
     rotation_degrees: [f32; 3],
     #[serde(default)]
     sides: Option<usize>,
+    #[serde(default)]
+    color: Option<[u8; 4]>,
+    #[serde(default)]
+    replace: bool,
 }
 
 #[derive(Deserialize)]
@@ -596,6 +602,8 @@ fn parse_request(method: &str, url: &str, body: &[u8]) -> Result<ApiCommand, Par
                     dimensions: payload.dimensions,
                     rotation_degrees: payload.rotation_degrees,
                     sides: payload.sides,
+                    color: payload.color,
+                    replace: payload.replace,
                 });
             }
             (Some("transform"), "PATCH") if parts.next().is_none() => {
@@ -919,8 +927,23 @@ mod tests {
                 kind: ApiBuildingKind::Base,
                 primitive: MeshPrimitive::Polygon,
                 sides: Some(5),
+                replace: false,
+                color: None,
                 ..
             })
+        ));
+        assert!(matches!(
+                parse_request(
+                    "POST",
+                    "/api/v1/cad/buildings/factory/primitives",
+                    br#"{"primitive":"cube","center":[0,0.5,0],"dimensions":[2,1,2],"color":[40,80,160,255],"replace":true}"#
+                ),
+                Ok(ApiCommand::AddCadPrimitive {
+                    kind: ApiBuildingKind::Factory,
+                    color: Some([40, 80, 160, 255]),
+                    replace: true,
+                    ..
+                })
         ));
         assert!(matches!(
             parse_request(

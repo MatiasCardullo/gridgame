@@ -1305,6 +1305,14 @@ pub struct PlanetState {
     pub target_rot: Quat,
     pub distance: f32,
     pub target_distance: f32,
+    focus_cell: Option<u32>,
+    focus_yaw: f32,
+    focus_pitch: f32,
+    focus_distance: f32,
+    target_focus_distance: f32,
+    focus_lockout: bool,
+    focus_blend: f32,
+    focus_blend_target: f32,
     pub dragging: bool,
     pub last_mouse: Vec2,
     pub config: PlanetNoiseConfig,
@@ -2324,6 +2332,14 @@ impl PlanetState {
             target_rot: initial_rot,
             distance: 6.0,
             target_distance: 6.0,
+            focus_cell: None,
+            focus_yaw: 0.0,
+            focus_pitch: 0.0,
+            focus_distance: 0.0,
+            target_focus_distance: 0.0,
+            focus_lockout: false,
+            focus_blend: 0.0,
+            focus_blend_target: 0.0,
             dragging: false,
             last_mouse: Vec2::ZERO,
             config,
@@ -5666,6 +5682,103 @@ fn save_mesh_points_from_meshes(meshes: &[Mesh]) {
     }
 }
 
+fn focus_orbit_direction(normal: Vec3, yaw: f32, pitch: f32) -> Vec3 {
+    let (tangent_right, tangent_forward) = focus_tangent_basis(normal);
+    let horizontal = tangent_right * yaw.cos() + tangent_forward * yaw.sin();
+    (normal * pitch.cos() + horizontal * pitch.sin()).normalize_or_zero()
+}
+
+fn focus_tangent_basis(normal: Vec3) -> (Vec3, Vec3) {
+    let reference = if normal.dot(Vec3::Y).abs() > 0.95 {
+        Vec3::X
+    } else {
+        Vec3::Y
+    };
+    let tangent_right = normal.cross(reference).normalize_or_zero();
+    let tangent_forward = tangent_right.cross(normal).normalize_or_zero();
+    (tangent_right, tangent_forward)
+}
+
+fn focus_orbit_angles(normal: Vec3, direction: Vec3) -> (f32, f32) {
+    let (tangent_right, tangent_forward) = focus_tangent_basis(normal);
+    let normal_component = direction.dot(normal).clamp(-1.0, 1.0);
+    let horizontal = direction - normal * normal_component;
+    let yaw = horizontal
+        .dot(tangent_forward)
+        .atan2(horizontal.dot(tangent_right));
+    (yaw, normal_component.acos())
+}
+
+fn focus_surface_radius(direction: Vec3, show_relief: bool, config: &PlanetNoiseConfig) -> f32 {
+    let elevation = if show_relief {
+        let height = height_value(direction, config);
+        if height >= config.sea_level {
+            (height - config.sea_level) * 0.28
+        } else {
+            0.0
+        }
+    } else {
+        0.0
+    };
+    1.6 + elevation
+}
+
+fn focus_pivot(
+    grid: &HexGrid,
+    cell_index: u32,
+    show_relief: bool,
+    config: &PlanetNoiseConfig,
+) -> Option<(Vec3, Vec3)> {
+    let normal = grid.vertices.get(cell_index as usize)?.normalize_or_zero();
+    if normal.length_squared() < 0.5 {
+        return None;
+    }
+    let point = normal * focus_surface_radius(normal, show_relief, config);
+    Some((point, normal))
+}
+
+fn focus_camera_pose(
+    pivot: Vec3,
+    normal: Vec3,
+    yaw: f32,
+    pitch: f32,
+    distance: f32,
+    show_relief: bool,
+    config: &PlanetNoiseConfig,
+) -> (Vec3, Vec3, f32) {
+    let orbit_direction = focus_orbit_direction(normal, yaw, pitch);
+    let candidate = pivot + orbit_direction * distance;
+    let shell_radius =
+        focus_surface_radius(candidate.normalize_or_zero(), show_relief, config) + 0.035;
+    let projection = pivot.dot(orbit_direction);
+    let discriminant = (projection * projection + shell_radius * shell_radius
+        - pivot.length_squared())
+    .max(0.0)
+    .sqrt();
+    let safe_distance = distance.max((-projection + discriminant).max(0.0));
+    let position = pivot + orbit_direction * safe_distance;
+    let forward = (pivot - position).normalize_or_zero();
+    let up = (normal - forward * normal.dot(forward)).normalize_or_zero();
+    (position, up, safe_distance)
+}
+
+fn blend_focus_camera(
+    planet_position: Vec3,
+    planet_up: Vec3,
+    focus_pivot: Vec3,
+    focus_position: Vec3,
+    focus_up: Vec3,
+    blend: f32,
+) -> (Vec3, Vec3, Vec3) {
+    let blend = blend.clamp(0.0, 1.0);
+    let blend = blend * blend * (3.0 - 2.0 * blend);
+    (
+        planet_position.lerp(focus_position, blend),
+        Vec3::ZERO.lerp(focus_pivot, blend),
+        planet_up.lerp(focus_up, blend).normalize_or_zero(),
+    )
+}
+
 // Maps camera distance to mesh subdivision detail levels.
 fn zoom_to_subdivisions(distance: f32) -> u8 {
     if distance < 4.0 {
@@ -5836,9 +5949,34 @@ pub fn run(
         state.debug_camera.show_original_frustum = !state.debug_camera.show_original_frustum;
     }
 
-    let orbit_camera_pos = (state.camera_rot * vec3(0.0, 0.0, 1.0)) * state.distance;
+    let planet_camera_pos = (state.camera_rot * Vec3::Z) * state.distance;
+    let planet_camera_up = state.camera_rot * Vec3::Y;
+    let (orbit_camera_pos, orbit_camera_target, _) = state
+        .focus_cell
+        .and_then(|cell| {
+            let grid = state.sim_grid.as_ref()?;
+            let (pivot, normal) = focus_pivot(grid, cell, state.show_relief, &state.config)?;
+            let (focus_position, focus_up, _) = focus_camera_pose(
+                pivot,
+                normal,
+                state.focus_yaw,
+                state.focus_pitch,
+                state.focus_distance,
+                state.show_relief,
+                &state.config,
+            );
+            Some(blend_focus_camera(
+                planet_camera_pos,
+                planet_camera_up,
+                pivot,
+                focus_position,
+                focus_up,
+                state.focus_blend,
+            ))
+        })
+        .unwrap_or((planet_camera_pos, Vec3::ZERO, planet_camera_up));
     if !was_debug_camera_enabled && state.debug_camera.enabled {
-        let orbit_forward = (-orbit_camera_pos).normalize_or_zero();
+        let orbit_forward = (orbit_camera_target - orbit_camera_pos).normalize_or_zero();
         let (yaw, pitch) = yaw_pitch_from_forward(orbit_forward);
         state.debug_camera.position = orbit_camera_pos;
         state.debug_camera.yaw = yaw;
@@ -5852,11 +5990,20 @@ pub fn run(
             state.last_mouse = mouse;
         } else {
             let delta = mouse - state.last_mouse;
-            let up_dir = state.target_rot * vec3(0.0, 1.0, 0.0);
-            let right_dir = state.target_rot * vec3(1.0, 0.0, 0.0);
-            let yaw_rot = Quat::from_axis_angle(up_dir, -delta.x * 0.01);
-            let pitch_rot = Quat::from_axis_angle(right_dir, -delta.y * 0.01);
-            state.target_rot = (yaw_rot * pitch_rot) * state.target_rot;
+            if state.focus_cell.is_some() {
+                state.focus_yaw -= delta.x * 0.01;
+                state.focus_pitch = (state.focus_pitch - delta.y * 0.01).clamp(0.06, 1.30);
+            }
+            if state.focus_cell.is_none()
+                || state.focus_blend < 0.995
+                || state.focus_blend_target < 0.5
+            {
+                let up_dir = state.target_rot * vec3(0.0, 1.0, 0.0);
+                let right_dir = state.target_rot * vec3(1.0, 0.0, 0.0);
+                let yaw_rot = Quat::from_axis_angle(up_dir, -delta.x * 0.01);
+                let pitch_rot = Quat::from_axis_angle(right_dir, -delta.y * 0.01);
+                state.target_rot = (yaw_rot * pitch_rot) * state.target_rot;
+            }
             state.last_mouse = mouse;
         }
     } else {
@@ -5927,20 +6074,109 @@ pub fn run(
     }
     if !state.debug_camera.enabled && (yaw_input != 0.0 || pitch_input != 0.0) {
         let speed = 1.6;
-        let up_dir = state.target_rot * vec3(0.0, 1.0, 0.0);
-        let right_dir = state.target_rot * vec3(1.0, 0.0, 0.0);
-        let yaw_rot = Quat::from_axis_angle(up_dir, yaw_input * speed * frame_time);
-        let pitch_rot = Quat::from_axis_angle(right_dir, pitch_input * speed * frame_time);
-        state.target_rot = (yaw_rot * pitch_rot) * state.target_rot;
+        if state.focus_cell.is_some() {
+            state.focus_yaw += yaw_input * speed * frame_time;
+            state.focus_pitch =
+                (state.focus_pitch - pitch_input * speed * frame_time).clamp(0.06, 1.30);
+        }
+        if state.focus_cell.is_none() || state.focus_blend < 0.995 || state.focus_blend_target < 0.5
+        {
+            let up_dir = state.target_rot * vec3(0.0, 1.0, 0.0);
+            let right_dir = state.target_rot * vec3(1.0, 0.0, 0.0);
+            let yaw_rot = Quat::from_axis_angle(up_dir, yaw_input * speed * frame_time);
+            let pitch_rot = Quat::from_axis_angle(right_dir, pitch_input * speed * frame_time);
+            state.target_rot = (yaw_rot * pitch_rot) * state.target_rot;
+        }
     }
 
     let (_wx, wy) = mouse_wheel();
-    if !state.debug_camera.enabled && wy.abs() > 0.001 {
+    if !state.debug_camera.enabled && state.focus_cell.is_some() {
+        if state.focus_blend_target > 0.5 && wy.abs() > 0.001 {
+            let next_focus_distance =
+                state.target_focus_distance - wy * 0.001 * state.target_focus_distance.max(0.10);
+            if wy < 0.0 && next_focus_distance > 1.65 {
+                if let Some((pivot, normal)) = state.focus_cell.and_then(|cell| {
+                    state
+                        .sim_grid
+                        .as_ref()
+                        .and_then(|grid| focus_pivot(grid, cell, state.show_relief, &state.config))
+                }) {
+                    let (position, up, _) = focus_camera_pose(
+                        pivot,
+                        normal,
+                        state.focus_yaw,
+                        state.focus_pitch,
+                        state.focus_distance,
+                        state.show_relief,
+                        &state.config,
+                    );
+                    let outward = position.normalize_or_zero();
+                    let rotation = quat_from_forward_up(outward, up);
+                    state.distance = position.length();
+                    state.target_distance = state.distance;
+                    state.camera_rot = rotation;
+                    state.target_rot = rotation;
+                    state.focus_lockout = true;
+                    state.focus_blend_target = 0.0;
+                }
+            } else {
+                state.target_focus_distance = next_focus_distance.clamp(0.10, 1.65);
+            }
+        }
+        if state.focus_blend_target > 0.5 {
+            state.focus_distance += (state.target_focus_distance - state.focus_distance) * 0.12;
+        }
+    } else if !state.debug_camera.enabled && wy.abs() > 0.001 {
         state.target_distance =
             (state.target_distance - wy * 0.001 * state.target_distance).clamp(1.66, 100.0);
     }
-    state.distance +=
-        (state.target_distance - state.distance) * (0.01 * state.distance).clamp(0.05, 100.0);
+    if state.focus_cell.is_none() {
+        if wy > 0.001 || state.distance >= 2.8 {
+            state.focus_lockout = false;
+        }
+        state.distance +=
+            (state.target_distance - state.distance) * (0.01 * state.distance).clamp(0.05, 100.0);
+        if !state.debug_camera.enabled && !state.focus_lockout && state.distance <= 1.7 {
+            if let Some(grid) = state.sim_grid.as_ref() {
+                let camera_direction = (state.camera_rot * Vec3::Z).normalize_or_zero();
+                if let Some(cell_index) = grid
+                    .vertices
+                    .iter()
+                    .enumerate()
+                    .map(|(index, vertex)| (index as u32, vertex.normalize_or_zero()))
+                    .max_by(|(_, a), (_, b)| {
+                        a.dot(camera_direction).total_cmp(&b.dot(camera_direction))
+                    })
+                    .map(|(index, _)| index)
+                {
+                    if let Some((pivot, normal)) =
+                        focus_pivot(grid, cell_index, state.show_relief, &state.config)
+                    {
+                        let camera_position = camera_direction * state.distance;
+                        let relative_direction = (camera_position - pivot).normalize_or_zero();
+                        let initial_distance = (camera_position - pivot).length().max(0.10);
+                        state.focus_cell = Some(cell_index);
+                        state.focus_distance = initial_distance;
+                        state.target_focus_distance = initial_distance;
+                        state.focus_blend_target = 1.0;
+                        let (yaw, pitch) = focus_orbit_angles(normal, relative_direction);
+                        state.focus_yaw = yaw;
+                        state.focus_pitch = pitch.clamp(0.06, 1.30);
+                        state.target_distance = state.distance;
+                    }
+                }
+            }
+        }
+    }
+    if state.focus_cell.is_some() {
+        let blend_speed = (1.0 - (-8.0 * frame_time).exp()).clamp(0.0, 1.0);
+        state.focus_blend += (state.focus_blend_target - state.focus_blend) * blend_speed;
+        if state.focus_blend_target < 0.5 && state.focus_blend < 0.005 {
+            state.focus_cell = None;
+            state.focus_blend = 0.0;
+            state.focus_blend_target = 0.0;
+        }
+    }
     let desired_subdivisions =
         zoom_to_subdivisions_hysteresis(state.distance, state.config.subdivisions);
     if state.show_relief && desired_subdivisions != state.config.subdivisions {
@@ -5974,13 +6210,41 @@ pub fn run(
     let camera_animating = state.dragging
         || wy.abs() > 0.01
         || (state.target_distance - state.distance).abs() > 0.02
+        || (state.focus_cell.is_some()
+            && ((state.target_focus_distance - state.focus_distance).abs() > 0.02
+                || (state.focus_blend_target - state.focus_blend).abs() > 0.005))
         || rot_delta > 0.001;
 
-    let orbit_camera_pos = (state.camera_rot * vec3(0.0, 0.0, 1.0)) * state.distance;
+    let planet_camera_pos = (state.camera_rot * Vec3::Z) * state.distance;
+    let planet_camera_up = state.camera_rot * Vec3::Y;
+    let (orbit_camera_pos, orbit_target, orbit_up) = state
+        .focus_cell
+        .and_then(|cell| {
+            let grid = state.sim_grid.as_ref()?;
+            let (pivot, normal) = focus_pivot(grid, cell, state.show_relief, &state.config)?;
+            let (focus_position, focus_up, _) = focus_camera_pose(
+                pivot,
+                normal,
+                state.focus_yaw,
+                state.focus_pitch,
+                state.focus_distance,
+                state.show_relief,
+                &state.config,
+            );
+            Some(blend_focus_camera(
+                planet_camera_pos,
+                planet_camera_up,
+                pivot,
+                focus_position,
+                focus_up,
+                state.focus_blend,
+            ))
+        })
+        .unwrap_or_else(|| (planet_camera_pos, Vec3::ZERO, planet_camera_up));
     let orbit_camera = Camera3D {
         position: orbit_camera_pos,
-        target: vec3(0.0, 0.0, 0.0),
-        up: state.camera_rot * vec3(0.0, 1.0, 0.0),
+        target: orbit_target,
+        up: orbit_up,
         fovy: 45.0,
         z_near: 0.05,
         z_far: 200.0,
@@ -7562,6 +7826,55 @@ mod tests {
     use crate::core::planet_resources::{
         LithologyKind, PlanetCellState, PlanetDeposit, sim_world_for_tests,
     };
+
+    #[test]
+    fn focus_orbit_clamps_camera_outside_relief_surface() {
+        let config = PlanetNoiseConfig::default();
+        let normal = Vec3::Z;
+        let pivot = normal * focus_surface_radius(normal, true, &config);
+        let (position, _, _) = focus_camera_pose(pivot, normal, 0.8, 1.25, 0.12, true, &config);
+        let minimum_radius =
+            focus_surface_radius(position.normalize_or_zero(), true, &config) + 0.034;
+
+        assert!(position.length() >= minimum_radius);
+    }
+
+    #[test]
+    fn focus_orbit_angles_recreate_camera_direction() {
+        let normal = Vec3::new(0.3, 0.7, 0.6).normalize();
+        let expected = focus_orbit_direction(normal, -1.1, 0.9);
+        let (yaw, pitch) = focus_orbit_angles(normal, expected);
+
+        assert!(focus_orbit_direction(normal, yaw, pitch).distance(expected) < 1e-5);
+    }
+
+    #[test]
+    fn focus_camera_blend_interpolates_from_planet_orbit() {
+        let planet_position = Vec3::Z * 1.7;
+        let focus_position = Vec3::X * 1.7;
+        let focus_pivot = Vec3::X * 1.6;
+        let (position, target, _) = blend_focus_camera(
+            planet_position,
+            Vec3::Y,
+            focus_pivot,
+            focus_position,
+            Vec3::Y,
+            0.5,
+        );
+
+        assert!(position.distance((planet_position + focus_position) * 0.5) < 1e-5);
+        assert!(target.distance(focus_pivot * 0.5) < 1e-5);
+    }
+
+    #[test]
+    fn planet_orbit_rotation_preserves_camera_up_when_leaving_focus() {
+        let outward = Vec3::new(0.3, 0.7, 0.6).normalize();
+        let desired_up = (Vec3::Y - outward * Vec3::Y.dot(outward)).normalize();
+        let rotation = quat_from_forward_up(outward, desired_up);
+
+        assert!((rotation * Vec3::Z).distance(outward) < 1e-5);
+        assert!((rotation * Vec3::Y).distance(desired_up) < 1e-5);
+    }
 
     #[test]
     fn network_cursor_snaps_to_center_corner_and_side_midpoint() {

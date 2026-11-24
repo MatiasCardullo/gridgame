@@ -8,6 +8,7 @@ use serde_json::{Value, json};
 use tiny_http::{Header, Request, Response, Server, StatusCode};
 
 use crate::core::Axial;
+use crate::core::object_assets::MeshPrimitive;
 #[cfg(test)]
 use crate::core::planet_placement::NetworkAnchor;
 use crate::core::planet_placement::{NetworkKind, NetworkPlacement};
@@ -145,6 +146,27 @@ pub enum ApiCommand {
         hex: Axial,
         config: ApiMechanicArmConfig,
     },
+    CadBuildings,
+    CadBuilding {
+        kind: ApiBuildingKind,
+    },
+    AddCadPrimitive {
+        kind: ApiBuildingKind,
+        primitive: MeshPrimitive,
+        center: [f32; 3],
+        dimensions: [f32; 3],
+        rotation_degrees: [f32; 3],
+        sides: Option<usize>,
+    },
+    TransformCadBuilding {
+        kind: ApiBuildingKind,
+        translation: [f32; 3],
+        rotation_degrees: [f32; 3],
+        scale: [f32; 3],
+    },
+    SaveCadBuilding {
+        kind: ApiBuildingKind,
+    },
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -243,6 +265,32 @@ struct SpawnUnitBody {
     preset: ApiUnitPreset,
     #[serde(default)]
     nodes: ApiUnitNodes,
+}
+
+#[derive(Deserialize)]
+struct CadPrimitiveBody {
+    primitive: MeshPrimitive,
+    center: [f32; 3],
+    #[serde(default = "unit_dimensions")]
+    dimensions: [f32; 3],
+    #[serde(default)]
+    rotation_degrees: [f32; 3],
+    #[serde(default)]
+    sides: Option<usize>,
+}
+
+#[derive(Deserialize)]
+struct CadTransformBody {
+    #[serde(default)]
+    translation: [f32; 3],
+    #[serde(default)]
+    rotation_degrees: [f32; 3],
+    #[serde(default = "unit_dimensions")]
+    scale: [f32; 3],
+}
+
+fn unit_dimensions() -> [f32; 3] {
+    [1.0; 3]
 }
 
 #[derive(Deserialize)]
@@ -531,6 +579,40 @@ fn parse_request(method: &str, url: &str, body: &[u8]) -> Result<ApiCommand, Par
             nodes: payload.nodes,
         });
     }
+    if path == format!("{API_PREFIX}/cad/buildings") && method == "GET" {
+        return Ok(ApiCommand::CadBuildings);
+    }
+    if let Some(rest) = path.strip_prefix(&format!("{API_PREFIX}/cad/buildings/")) {
+        let mut parts = rest.split('/');
+        let kind = parse_building_kind(parts.next().unwrap_or_default())?;
+        match (parts.next(), method) {
+            (None, "GET") => return Ok(ApiCommand::CadBuilding { kind }),
+            (Some("primitives"), "POST") if parts.next().is_none() => {
+                let payload = parse_json_body::<CadPrimitiveBody>(body)?;
+                return Ok(ApiCommand::AddCadPrimitive {
+                    kind,
+                    primitive: payload.primitive,
+                    center: payload.center,
+                    dimensions: payload.dimensions,
+                    rotation_degrees: payload.rotation_degrees,
+                    sides: payload.sides,
+                });
+            }
+            (Some("transform"), "PATCH") if parts.next().is_none() => {
+                let payload = parse_json_body::<CadTransformBody>(body)?;
+                return Ok(ApiCommand::TransformCadBuilding {
+                    kind,
+                    translation: payload.translation,
+                    rotation_degrees: payload.rotation_degrees,
+                    scale: payload.scale,
+                });
+            }
+            (Some("save"), "PUT") if parts.next().is_none() => {
+                return Ok(ApiCommand::SaveCadBuilding { kind });
+            }
+            _ => {}
+        }
+    }
     if let Some(command) = parse_interior_request(method, path, body)? {
         return Ok(command);
     }
@@ -539,6 +621,24 @@ fn parse_request(method: &str, url: &str, body: &[u8]) -> Result<ApiCommand, Par
         "not_found",
         format!("no API route for {method} {path}"),
     ))
+}
+
+fn parse_building_kind(value: &str) -> Result<ApiBuildingKind, ParseError> {
+    match value {
+        "base" => Ok(ApiBuildingKind::Base),
+        "builder" => Ok(ApiBuildingKind::Builder),
+        "housing" => Ok(ApiBuildingKind::Housing),
+        "factory" => Ok(ApiBuildingKind::Factory),
+        "mine" => Ok(ApiBuildingKind::Mine),
+        "warehouse" => Ok(ApiBuildingKind::Warehouse),
+        "refuel" => Ok(ApiBuildingKind::Refuel),
+        "logistics" => Ok(ApiBuildingKind::Logistics),
+        _ => Err(parse_error(
+            400,
+            "invalid_building_kind",
+            format!("unknown CAD building kind '{value}'"),
+        )),
+    }
 }
 
 fn parse_interior_request(
@@ -795,6 +895,56 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn parses_cad_building_design_commands() {
+        assert!(matches!(
+            parse_request("GET", "/api/v1/cad/buildings", &[]),
+            Ok(ApiCommand::CadBuildings)
+        ));
+        assert!(matches!(
+            parse_request("GET", "/api/v1/cad/buildings/factory", &[]),
+            Ok(ApiCommand::CadBuilding {
+                kind: ApiBuildingKind::Factory
+            })
+        ));
+        assert!(matches!(
+            parse_request(
+                "POST",
+                "/api/v1/cad/buildings/base/primitives",
+                br#"{"primitive":"polygon","sides":5,"center":[0,1,0],"dimensions":[2,1,2]}"#
+            ),
+            Ok(ApiCommand::AddCadPrimitive {
+                kind: ApiBuildingKind::Base,
+                primitive: MeshPrimitive::Polygon,
+                sides: Some(5),
+                ..
+            })
+        ));
+        assert!(matches!(
+            parse_request(
+                "PATCH",
+                "/api/v1/cad/buildings/mine/transform",
+                br#"{"translation":[1,0,0],"rotation_degrees":[0,90,0],"scale":[1,2,1]}"#
+            ),
+            Ok(ApiCommand::TransformCadBuilding {
+                kind: ApiBuildingKind::Mine,
+                ..
+            })
+        ));
+        assert!(matches!(
+            parse_request("PUT", "/api/v1/cad/buildings/base/save", &[]),
+            Ok(ApiCommand::SaveCadBuilding {
+                kind: ApiBuildingKind::Base
+            })
+        ));
+        assert_eq!(
+            parse_request("GET", "/api/v1/cad/buildings/unknown", &[])
+                .unwrap_err()
+                .code,
+            "invalid_building_kind"
+        );
     }
 
     #[test]

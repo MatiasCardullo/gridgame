@@ -5,8 +5,8 @@ does not accept connections from other computers. There is no authentication; an
 process able to connect can issue gameplay commands. The server also rejects unexpected
 `Host` and browser `Origin` headers; `POST` commands must use `application/json`.
 
-All endpoints are under `/api/v1`. Requests are handled by the main game loop, which
-remains the only code that mutates planet state. If the planet simulation is still loading,
+All endpoints are under `/api/v1`. Requests are handled by the main game loop, which owns
+mutations of planet state and the CAD asset catalog. If the planet simulation is still loading,
 `GET /status` returns `planet_ready: false`; other planet-dependent requests return `503`.
 
 ## Read state
@@ -19,6 +19,8 @@ remains the only code that mutates planet state. If the planet simulation is sti
 | `GET /buildings` | Read buildings, triangle slots, construction progress, and stored resources. |
 | `GET /networks` | Read placed Route and RailTrack segments and their endpoint geometry. |
 | `GET /units` | Read planet units, route nodes, location, fuel, and cargo. |
+| `GET /cad/buildings` | List building meshes available to the CAD API. |
+| `GET /cad/buildings/{kind}` | Read a building mesh's vertex positions, triangle indices, and radial pivot. |
 | `GET /bases/{cell}/interior` | Inspect interior blocks, machine inventories, assembler state, arms, forklifts, and logistics requests for a Base. |
 | `GET /screenshot` | Capture the currently rendered frame as a PNG image. |
 
@@ -82,6 +84,45 @@ behavior. Remove a network segment by its returned ID:
 
 ```powershell
 curl.exe -X DELETE "http://127.0.0.1:39123/api/v1/networks/7"
+```
+
+## Design building meshes
+
+The CAD API uses the same building meshes as the editor. `GET /cad/buildings` lists the
+available building assets; `GET /cad/buildings/{kind}` returns vertex positions, triangle
+indices, and the radial pivot. Supported kinds are `base`, `builder`, `housing`, `factory`,
+`mine`, `warehouse`, `refuel`, and `logistics`.
+
+| Method and path | Description |
+| --- | --- |
+| `POST /cad/buildings/{kind}/primitives` | Add a cube, polygon, sphere, or cylinder to a building mesh. |
+| `PATCH /cad/buildings/{kind}/transform` | Transform the whole building mesh. |
+| `PUT /cad/buildings/{kind}/save` | Persist the in-memory CAD mesh and metadata. |
+
+Add a primitive to a building mesh:
+
+```powershell
+curl.exe -X POST "http://127.0.0.1:39123/api/v1/cad/buildings/base/primitives" `
+  -H "Content-Type: application/json" `
+  -d '{"primitive":"polygon","sides":6,"center":[0,0.5,0],"dimensions":[2,1,2],"rotation_degrees":[0,0,0]}'
+```
+
+Primitive names are `cube`, `polygon`, `sphere`, and `cylinder`. `center` is a position in
+model units; `dimensions` scales the primitive on each axis. `rotation_degrees` is optional
+and defaults to zero. Polygon primitives require `sides` from 3 to 16.
+
+Transform the entire mesh about the origin:
+
+```powershell
+curl.exe -X PATCH "http://127.0.0.1:39123/api/v1/cad/buildings/base/transform" `
+  -H "Content-Type: application/json" `
+  -d '{"translation":[0,0,0],"rotation_degrees":[0,45,0],"scale":[1,1,1]}'
+```
+
+CAD edits update the running catalog but are not written to disk until saved:
+
+```powershell
+curl.exe -X PUT "http://127.0.0.1:39123/api/v1/cad/buildings/base/save"
 ```
 
 Create a unit:

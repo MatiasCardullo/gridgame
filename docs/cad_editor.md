@@ -28,6 +28,9 @@ the last saved version.
   close the input or press `Escape` to dismiss it.
 - Use the primitive placement tools to add geometry; confirm placement with
   `Enter` and cancel with `Escape`.
+- **Polygon** creates a flat regular polygon. Place its center, enter a side
+  count from 3 to 16, then click the viewport to size it or use **Create** for
+  the default size. The former **Plane** button is replaced.
 - **Trim** starts by selecting target face(s); `Shift` toggles faces in the
   selection. Press `Enter` to choose cutter face(s), then select the mesh faces
   whose intersections should split the targets. Press `Enter` to split; both
@@ -67,8 +70,7 @@ The **Same building** condition reuses the selected cell's building type, while
 **Other building** chooses another building or route. **Shuffle neighbors**
 changes the preview conditions. Conditioned geometry is normalized against the
 unconditioned model so changing neighbor conditions does not rescale the shared
-building geometry. Mesh View shows a hex outline for the planet cell boundary
-and frames that guide at the same apparent scale as the interaction preview.
+building geometry.
 
 ## Radial Repeat and UCS origin
 

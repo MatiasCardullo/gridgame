@@ -107,25 +107,42 @@ async fn main() {
                         }),
                     )
                 }
-                command => match planet_state.as_mut() {
-                    Some(state) => state.handle_api_command(command),
-                    None => match command {
-                        core::api::ApiCommand::Status => core::api::ApiReply::json(
-                            200,
-                            serde_json::json!({
-                                "planet_ready": false,
-                                "cell_count": null,
-                                "building_count": 0,
-                                "unit_count": 0,
-                            }),
-                        ),
-                        _ => core::api::ApiReply::error(
-                            503,
-                            "planet_unavailable",
-                            "planet state is not available yet",
-                        ),
-                    },
-                },
+                command => {
+                    if matches!(
+                        &command,
+                        core::api::ApiCommand::CadBuildings
+                            | core::api::ApiCommand::CadBuilding { .. }
+                            | core::api::ApiCommand::AddCadPrimitive { .. }
+                            | core::api::ApiCommand::TransformCadBuilding { .. }
+                            | core::api::ApiCommand::SaveCadBuilding { .. }
+                    ) {
+                        scenes::cad::handle_api_command(
+                            &mut cad_state,
+                            &mut object_catalog,
+                            command,
+                        )
+                    } else {
+                        match planet_state.as_mut() {
+                            Some(state) => state.handle_api_command(command),
+                            None => match command {
+                                core::api::ApiCommand::Status => core::api::ApiReply::json(
+                                    200,
+                                    serde_json::json!({
+                                        "planet_ready": false,
+                                        "cell_count": null,
+                                        "building_count": 0,
+                                        "unit_count": 0,
+                                    }),
+                                ),
+                                _ => core::api::ApiReply::error(
+                                    503,
+                                    "planet_unavailable",
+                                    "planet state is not available yet",
+                                ),
+                            },
+                        }
+                    }
+                }
             };
             if message.reply.send(reply).is_err() {
                 eprintln!("GridGame API client disconnected before receiving a reply");

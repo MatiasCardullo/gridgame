@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 
 use macroquad::prelude::*;
 
+use crate::core::api::{ApiBuildingKind, ApiCommand, ApiReply};
 use crate::core::object_assets::{
     BUILDING_PREVIEW_CELL_GUIDE_RADIUS, BUILDING_PREVIEW_CELL_RADIUS, EditableMesh,
     FaceGroupProgram, FaceMetadata, MeshPrimitive, ObjectCatalog, ObjectCategory, ObjectId,
@@ -199,6 +200,16 @@ struct PrimitivePlacement {
     input_focused: bool,
     input_selected: bool,
     dimension_index: usize,
+}
+
+#[derive(Clone, Copy)]
+struct PrimitiveGeometry {
+    primitive: MeshPrimitive,
+    center: Vec3,
+    dimensions: Vec3,
+    sides: usize,
+    rotation: Quat,
+    parent_id: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1000,20 +1011,24 @@ fn snap_model_point_to_grid_layout(
 fn primitive_dimension_count(primitive: MeshPrimitive) -> usize {
     match primitive {
         MeshPrimitive::Cube | MeshPrimitive::Sphere => 1,
-        MeshPrimitive::Plane | MeshPrimitive::Cylinder => 2,
+        MeshPrimitive::Polygon => 1,
+        MeshPrimitive::Cylinder => 2,
     }
 }
 
 fn primitive_default_dimensions(primitive: MeshPrimitive) -> &'static str {
     match primitive {
         MeshPrimitive::Cube => "1",
-        MeshPrimitive::Plane => "1, 1",
+        MeshPrimitive::Polygon => "6",
         MeshPrimitive::Sphere => "0.5",
         MeshPrimitive::Cylinder => "0.5, 1",
     }
 }
 
 fn parse_dimension_values(primitive: MeshPrimitive, text: &str) -> Result<Vec<f32>, String> {
+    if primitive == MeshPrimitive::Polygon {
+        return Ok(vec![parse_polygon_sides(text)? as f32]);
+    }
     let count = primitive_dimension_count(primitive);
     let values = text
         .split(|character: char| character == ',' || character.is_whitespace())
@@ -1027,9 +1042,7 @@ fn parse_dimension_values(primitive: MeshPrimitive, text: &str) -> Result<Vec<f3
     if values.len() != count {
         return Err(match primitive {
             MeshPrimitive::Cube => "Enter one cube edge length".to_string(),
-            MeshPrimitive::Plane => {
-                "Enter plane width and length, separated by a comma".to_string()
-            }
+            MeshPrimitive::Polygon => "Enter a whole number of polygon sides".to_string(),
             MeshPrimitive::Sphere => "Enter one sphere radius".to_string(),
             MeshPrimitive::Cylinder => {
                 "Enter cylinder radius and height, separated by a comma".to_string()
@@ -1045,11 +1058,30 @@ fn parse_dimension_values(primitive: MeshPrimitive, text: &str) -> Result<Vec<f3
     Ok(values)
 }
 
+fn parse_polygon_sides(text: &str) -> Result<usize, String> {
+    let sides = text
+        .trim()
+        .parse::<usize>()
+        .map_err(|_| "Enter a whole number of polygon sides".to_string())?;
+    if !(3..=16).contains(&sides) {
+        return Err("Polygon sides must be between 3 and 16".to_string());
+    }
+    Ok(sides)
+}
+
+fn primitive_sides(primitive: MeshPrimitive, text: &str) -> Result<usize, String> {
+    if primitive == MeshPrimitive::Polygon {
+        parse_polygon_sides(text)
+    } else {
+        Ok(6)
+    }
+}
+
 fn parse_primitive_dimensions(primitive: MeshPrimitive, text: &str) -> Result<Vec3, String> {
     let values = parse_dimension_values(primitive, text)?;
     Ok(match primitive {
         MeshPrimitive::Cube => vec3(values[0], values[0], values[0]),
-        MeshPrimitive::Plane => vec3(values[0], 1.0, values[1]),
+        MeshPrimitive::Polygon => vec3(1.0, 1.0, 1.0),
         MeshPrimitive::Sphere => vec3(values[0] * 2.0, values[0] * 2.0, values[0] * 2.0),
         MeshPrimitive::Cylinder => vec3(values[0] * 2.0, values[1], values[0] * 2.0),
     })
@@ -1059,6 +1091,15 @@ fn adjust_placement_dimension(
     placement: &mut PrimitivePlacement,
     delta: f32,
 ) -> Result<(), String> {
+    if placement.primitive == MeshPrimitive::Polygon {
+        let sides = parse_polygon_sides(&placement.dimensions)?;
+        placement.dimensions = (sides as i32 + delta.signum() as i32)
+            .clamp(3, 16)
+            .to_string();
+        placement.input_focused = true;
+        placement.input_selected = false;
+        return Ok(());
+    }
     let mut values = parse_dimension_values(placement.primitive, &placement.dimensions)?;
     let mut tokens = placement
         .dimensions
@@ -1092,8 +1133,7 @@ fn select_placement_dimension(placement: &mut PrimitivePlacement, direction: i32
 fn placement_dimension_label(placement: &PrimitivePlacement) -> &'static str {
     match (placement.primitive, placement.dimension_index) {
         (MeshPrimitive::Cube, _) => "edge length",
-        (MeshPrimitive::Plane, 0) => "width",
-        (MeshPrimitive::Plane, _) => "length",
+        (MeshPrimitive::Polygon, _) => "sides",
         (MeshPrimitive::Sphere, _) => "radius",
         (MeshPrimitive::Cylinder, 0) => "radius",
         (MeshPrimitive::Cylinder, _) => "height",
@@ -1106,7 +1146,7 @@ fn dimensions_from_click(primitive: MeshPrimitive, center: Vec3, point: Vec3) ->
         MeshPrimitive::Cube | MeshPrimitive::Sphere | MeshPrimitive::Cylinder => {
             vec3(diameter, diameter, diameter)
         }
-        MeshPrimitive::Plane => vec3(diameter, 1.0, diameter),
+        MeshPrimitive::Polygon => vec3(diameter, 1.0, diameter),
     }
 }
 
@@ -3221,36 +3261,27 @@ fn add_primitive(
     primitive: MeshPrimitive,
     center: Vec3,
     dimensions: Vec3,
+    sides: usize,
+    rotation: Quat,
 ) -> Result<(), String> {
     let snapshot = capture_snapshot(catalog, state)?;
-    let shape = EditableMesh::primitive(primitive).transformed(|position| {
-        center
-            + vec3(
-                position.x * dimensions.x,
-                position.y * dimensions.y,
-                position.z * dimensions.z,
-            )
-    });
-    let first_face = snapshot.mesh.face_count();
-    let face_count = shape.face_count();
     let mut mesh = snapshot.mesh.clone();
-    mesh.append(&shape)?;
     let mut metadata = snapshot.metadata.clone();
-    metadata.face_names.resize(first_face + face_count, None);
     let parent_id = state
         .selected_group
         .or_else(|| metadata.radial_main_group_id());
-    if let Some(group_id) = parent_id {
-        if metadata.group_is_locked(group_id) {
-            return Err("Unlock the group before adding geometry".to_string());
-        }
-        if metadata.group_is_hidden(group_id) {
-            return Err("Show the group before adding geometry".to_string());
-        }
-    }
-    let faces = (first_face..first_face + face_count).collect::<Vec<_>>();
-    let group_id = metadata.create_group_under(&faces, parent_id)?;
-    metadata.rename_group(group_id, primitive_group_name(primitive).to_string())?;
+    let faces = append_primitive_geometry(
+        &mut mesh,
+        &mut metadata,
+        PrimitiveGeometry {
+            primitive,
+            center,
+            dimensions,
+            sides,
+            rotation,
+            parent_id,
+        },
+    )?;
     *selected_mesh_mut(catalog, state)
         .ok_or_else(|| "Selected object is unavailable".to_string())? = mesh;
     *selected_metadata_mut(catalog, state)
@@ -3266,10 +3297,52 @@ fn add_primitive(
     Ok(())
 }
 
+fn append_primitive_geometry(
+    mesh: &mut EditableMesh,
+    metadata: &mut FaceMetadata,
+    geometry: PrimitiveGeometry,
+) -> Result<Vec<usize>, String> {
+    if let Some(group_id) = geometry.parent_id {
+        if metadata.group_is_locked(group_id) {
+            return Err("Unlock the group before adding geometry".to_string());
+        }
+        if metadata.group_is_hidden(group_id) {
+            return Err("Show the group before adding geometry".to_string());
+        }
+    }
+    let shape = primitive_mesh(geometry.primitive, geometry.sides)?.transformed(|position| {
+        geometry.center
+            + geometry.rotation
+                * vec3(
+                    position.x * geometry.dimensions.x,
+                    position.y * geometry.dimensions.y,
+                    position.z * geometry.dimensions.z,
+                )
+    });
+    let first_face = mesh.face_count();
+    let face_count = shape.face_count();
+    mesh.append(&shape)?;
+    metadata.face_names.resize(first_face + face_count, None);
+    let faces = (first_face..first_face + face_count).collect::<Vec<_>>();
+    let group_id = metadata.create_group_under(&faces, geometry.parent_id)?;
+    metadata.rename_group(
+        group_id,
+        primitive_group_name(geometry.primitive).to_string(),
+    )?;
+    Ok(faces)
+}
+
+fn primitive_mesh(primitive: MeshPrimitive, sides: usize) -> Result<EditableMesh, String> {
+    match primitive {
+        MeshPrimitive::Polygon => EditableMesh::regular_polygon(sides),
+        _ => Ok(EditableMesh::primitive(primitive)),
+    }
+}
+
 fn primitive_group_name(primitive: MeshPrimitive) -> &'static str {
     match primitive {
         MeshPrimitive::Cube => "Cube",
-        MeshPrimitive::Plane => "Plane",
+        MeshPrimitive::Polygon => "Polygon",
         MeshPrimitive::Sphere => "Sphere",
         MeshPrimitive::Cylinder => "Cylinder",
     }
@@ -3304,7 +3377,22 @@ fn confirm_primitive_placement(catalog: &mut ObjectCatalog, state: &mut CadScene
             return;
         }
     };
-    match add_primitive(catalog, state, placement.primitive, center, dimensions) {
+    let sides = match primitive_sides(placement.primitive, &placement.dimensions) {
+        Ok(sides) => sides,
+        Err(error) => {
+            state.error = Some(error);
+            return;
+        }
+    };
+    match add_primitive(
+        catalog,
+        state,
+        placement.primitive,
+        center,
+        dimensions,
+        sides,
+        Quat::IDENTITY,
+    ) {
         Ok(()) => state.primitive_placement = None,
         Err(error) => state.error = Some(error),
     }
@@ -3482,16 +3570,6 @@ fn hex_cell_center(index: usize, radius: f32, origin: Vec3) -> Vec3 {
         )
 }
 
-fn draw_hex_outline(center: Vec3, radius: f32, color: Color) {
-    for corner in 0..6 {
-        let angle_a = std::f32::consts::TAU * corner as f32 / 6.0;
-        let angle_b = std::f32::consts::TAU * (corner + 1) as f32 / 6.0;
-        let a = center + vec3(angle_a.cos() * radius, 0.0, angle_a.sin() * radius);
-        let b = center + vec3(angle_b.cos() * radius, 0.0, angle_b.sin() * radius);
-        draw_line_3d(a, b, color);
-    }
-}
-
 fn draw_triangle_slot_outline(center: Vec3, radius: f32, sides: usize) {
     let color = Color::from_rgba(255, 225, 90, 255);
     let corners = (0..sides)
@@ -3661,13 +3739,8 @@ fn draw_interaction_preview(catalog: &ObjectCatalog, state: &CadSceneState) -> R
     let camera = preview_camera(state);
     set_camera(&camera);
     let result = (|| {
-        let origin = state.target;
         const CELL_RADIUS: f32 = BUILDING_PREVIEW_CELL_RADIUS;
-        draw_hex_outline(origin, CELL_RADIUS, Color::from_rgba(255, 225, 90, 255));
-        for index in 0..6 {
-            let center = hex_cell_center(index, CELL_RADIUS, origin);
-            draw_hex_outline(center, CELL_RADIUS, Color::from_rgba(115, 145, 165, 255));
-        }
+        let origin = state.target;
 
         let neighbor_objects = std::array::from_fn(|index| {
             preview_neighbor_for_condition(
@@ -4344,6 +4417,331 @@ fn draw_status_bar(ctx: &FrameContext, catalog: &ObjectCatalog, state: &CadScene
     );
 }
 
+pub fn handle_api_command(
+    state: &mut CadSceneState,
+    catalog: &mut ObjectCatalog,
+    command: ApiCommand,
+) -> ApiReply {
+    match command {
+        ApiCommand::CadBuildings => {
+            let buildings = [
+                ApiBuildingKind::Base,
+                ApiBuildingKind::Builder,
+                ApiBuildingKind::Housing,
+                ApiBuildingKind::Factory,
+                ApiBuildingKind::Mine,
+                ApiBuildingKind::Warehouse,
+                ApiBuildingKind::Refuel,
+                ApiBuildingKind::Logistics,
+            ]
+            .into_iter()
+            .map(|kind| {
+                let id = cad_object_id(kind);
+                let entry = catalog
+                    .entries()
+                    .iter()
+                    .find(|entry| entry.definition.id == id);
+                let mesh = catalog.get(id);
+                serde_json::json!({
+                    "kind": cad_building_name(kind),
+                    "label": entry.map(|entry| entry.definition.label),
+                    "available": mesh.is_some(),
+                    "vertex_count": mesh.map(|mesh| mesh.vertices.len()),
+                    "face_count": mesh.map(EditableMesh::face_count),
+                    "error": entry.and_then(|entry| entry.error.as_deref()),
+                })
+            })
+            .collect::<Vec<_>>();
+            ApiReply::json(200, serde_json::json!({ "buildings": buildings }))
+        }
+        ApiCommand::CadBuilding { kind } => {
+            let id = cad_object_id(kind);
+            match (catalog.get(id), catalog.metadata(id, None)) {
+                (Some(mesh), Some(metadata)) => ApiReply::json(
+                    200,
+                    serde_json::json!({
+                        "kind": cad_building_name(kind),
+                        "vertices": mesh.vertices.iter().map(|vertex| [
+                            vertex.position.x,
+                            vertex.position.y,
+                            vertex.position.z,
+                        ]).collect::<Vec<_>>(),
+                        "indices": &mesh.indices,
+                        "face_count": mesh.face_count(),
+                        "radial_pivot": metadata.radial_pivot,
+                    }),
+                ),
+                _ => ApiReply::error(
+                    404,
+                    "cad_building_unavailable",
+                    format!("CAD mesh for '{}' is unavailable", cad_building_name(kind)),
+                ),
+            }
+        }
+        ApiCommand::AddCadPrimitive {
+            kind,
+            primitive,
+            center,
+            dimensions,
+            rotation_degrees,
+            sides,
+        } => {
+            let sides = if primitive == MeshPrimitive::Polygon {
+                match sides {
+                    Some(sides) if (3..=16).contains(&sides) => sides,
+                    Some(_) => {
+                        return ApiReply::error(
+                            400,
+                            "invalid_polygon_sides",
+                            "polygon sides must be between 3 and 16",
+                        );
+                    }
+                    None => {
+                        return ApiReply::error(
+                            400,
+                            "missing_polygon_sides",
+                            "polygon primitives require a sides value between 3 and 16",
+                        );
+                    }
+                }
+            } else {
+                6
+            };
+            if !center
+                .iter()
+                .all(|value| value.is_finite() && value.abs() <= 100_000.0)
+                || !dimensions
+                    .iter()
+                    .all(|value| value.is_finite() && *value > 0.0 && *value <= 1000.0)
+                || !rotation_degrees
+                    .iter()
+                    .all(|value| value.is_finite() && value.abs() <= 360_000.0)
+            {
+                return ApiReply::error(
+                    400,
+                    "invalid_primitive_transform",
+                    "center and rotation must be finite and bounded; dimensions must be finite and in (0, 1000]",
+                );
+            }
+            let id = cad_object_id(kind);
+            let Some(mut mesh) = catalog.get(id).cloned() else {
+                return ApiReply::error(
+                    404,
+                    "cad_building_unavailable",
+                    format!("CAD mesh for '{}' is unavailable", cad_building_name(kind)),
+                );
+            };
+            let Some(mut metadata) = catalog.metadata(id, None).cloned() else {
+                return ApiReply::error(
+                    404,
+                    "cad_metadata_unavailable",
+                    format!(
+                        "CAD metadata for '{}' is unavailable",
+                        cad_building_name(kind)
+                    ),
+                );
+            };
+            let rotation = Quat::from_rotation_y(rotation_degrees[1].to_radians())
+                * Quat::from_rotation_x(rotation_degrees[0].to_radians())
+                * Quat::from_rotation_z(rotation_degrees[2].to_radians());
+            if state.editing && state.selected == id {
+                if let Err(error) = add_primitive(
+                    catalog,
+                    state,
+                    primitive,
+                    vec3(center[0], center[1], center[2]),
+                    vec3(dimensions[0], dimensions[1], dimensions[2]),
+                    sides,
+                    rotation,
+                ) {
+                    return ApiReply::error(400, "cad_edit_failed", error);
+                }
+                let mesh = catalog
+                    .get(id)
+                    .expect("CAD primitive was added to the selected building");
+                return ApiReply::json(
+                    200,
+                    serde_json::json!({
+                        "kind": cad_building_name(kind),
+                        "vertex_count": mesh.vertices.len(),
+                        "face_count": mesh.face_count(),
+                        "saved": false,
+                    }),
+                );
+            }
+            let parent_id = metadata.radial_main_group_id();
+            if let Err(error) = append_primitive_geometry(
+                &mut mesh,
+                &mut metadata,
+                PrimitiveGeometry {
+                    primitive,
+                    center: vec3(center[0], center[1], center[2]),
+                    dimensions: vec3(dimensions[0], dimensions[1], dimensions[2]),
+                    sides,
+                    rotation,
+                    parent_id,
+                },
+            ) {
+                return ApiReply::error(400, "cad_edit_failed", error);
+            }
+            *catalog
+                .get_mut(id)
+                .expect("catalog mesh was checked before editing") = mesh.clone();
+            *catalog
+                .metadata_mut(id, None)
+                .expect("catalog metadata was checked before editing") = metadata;
+            ApiReply::json(
+                200,
+                serde_json::json!({
+                    "kind": cad_building_name(kind),
+                    "vertex_count": mesh.vertices.len(),
+                    "face_count": mesh.face_count(),
+                    "saved": false,
+                }),
+            )
+        }
+        ApiCommand::TransformCadBuilding {
+            kind,
+            translation,
+            rotation_degrees,
+            scale,
+        } => {
+            if !translation
+                .iter()
+                .all(|value| value.is_finite() && value.abs() <= 100_000.0)
+                || !rotation_degrees
+                    .iter()
+                    .all(|value| value.is_finite() && value.abs() <= 360_000.0)
+                || !scale
+                    .iter()
+                    .all(|value| value.is_finite() && *value > 0.001 && *value <= 1000.0)
+            {
+                return ApiReply::error(
+                    400,
+                    "invalid_building_transform",
+                    "translation and rotation must be finite and bounded; scale must be in (0.001, 1000]",
+                );
+            }
+            let id = cad_object_id(kind);
+            let Some(mut mesh) = catalog.get(id).cloned() else {
+                return ApiReply::error(
+                    404,
+                    "cad_building_unavailable",
+                    format!("CAD mesh for '{}' is unavailable", cad_building_name(kind)),
+                );
+            };
+            let Some(mut metadata) = catalog.metadata(id, None).cloned() else {
+                return ApiReply::error(
+                    404,
+                    "cad_metadata_unavailable",
+                    format!(
+                        "CAD metadata for '{}' is unavailable",
+                        cad_building_name(kind)
+                    ),
+                );
+            };
+            let snapshot = if state.editing && state.selected == id {
+                match capture_snapshot(catalog, state) {
+                    Ok(snapshot) => Some(snapshot),
+                    Err(error) => return ApiReply::error(409, "cad_edit_failed", error),
+                }
+            } else {
+                None
+            };
+            let rotation = Quat::from_rotation_y(rotation_degrees[1].to_radians())
+                * Quat::from_rotation_x(rotation_degrees[0].to_radians())
+                * Quat::from_rotation_z(rotation_degrees[2].to_radians());
+            let translation = vec3(translation[0], translation[1], translation[2]);
+            let scale = vec3(scale[0], scale[1], scale[2]);
+            let transform = |point: Vec3| rotation * (point * scale) + translation;
+            mesh = mesh.transformed(transform);
+            if let Some([x, y, z]) = metadata.radial_pivot {
+                let point = transform(vec3(x, y, z));
+                metadata.radial_pivot = Some([point.x, point.y, point.z]);
+            }
+            *catalog
+                .get_mut(id)
+                .expect("catalog mesh was checked before transforming") = mesh.clone();
+            *catalog
+                .metadata_mut(id, None)
+                .expect("catalog metadata was checked before transforming") = metadata;
+            if let Some(snapshot) = snapshot {
+                push_undo(state, snapshot);
+                state.dirty = true;
+            }
+            ApiReply::json(
+                200,
+                serde_json::json!({
+                    "kind": cad_building_name(kind),
+                    "vertex_count": mesh.vertices.len(),
+                    "face_count": mesh.face_count(),
+                    "saved": false,
+                }),
+            )
+        }
+        ApiCommand::SaveCadBuilding { kind } => {
+            let id = cad_object_id(kind);
+            let Some(mesh) = catalog.get(id).cloned() else {
+                return ApiReply::error(
+                    404,
+                    "cad_building_unavailable",
+                    format!("CAD mesh for '{}' is unavailable", cad_building_name(kind)),
+                );
+            };
+            match catalog.save(id, mesh.clone()) {
+                Ok(()) => {
+                    if state.selected == id {
+                        state.original_mesh = Some(mesh.clone());
+                        state.original_metadata = catalog.metadata(id, None).cloned();
+                        state.dirty = false;
+                    }
+                    ApiReply::json(
+                        200,
+                        serde_json::json!({
+                            "kind": cad_building_name(kind),
+                            "vertex_count": mesh.vertices.len(),
+                            "face_count": mesh.face_count(),
+                            "saved": true,
+                        }),
+                    )
+                }
+                Err(error) => ApiReply::error(500, "cad_save_failed", error),
+            }
+        }
+        _ => ApiReply::error(
+            400,
+            "not_a_cad_command",
+            "command is not supported by the CAD API",
+        ),
+    }
+}
+
+fn cad_object_id(kind: ApiBuildingKind) -> ObjectId {
+    match kind {
+        ApiBuildingKind::Base => ObjectId::PlanetBase,
+        ApiBuildingKind::Builder => ObjectId::PlanetBuilder,
+        ApiBuildingKind::Housing => ObjectId::PlanetHousing,
+        ApiBuildingKind::Factory => ObjectId::PlanetFactory,
+        ApiBuildingKind::Mine => ObjectId::PlanetMine,
+        ApiBuildingKind::Warehouse => ObjectId::PlanetWarehouse,
+        ApiBuildingKind::Refuel => ObjectId::PlanetRefuel,
+        ApiBuildingKind::Logistics => ObjectId::PlanetLogistics,
+    }
+}
+
+fn cad_building_name(kind: ApiBuildingKind) -> &'static str {
+    match kind {
+        ApiBuildingKind::Base => "base",
+        ApiBuildingKind::Builder => "builder",
+        ApiBuildingKind::Housing => "housing",
+        ApiBuildingKind::Factory => "factory",
+        ApiBuildingKind::Mine => "mine",
+        ApiBuildingKind::Warehouse => "warehouse",
+        ApiBuildingKind::Refuel => "refuel",
+        ApiBuildingKind::Logistics => "logistics",
+    }
+}
+
 pub fn run(
     ctx: &FrameContext,
     state: &mut CadSceneState,
@@ -5009,7 +5407,7 @@ pub fn run(
     if state.editing {
         for (label, primitive) in [
             ("Cube", MeshPrimitive::Cube),
-            ("Plane", MeshPrimitive::Plane),
+            ("Polygon", MeshPrimitive::Polygon),
             ("Sphere", MeshPrimitive::Sphere),
             ("Cylinder", MeshPrimitive::Cylinder),
         ] {
@@ -5547,12 +5945,6 @@ pub fn run(
         {
             let (model_center, scale) = mesh_center_and_scale(mesh);
             let metadata = selected_metadata(catalog, state);
-            let guide_center = mesh_cell_guide_center(mesh, metadata);
-            draw_hex_outline(
-                guide_center,
-                BUILDING_PREVIEW_CELL_GUIDE_RADIUS,
-                Color::from_rgba(255, 225, 90, 190),
-            );
             if let Some(metadata) = metadata
                 && metadata.radial_main_group_id().is_some()
             {
@@ -5733,8 +6125,10 @@ pub fn run(
                 && let Some(center) = placement.center
                 && let Ok(dimensions) =
                     parse_primitive_dimensions(placement.primitive, &placement.dimensions)
+                && let Ok(sides) = primitive_sides(placement.primitive, &placement.dimensions)
+                && let Ok(primitive_mesh) = primitive_mesh(placement.primitive, sides)
             {
-                let ghost = EditableMesh::primitive(placement.primitive).transformed(|position| {
+                let ghost = primitive_mesh.transformed(|position| {
                     let model_position = center
                         + vec3(
                             position.x * dimensions.x,
@@ -5821,9 +6215,21 @@ pub fn run(
                     if let Some(center) = placement.center {
                         let dimensions =
                             dimensions_from_click(placement.primitive, center, model_point);
-                        match add_primitive(catalog, state, placement.primitive, center, dimensions)
-                        {
-                            Ok(()) => state.primitive_placement = None,
+                        match primitive_sides(placement.primitive, &placement.dimensions) {
+                            Ok(sides) => {
+                                match add_primitive(
+                                    catalog,
+                                    state,
+                                    placement.primitive,
+                                    center,
+                                    dimensions,
+                                    sides,
+                                    Quat::IDENTITY,
+                                ) {
+                                    Ok(()) => state.primitive_placement = None,
+                                    Err(error) => state.error = Some(error),
+                                }
+                            }
                             Err(error) => state.error = Some(error),
                         }
                     } else if let Some(active) = state.primitive_placement.as_mut() {
@@ -6415,12 +6821,16 @@ pub fn run(
             );
             let name = match placement.primitive {
                 MeshPrimitive::Cube => "Cube",
-                MeshPrimitive::Plane => "Plane",
+                MeshPrimitive::Polygon => "Polygon",
                 MeshPrimitive::Sphere => "Sphere",
                 MeshPrimitive::Cylinder => "Cylinder",
             };
             draw_text(
-                "Click viewport for size, or type values",
+                if placement.primitive == MeshPrimitive::Polygon {
+                    "Enter 3-16 sides; click viewport to size"
+                } else {
+                    "Click viewport for size, or type values"
+                },
                 panel.x + 12.0,
                 panel.y + 20.0,
                 ctx.font_sm,
@@ -6437,14 +6847,22 @@ pub fn run(
                 ctx.colors_rt.text_secondary,
             );
             draw_text(
-                "Up/Down: +/-0.1; Shift: +/-0.01",
+                if placement.primitive == MeshPrimitive::Polygon {
+                    "Up/Down: +/-1 side"
+                } else {
+                    "Up/Down: +/-0.1; Shift: +/-0.01"
+                },
                 panel.x + 12.0,
                 panel.y + 62.0,
                 ctx.font_sm,
                 ctx.colors_rt.text_secondary,
             );
             draw_text(
-                "Left/Right: select dimension",
+                if placement.primitive == MeshPrimitive::Polygon {
+                    "Create when ready"
+                } else {
+                    "Left/Right: select dimension"
+                },
                 panel.x + 12.0,
                 panel.y + 80.0,
                 ctx.font_sm,
@@ -6606,9 +7024,13 @@ mod tests {
             vec3(2.5, 2.5, 2.5)
         );
         assert_eq!(
-            parse_primitive_dimensions(MeshPrimitive::Plane, "3, 4").unwrap(),
-            vec3(3.0, 1.0, 4.0)
+            parse_primitive_dimensions(MeshPrimitive::Polygon, "6").unwrap(),
+            vec3(1.0, 1.0, 1.0)
         );
+        assert_eq!(parse_polygon_sides("16").unwrap(), 16);
+        assert!(parse_polygon_sides("2").is_err());
+        assert!(parse_polygon_sides("17").is_err());
+        assert!(parse_polygon_sides("6.5").is_err());
         assert_eq!(
             parse_primitive_dimensions(MeshPrimitive::Sphere, "0.75").unwrap(),
             vec3(1.5, 1.5, 1.5)
@@ -7363,6 +7785,67 @@ mod tests {
     }
 
     #[test]
+    fn cad_api_can_add_and_transform_building_geometry_with_validation() {
+        let mut catalog = ObjectCatalog::load();
+        let mut state = CadSceneState {
+            editing: true,
+            ..CadSceneState::default()
+        };
+        let id = ObjectId::PlanetBase;
+        let starting_faces = catalog.get(id).unwrap().face_count();
+        let added = handle_api_command(
+            &mut state,
+            &mut catalog,
+            ApiCommand::AddCadPrimitive {
+                kind: ApiBuildingKind::Base,
+                primitive: MeshPrimitive::Polygon,
+                center: [0.0, 0.5, 0.0],
+                dimensions: [2.0, 1.0, 2.0],
+                rotation_degrees: [0.0; 3],
+                sides: Some(5),
+            },
+        );
+        assert_eq!(added.status, 200);
+        assert_eq!(catalog.get(id).unwrap().face_count(), starting_faces + 5);
+        assert_eq!(added.body["saved"], false);
+
+        let before = catalog.get(id).unwrap().vertices[0].position;
+        let transformed = handle_api_command(
+            &mut state,
+            &mut catalog,
+            ApiCommand::TransformCadBuilding {
+                kind: ApiBuildingKind::Base,
+                translation: [1.0, 0.0, 0.0],
+                rotation_degrees: [0.0; 3],
+                scale: [2.0, 1.0, 1.0],
+            },
+        );
+        assert_eq!(transformed.status, 200);
+        let after = catalog.get(id).unwrap().vertices[0].position;
+        assert!((after.x - (before.x * 2.0 + 1.0)).abs() < 1e-5);
+        assert!((after.y - before.y).abs() < 1e-5);
+
+        let invalid = handle_api_command(
+            &mut state,
+            &mut catalog,
+            ApiCommand::AddCadPrimitive {
+                kind: ApiBuildingKind::Base,
+                primitive: MeshPrimitive::Polygon,
+                center: [0.0; 3],
+                dimensions: [1.0; 3],
+                rotation_degrees: [0.0; 3],
+                sides: Some(17),
+            },
+        );
+        assert_eq!(invalid.status, 400);
+        assert_eq!(catalog.get(id).unwrap().face_count(), starting_faces + 5);
+        assert!(undo(&mut catalog, &mut state).unwrap());
+        assert_eq!(catalog.get(id).unwrap().face_count(), starting_faces + 5);
+        assert!(undo(&mut catalog, &mut state).unwrap());
+        assert_eq!(catalog.get(id).unwrap().face_count(), starting_faces);
+    }
+
+    #[test]
     fn vertex_edits_include_duplicate_face_corners() {
         let mut mesh = EditableMesh {
             vertices: vec![
@@ -7779,7 +8262,18 @@ mod tests {
             trim_path_points: vec![vec3(0.5, 0.0, 0.0), vec3(0.0, 0.0, -0.5)],
             ..CadSceneState::default()
         };
-        let mut mesh = EditableMesh::primitive(MeshPrimitive::Plane);
+        let mut mesh = EditableMesh {
+            vertices: [
+                vec3(-0.5, 0.0, -0.5),
+                vec3(0.5, 0.0, -0.5),
+                vec3(0.5, 0.0, 0.5),
+                vec3(-0.5, 0.0, 0.5),
+            ]
+            .into_iter()
+            .map(|position| Vertex::new2(position, Vec2::ZERO, WHITE))
+            .collect(),
+            indices: vec![0, 2, 1, 0, 3, 2],
+        };
         *selected_mesh_mut(&mut catalog, &state).unwrap() = mesh.clone();
 
         apply_trim(&mut catalog, &mut state).unwrap();

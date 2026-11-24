@@ -407,10 +407,11 @@ pub struct EditableMesh {
     pub indices: Vec<u32>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum MeshPrimitive {
     Cube,
-    Plane,
+    Polygon,
     Sphere,
     Cylinder,
 }
@@ -511,19 +512,36 @@ impl EditableMesh {
                     color,
                 )
             }
-            MeshPrimitive::Plane => Self::from_positions_and_indices(
-                &[
-                    vec3(-0.5, 0.0, -0.5),
-                    vec3(0.5, 0.0, -0.5),
-                    vec3(0.5, 0.0, 0.5),
-                    vec3(-0.5, 0.0, 0.5),
-                ],
-                &[0, 2, 1, 0, 3, 2],
-                color,
-            ),
+            MeshPrimitive::Polygon => {
+                Self::regular_polygon(6).expect("the default polygon side count is valid")
+            }
             MeshPrimitive::Sphere => Self::sphere_primitive(color),
             MeshPrimitive::Cylinder => Self::cylinder_primitive(color),
         }
+    }
+
+    pub fn regular_polygon(sides: usize) -> Result<Self, String> {
+        if !(3..=16).contains(&sides) {
+            return Err("Polygon sides must be between 3 and 16".to_string());
+        }
+        let mut positions = Vec::with_capacity(sides + 1);
+        positions.push(Vec3::ZERO);
+        for side in 0..sides {
+            let angle =
+                std::f32::consts::TAU * side as f32 / sides as f32 - std::f32::consts::FRAC_PI_2;
+            positions.push(vec3(angle.cos() * 0.5, 0.0, angle.sin() * 0.5));
+        }
+        let mut indices = Vec::with_capacity(sides * 3);
+        for side in 0..sides {
+            let current = side as u32 + 1;
+            let next = ((side + 1) % sides) as u32 + 1;
+            indices.extend_from_slice(&[0, next, current]);
+        }
+        Ok(Self::from_positions_and_indices(
+            &positions,
+            &indices,
+            Color::from_rgba(205, 190, 160, 255),
+        ))
     }
 
     fn from_positions_and_indices(positions: &[Vec3], indices: &[u32], color: Color) -> Self {
@@ -3607,7 +3625,7 @@ mod tests {
 
     #[test]
     fn reflected_and_offset_face_copies_keep_source_geometry_and_report_face_mapping() {
-        let mut mesh = EditableMesh::primitive(MeshPrimitive::Plane);
+        let mut mesh = EditableMesh::regular_polygon(3).unwrap();
         let original_indices = mesh.indices.clone();
         let original_positions = mesh
             .vertices
@@ -3617,11 +3635,11 @@ mod tests {
         let reflected = mesh
             .copy_faces_reflected(&[0], Vec3::ZERO, Vec3::X)
             .unwrap();
-        assert_eq!(mesh.face_count(), 3);
+        assert_eq!(mesh.face_count(), 4);
         assert_eq!(&mesh.indices[..original_indices.len()], original_indices);
-        assert_eq!(reflected, vec![(0, 2)]);
+        assert_eq!(reflected, vec![(0, 3)]);
         let source = &original_indices[..3];
-        let mirrored = &mesh.indices[6..9];
+        let mirrored = &mesh.indices[9..12];
         for (mirrored_index, source_index) in mirrored.iter().zip([source[0], source[2], source[1]])
         {
             assert_eq!(
@@ -3993,7 +4011,7 @@ mod tests {
     fn primitive_meshes_have_valid_non_degenerate_triangles() {
         for (primitive, expected_faces) in [
             (MeshPrimitive::Cube, 12),
-            (MeshPrimitive::Plane, 2),
+            (MeshPrimitive::Polygon, 6),
             (MeshPrimitive::Sphere, 224),
             (MeshPrimitive::Cylinder, 64),
         ] {
@@ -4011,6 +4029,17 @@ mod tests {
                 assert!((b - a).cross(c - a).length_squared() > 1e-10);
             }
         }
+    }
+
+    #[test]
+    fn regular_polygon_validates_side_count_and_generates_one_triangle_per_side() {
+        for sides in [3, 5, 6, 16] {
+            let mesh = EditableMesh::regular_polygon(sides).unwrap();
+            assert_eq!(mesh.face_count(), sides);
+            assert_eq!(mesh.vertices.len(), sides + 1);
+        }
+        assert!(EditableMesh::regular_polygon(2).is_err());
+        assert!(EditableMesh::regular_polygon(17).is_err());
     }
 
     #[test]

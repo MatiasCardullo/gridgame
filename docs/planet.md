@@ -102,7 +102,7 @@
 6. Hover grid/cell:
 - Selects the cell from the same grid used by simulation.
 - Grid cache (dual of the triangulation) at `planet_data/planet_sim_grid.bin`.
-- Draws a single polygon (pent/hex) with an outer ring at `overlay_radius` and an inner ring at `surface_radius`.
+- Generic hover keeps an outer pentagon/hexagon and radial grid guide.
 
 7. Gameplay cell simulation:
 - Uses the same grid cache (`planet_data/planet_sim_grid.bin`) for gameplay state.

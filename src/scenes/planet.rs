@@ -73,6 +73,9 @@ const HEIGHTMAP_SIZE: u16 = 2048;
 const TEXTURE_BASE_SUBDIVISIONS: usize = 2;
 const TEXTURE_LAYER_OFFSET: f32 = 0.004;
 const SUBDIVISION_HYSTERESIS: f32 = 0.25;
+const FOCUS_MIN_PITCH: f32 = 0.06;
+const FOCUS_MAX_PITCH: f32 = 1.30;
+const FOCUS_ORIENTATION_FADE_PER_RADIAN: f32 = 0.8;
 const FALLBACK_RELIEF_SUBDIVISIONS: usize = 1;
 const REGEN_FACE_GRAIN: usize = 12;
 const ICOSAHEDRON_FACE_COUNT: usize = 20;
@@ -1313,6 +1316,8 @@ pub struct PlanetState {
     focus_lockout: bool,
     focus_blend: f32,
     focus_blend_target: f32,
+    focus_reference_up: Vec3,
+    focus_orientation_weight: f32,
     pub dragging: bool,
     pub last_mouse: Vec2,
     pub config: PlanetNoiseConfig,
@@ -2340,6 +2345,8 @@ impl PlanetState {
             focus_lockout: false,
             focus_blend: 0.0,
             focus_blend_target: 0.0,
+            focus_reference_up: Vec3::Y,
+            focus_orientation_weight: 0.0,
             dragging: false,
             last_mouse: Vec2::ZERO,
             config,
@@ -5709,6 +5716,25 @@ fn focus_orbit_angles(normal: Vec3, direction: Vec3) -> (f32, f32) {
     (yaw, normal_component.acos())
 }
 
+fn orbit_focus_camera_from_screen_delta(
+    normal: Vec3,
+    yaw: f32,
+    pitch: f32,
+    reference_up: Vec3,
+    orientation_weight: f32,
+    yaw_delta: f32,
+    pitch_delta: f32,
+) -> (f32, f32) {
+    let direction = focus_orbit_direction(normal, yaw, pitch);
+    let up = focus_camera_up(-direction, normal, reference_up, orientation_weight);
+    let right = up.cross(direction).normalize_or_zero();
+    let yaw_rotation = Quat::from_axis_angle(up, yaw_delta);
+    let pitch_rotation = Quat::from_axis_angle(right, pitch_delta);
+    let rotated_direction = (yaw_rotation * pitch_rotation * direction).normalize_or_zero();
+    let (yaw, pitch) = focus_orbit_angles(normal, rotated_direction);
+    (yaw, pitch.clamp(FOCUS_MIN_PITCH, FOCUS_MAX_PITCH))
+}
+
 fn focus_surface_radius(direction: Vec3, show_relief: bool, config: &PlanetNoiseConfig) -> f32 {
     let elevation = if show_relief {
         let height = height_value(direction, config);
@@ -5740,8 +5766,10 @@ fn focus_pivot(
 fn focus_camera_pose(
     pivot: Vec3,
     normal: Vec3,
+    reference_up: Vec3,
     yaw: f32,
     pitch: f32,
+    orientation_weight: f32,
     distance: f32,
     show_relief: bool,
     config: &PlanetNoiseConfig,
@@ -5758,8 +5786,52 @@ fn focus_camera_pose(
     let safe_distance = distance.max((-projection + discriminant).max(0.0));
     let position = pivot + orbit_direction * safe_distance;
     let forward = (pivot - position).normalize_or_zero();
-    let up = (normal - forward * normal.dot(forward)).normalize_or_zero();
+    let up = focus_camera_up(forward, normal, reference_up, orientation_weight);
     (position, up, safe_distance)
+}
+
+fn focus_camera_up(
+    forward: Vec3,
+    normal: Vec3,
+    reference_up: Vec3,
+    orientation_weight: f32,
+) -> Vec3 {
+    let reference_up = camera_up_from_reference(forward, reference_up, normal);
+    let ground_up = camera_up_from_reference(forward, normal, reference_up);
+    let local_progress = 1.0 - orientation_weight.clamp(0.0, 1.0);
+    let progress = local_progress * local_progress * (3.0 - 2.0 * local_progress);
+    let sine = forward.dot(reference_up.cross(ground_up));
+    let cosine = reference_up.dot(ground_up).clamp(-1.0, 1.0);
+    let roll = if sine.abs() < 1e-6 && cosine < 0.0 {
+        std::f32::consts::PI
+    } else {
+        sine.atan2(cosine)
+    };
+    (Quat::from_axis_angle(forward, roll * progress) * reference_up).normalize_or_zero()
+}
+
+fn decay_focus_orientation_weight(weight: f32, angular_distance: f32) -> f32 {
+    (weight - angular_distance.max(0.0) * FOCUS_ORIENTATION_FADE_PER_RADIAN).clamp(0.0, 1.0)
+}
+
+fn camera_up_from_reference(forward: Vec3, reference_up: Vec3, fallback_up: Vec3) -> Vec3 {
+    let project_up = |up: Vec3| up - forward * up.dot(forward);
+    let up = project_up(reference_up);
+    if up.length_squared() > 1e-8 {
+        return up.normalize();
+    }
+
+    let up = project_up(fallback_up);
+    if up.length_squared() > 1e-8 {
+        return up.normalize();
+    }
+
+    let fallback = if forward.dot(Vec3::Y).abs() < 0.95 {
+        Vec3::Y
+    } else {
+        Vec3::X
+    };
+    project_up(fallback).normalize_or_zero()
 }
 
 fn blend_focus_camera(
@@ -5772,11 +5844,12 @@ fn blend_focus_camera(
 ) -> (Vec3, Vec3, Vec3) {
     let blend = blend.clamp(0.0, 1.0);
     let blend = blend * blend * (3.0 - 2.0 * blend);
-    (
-        planet_position.lerp(focus_position, blend),
-        Vec3::ZERO.lerp(focus_pivot, blend),
-        planet_up.lerp(focus_up, blend).normalize_or_zero(),
-    )
+    let position = planet_position.lerp(focus_position, blend);
+    let target = Vec3::ZERO.lerp(focus_pivot, blend);
+    let forward = (target - position).normalize_or_zero();
+    let reference_up = planet_up.lerp(focus_up, blend);
+    let up = camera_up_from_reference(forward, reference_up, focus_up);
+    (position, target, up)
 }
 
 // Maps camera distance to mesh subdivision detail levels.
@@ -5959,8 +6032,10 @@ pub fn run(
             let (focus_position, focus_up, _) = focus_camera_pose(
                 pivot,
                 normal,
+                state.focus_reference_up,
                 state.focus_yaw,
                 state.focus_pitch,
+                state.focus_orientation_weight,
                 state.focus_distance,
                 state.show_relief,
                 &state.config,
@@ -5991,8 +6066,26 @@ pub fn run(
         } else {
             let delta = mouse - state.last_mouse;
             if state.focus_cell.is_some() {
-                state.focus_yaw -= delta.x * 0.01;
-                state.focus_pitch = (state.focus_pitch - delta.y * 0.01).clamp(0.06, 1.30);
+                if let Some((_, normal)) = state.focus_cell.and_then(|cell| {
+                    state
+                        .sim_grid
+                        .as_ref()
+                        .and_then(|grid| focus_pivot(grid, cell, state.show_relief, &state.config))
+                }) {
+                    (state.focus_yaw, state.focus_pitch) = orbit_focus_camera_from_screen_delta(
+                        normal,
+                        state.focus_yaw,
+                        state.focus_pitch,
+                        state.focus_reference_up,
+                        state.focus_orientation_weight,
+                        -delta.x * 0.01,
+                        -delta.y * 0.01,
+                    );
+                    state.focus_orientation_weight = decay_focus_orientation_weight(
+                        state.focus_orientation_weight,
+                        delta.length() * 0.01,
+                    );
+                }
             }
             if state.focus_cell.is_none()
                 || state.focus_blend < 0.995
@@ -6075,9 +6168,27 @@ pub fn run(
     if !state.debug_camera.enabled && (yaw_input != 0.0 || pitch_input != 0.0) {
         let speed = 1.6;
         if state.focus_cell.is_some() {
-            state.focus_yaw += yaw_input * speed * frame_time;
-            state.focus_pitch =
-                (state.focus_pitch - pitch_input * speed * frame_time).clamp(0.06, 1.30);
+            if let Some((_, normal)) = state.focus_cell.and_then(|cell| {
+                state
+                    .sim_grid
+                    .as_ref()
+                    .and_then(|grid| focus_pivot(grid, cell, state.show_relief, &state.config))
+            }) {
+                (state.focus_yaw, state.focus_pitch) = orbit_focus_camera_from_screen_delta(
+                    normal,
+                    state.focus_yaw,
+                    state.focus_pitch,
+                    state.focus_reference_up,
+                    state.focus_orientation_weight,
+                    yaw_input * speed * frame_time,
+                    -pitch_input * speed * frame_time,
+                );
+                let angular_distance = vec2(yaw_input, pitch_input).length() * speed * frame_time;
+                state.focus_orientation_weight = decay_focus_orientation_weight(
+                    state.focus_orientation_weight,
+                    angular_distance,
+                );
+            }
         }
         if state.focus_cell.is_none() || state.focus_blend < 0.995 || state.focus_blend_target < 0.5
         {
@@ -6104,8 +6215,10 @@ pub fn run(
                     let (position, up, _) = focus_camera_pose(
                         pivot,
                         normal,
+                        state.focus_reference_up,
                         state.focus_yaw,
                         state.focus_pitch,
+                        state.focus_orientation_weight,
                         state.focus_distance,
                         state.show_relief,
                         &state.config,
@@ -6159,9 +6272,11 @@ pub fn run(
                         state.focus_distance = initial_distance;
                         state.target_focus_distance = initial_distance;
                         state.focus_blend_target = 1.0;
+                        state.focus_reference_up = state.camera_rot * Vec3::Y;
+                        state.focus_orientation_weight = 1.0;
                         let (yaw, pitch) = focus_orbit_angles(normal, relative_direction);
                         state.focus_yaw = yaw;
-                        state.focus_pitch = pitch.clamp(0.06, 1.30);
+                        state.focus_pitch = pitch.clamp(FOCUS_MIN_PITCH, FOCUS_MAX_PITCH);
                         state.target_distance = state.distance;
                     }
                 }
@@ -6175,6 +6290,7 @@ pub fn run(
             state.focus_cell = None;
             state.focus_blend = 0.0;
             state.focus_blend_target = 0.0;
+            state.focus_orientation_weight = 0.0;
         }
     }
     let desired_subdivisions =
@@ -6225,8 +6341,10 @@ pub fn run(
             let (focus_position, focus_up, _) = focus_camera_pose(
                 pivot,
                 normal,
+                state.focus_reference_up,
                 state.focus_yaw,
                 state.focus_pitch,
+                state.focus_orientation_weight,
                 state.focus_distance,
                 state.show_relief,
                 &state.config,

@@ -4,36 +4,47 @@ use crate::core::planet_resources::{
 };
 
 #[test]
+fn planet_noise_default_matches_saved_planet_snapshot() {
+    let config = PlanetNoiseConfig::default();
+
+    assert_eq!(config.noise_scale, 3.7);
+    assert_eq!(config.height_amp, 0.9);
+    assert_eq!(config.height_bias, -0.1);
+    assert_eq!(config.lat_bias, 0.0);
+    assert_eq!(config.sea_level, 0.3);
+    assert_eq!(config.ice_start, 0.61);
+    assert_eq!(config.ice_strength, 1.5);
+    assert_eq!(config.subdivisions, 3);
+}
+
+#[test]
 fn focus_orbit_clamps_camera_outside_relief_surface() {
     let config = PlanetNoiseConfig::default();
     let normal = Vec3::Z;
     let pivot = normal * focus_surface_radius(normal, true, &config);
     let (position, _, _) =
-        focus_camera_pose(pivot, normal, 0.8, 1.25, 0.12, Vec3::Y, true, &config);
+        focus_camera_pose(pivot, normal, Vec3::Y, 0.8, 1.25, 1.0, 0.12, true, &config);
     let minimum_radius = focus_surface_radius(position.normalize_or_zero(), true, &config) + 0.034;
 
     assert!(position.length() >= minimum_radius);
 }
 
 #[test]
-fn focus_camera_keeps_reference_up_when_looking_down_on_cell() {
-    let config = PlanetNoiseConfig::default();
-    let normal = Vec3::Z;
-    let pivot = normal * focus_surface_radius(normal, false, &config);
+fn focus_camera_roll_fades_from_incoming_up_to_local_up() {
+    let normal = Vec3::new(0.8, 0.0, 0.6).normalize();
     let reference_up = Vec3::Y;
-    let (_, up, _) = focus_camera_pose(
-        pivot,
-        normal,
-        0.8,
-        FOCUS_MIN_PITCH,
-        0.2,
-        reference_up,
-        false,
-        &config,
-    );
+    let direction = focus_orbit_direction(normal, 0.8, 0.8);
+    let incoming_up = focus_camera_up(-direction, normal, reference_up, 1.0);
+    let halfway_up = focus_camera_up(-direction, normal, reference_up, 0.5);
+    let local_up = focus_camera_up(-direction, normal, reference_up, 0.0);
+    let expected_incoming_up = camera_up_from_reference(-direction, reference_up, normal);
+    let expected_local_up = camera_up_from_reference(-direction, normal, reference_up);
 
-    assert!(up.dot(reference_up) > 0.999);
-    assert!((FOCUS_MAX_PITCH.to_degrees() - 80.0).abs() < 0.001);
+    assert!(incoming_up.distance(expected_incoming_up) < 1e-5);
+    assert!(local_up.distance(expected_local_up) < 1e-5);
+    assert!(halfway_up.dot(incoming_up) > local_up.dot(incoming_up));
+    assert!(decay_focus_orientation_weight(1.0, 0.5) < 1.0);
+    assert!(decay_focus_orientation_weight(1.0, 2.0) < 0.0 + f32::EPSILON);
 }
 
 #[test]
@@ -43,6 +54,25 @@ fn focus_orbit_angles_recreate_camera_direction() {
     let (yaw, pitch) = focus_orbit_angles(normal, expected);
 
     assert!(focus_orbit_direction(normal, yaw, pitch).distance(expected) < 1e-5);
+}
+
+#[test]
+fn focus_camera_pan_follows_screen_space_axes() {
+    let normal = Vec3::new(0.3, 0.7, 0.6).normalize();
+    let reference_up = Vec3::Y;
+    let direction = focus_orbit_direction(normal, 0.7, 0.8);
+    let up = focus_camera_up(-direction, normal, reference_up, 0.5);
+    let right = up.cross(direction).normalize();
+
+    let (yaw, pitch) =
+        orbit_focus_camera_from_screen_delta(normal, 0.7, 0.8, reference_up, 0.5, -0.01, 0.0);
+    let horizontal_direction = focus_orbit_direction(normal, yaw, pitch);
+    let (yaw, pitch) =
+        orbit_focus_camera_from_screen_delta(normal, 0.7, 0.8, reference_up, 0.5, 0.0, -0.01);
+    let vertical_direction = focus_orbit_direction(normal, yaw, pitch);
+
+    assert!((horizontal_direction - direction).dot(right) < 0.0);
+    assert!((vertical_direction - direction).dot(up) > 0.0);
 }
 
 #[test]
@@ -61,6 +91,20 @@ fn focus_camera_blend_interpolates_from_planet_orbit() {
 
     assert!(position.distance((planet_position + focus_position) * 0.5) < 1e-5);
     assert!(target.distance(focus_pivot * 0.5) < 1e-5);
+}
+
+#[test]
+fn focus_camera_blend_preserves_planet_camera_roll() {
+    let (_, _, up) = blend_focus_camera(
+        Vec3::Z * 1.7,
+        Vec3::Y,
+        Vec3::X * 1.6,
+        Vec3::X * 1.7,
+        Vec3::Y,
+        0.5,
+    );
+
+    assert!(up.distance(Vec3::Y) < 1e-5);
 }
 
 #[test]

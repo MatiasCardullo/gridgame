@@ -80,6 +80,7 @@ const FALLBACK_RELIEF_SUBDIVISIONS: usize = 1;
 const REGEN_FACE_GRAIN: usize = 12;
 const ICOSAHEDRON_FACE_COUNT: usize = 20;
 const SUBFACE_HOVER_MAX_DISTANCE: f32 = 5.6;
+const CELL_HOVER_MAX_DISTANCE: f32 = 2.0;
 const SIM_GRID_HEXES_ACROSS: i32 = 160;
 const PLANET_OVERLAY_OFFSET: f32 = 0.01;
 const PLANET_SIM_SEED: u64 = 0xDA7A_51C4_1234_8B9E;
@@ -91,6 +92,10 @@ enum UnitNodePick {
     Dropoff,
     Refuel,
     Construction,
+}
+
+fn cell_hover_enabled(distance: f32) -> bool {
+    distance <= CELL_HOVER_MAX_DISTANCE
 }
 
 // Wraps an angle to the [-PI, PI] range for smooth camera interpolation.
@@ -6460,6 +6465,7 @@ pub fn run(
     }
 
     let use_subface_hover = state.distance <= SUBFACE_HOVER_MAX_DISTANCE;
+    let use_cell_hover = cell_hover_enabled(state.distance);
     let mut hovered_subface: Option<usize> = None;
     let mut hovered_base_face: Option<usize> = None;
     let mut hover_hit: Option<Vec3> = None;
@@ -6472,8 +6478,9 @@ pub fn run(
                 if use_subface_hover {
                     hovered_subface = hovered_face(hit, &faces, &vertices);
                 }
-                if let (Some(sim_grid), Some(base_face)) =
-                    (state.sim_grid.as_ref(), hovered_base_face)
+                if use_cell_hover
+                    && let (Some(sim_grid), Some(base_face)) =
+                        (state.sim_grid.as_ref(), hovered_base_face)
                 {
                     hovered_cell = hovered_hex_vertex(sim_grid, hit.normalize(), base_face);
                 }
@@ -6609,24 +6616,28 @@ pub fn run(
                         state.node_pick = None;
                     }
                 }
-            } else if let Some(building) = state.buildings.get(&BuildingSlot {
-                cell_index,
-                triangle_index: hovered_triangle_index,
-            }) {
-                state.info_window.title = building.kind.label().to_string();
-                state.info_window.rect = Rect::new(mouse.x + 12.0, mouse.y + 12.0, 280.0, 190.0);
-                state.info_window.open = true;
-                state.info_target_cell = Some(cell_index);
-                state.info_target_triangle = hovered_triangle_index;
-                state.info_window.show_units = false;
-            } else if let Some(face_index) = hovered_subface {
-                let face = faces[face_index];
-                let normal = face_normal(&vertices, face);
-                state.target_rot = quat_from_forward_up(normal, vec3(0.0, 1.0, 0.0));
-            } else if let Some(face_index) = hovered_base_face {
-                let face = base_faces[face_index];
-                let normal = face_normal(&base_vertices, face);
-                state.target_rot = quat_from_forward_up(normal, vec3(0.0, 1.0, 0.0));
+            } else {
+                if state.focus_cell.is_none()
+                    && let Some(normal) = state
+                        .sim_grid
+                        .as_ref()
+                        .and_then(|grid| grid.vertices.get(cell_index as usize))
+                        .copied()
+                {
+                    state.target_rot = quat_from_forward_up(normal, vec3(0.0, 1.0, 0.0));
+                }
+                if let Some(building) = state.buildings.get(&BuildingSlot {
+                    cell_index,
+                    triangle_index: hovered_triangle_index,
+                }) {
+                    state.info_window.title = building.kind.label().to_string();
+                    state.info_window.rect =
+                        Rect::new(mouse.x + 12.0, mouse.y + 12.0, 280.0, 190.0);
+                    state.info_window.open = true;
+                    state.info_target_cell = Some(cell_index);
+                    state.info_target_triangle = hovered_triangle_index;
+                    state.info_window.show_units = false;
+                }
             }
         } else if let Some(face_index) = hovered_subface {
             let face = faces[face_index];

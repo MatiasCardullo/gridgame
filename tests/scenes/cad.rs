@@ -779,7 +779,7 @@ fn radial_neighbor_groups_appear_as_a_main_group_with_condition_children() {
         )
         .unwrap();
 
-    let items = sidebar_items(&metadata, 3);
+    let items = sidebar_items(&metadata, 3, &HashSet::new());
     assert_eq!(items.first(), Some(&SidebarItem::Group(main_id)));
     assert_eq!(
         items,
@@ -794,6 +794,26 @@ fn radial_neighbor_groups_appear_as_a_main_group_with_condition_children() {
                 index: 1,
                 group: Some(route_group),
             },
+            SidebarItem::Face {
+                index: 2,
+                group: None,
+            },
+        ]
+    );
+}
+
+#[test]
+fn collapsing_a_group_hides_its_faces_and_nested_groups() {
+    let mut metadata = FaceMetadata::for_face_count(3);
+    let main_id = metadata.create_group(&[0]).unwrap();
+    metadata.create_group_under(&[1], Some(main_id)).unwrap();
+
+    let items = sidebar_items(&metadata, 3, &HashSet::from([main_id]));
+
+    assert_eq!(
+        items,
+        [
+            SidebarItem::Group(main_id),
             SidebarItem::Face {
                 index: 2,
                 group: None,

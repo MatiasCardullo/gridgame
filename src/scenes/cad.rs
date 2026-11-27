@@ -228,6 +228,8 @@ pub struct CadSceneState {
     exit_confirmation_open: bool,
     selection_mode: SelectionMode,
     face_scroll: usize,
+    face_scroll_drag_offset: Option<f32>,
+    collapsed_groups: HashSet<u64>,
     selected_faces: Vec<usize>,
     selected_group: Option<u64>,
     selected_vertices: Vec<usize>,
@@ -295,6 +297,8 @@ impl Default for CadSceneState {
             exit_confirmation_open: false,
             selection_mode: SelectionMode::Vertex,
             face_scroll: 0,
+            face_scroll_drag_offset: None,
+            collapsed_groups: HashSet::new(),
             selected_faces: Vec::new(),
             selected_group: None,
             selected_vertices: Vec::new(),
@@ -2820,6 +2824,8 @@ fn switch_to_object(state: &mut CadSceneState, id: ObjectId) {
     state.undo_stack.clear();
     state.redo_stack.clear();
     state.face_scroll = 0;
+    state.face_scroll_drag_offset = None;
+    state.collapsed_groups.clear();
     state.error = None;
     state.target = Vec3::ZERO;
     state.distance = 4.0;
@@ -2967,14 +2973,17 @@ fn apply_numeric_transform(
     Ok(())
 }
 
-fn sidebar_items(metadata: &FaceMetadata, face_count: usize) -> Vec<SidebarItem> {
+fn sidebar_items(
+    metadata: &FaceMetadata,
+    face_count: usize,
+    collapsed_groups: &HashSet<u64>,
+) -> Vec<SidebarItem> {
     fn append_group(
         metadata: &FaceMetadata,
         group_id: u64,
-        face_count: usize,
-        grouped_faces: &mut HashSet<usize>,
         visited: &mut HashSet<u64>,
         items: &mut Vec<SidebarItem>,
+        collapsed_groups: &HashSet<u64>,
     ) {
         if !visited.insert(group_id) {
             return;
@@ -2983,33 +2992,31 @@ fn sidebar_items(metadata: &FaceMetadata, face_count: usize) -> Vec<SidebarItem>
             return;
         };
         items.push(SidebarItem::Group(group_id));
+        if collapsed_groups.contains(&group_id) {
+            return;
+        }
         for &face in &group.faces {
-            if face < face_count {
-                grouped_faces.insert(face);
-                items.push(SidebarItem::Face {
-                    index: face,
-                    group: Some(group_id),
-                });
-            }
+            items.push(SidebarItem::Face {
+                index: face,
+                group: Some(group_id),
+            });
         }
         for child in metadata
             .groups
             .iter()
             .filter(|child| child.parent_id == Some(group_id))
         {
-            append_group(
-                metadata,
-                child.id,
-                face_count,
-                grouped_faces,
-                visited,
-                items,
-            );
+            append_group(metadata, child.id, visited, items, collapsed_groups);
         }
     }
 
     let mut items = Vec::new();
-    let mut grouped_faces = HashSet::new();
+    let grouped_faces = metadata
+        .groups
+        .iter()
+        .flat_map(|group| group.faces.iter().copied())
+        .filter(|&face| face < face_count)
+        .collect::<HashSet<_>>();
     let mut visited = HashSet::new();
     for group in metadata
         .groups
@@ -3019,10 +3026,9 @@ fn sidebar_items(metadata: &FaceMetadata, face_count: usize) -> Vec<SidebarItem>
         append_group(
             metadata,
             group.id,
-            face_count,
-            &mut grouped_faces,
             &mut visited,
             &mut items,
+            collapsed_groups,
         );
     }
     for face in 0..face_count {
@@ -5210,11 +5216,36 @@ pub fn run(
             .map(EditableMesh::face_count)
             .unwrap_or(0);
         let items = selected_metadata(catalog, state)
-            .map(|metadata| sidebar_items(metadata, face_count))
+            .map(|metadata| sidebar_items(metadata, face_count, &state.collapsed_groups))
             .unwrap_or_default();
         let visible_rows = ((screen_height() - FACE_LIST_TOP - 46.0) / FACE_ROW_HEIGHT)
             .floor()
             .max(1.0) as usize;
+        state.face_scroll = state
+            .face_scroll
+            .min(items.len().saturating_sub(visible_rows));
+        let scroll_track = Rect::new(
+            SIDEBAR_WIDTH - 8.0,
+            FACE_LIST_TOP,
+            6.0,
+            visible_rows as f32 * FACE_ROW_HEIGHT,
+        );
+        let max_scroll = items.len().saturating_sub(visible_rows);
+        let thumb_height = if max_scroll == 0 {
+            scroll_track.h
+        } else {
+            (scroll_track.h * visible_rows as f32 / items.len() as f32)
+                .max(24.0)
+                .min(scroll_track.h)
+        };
+        let thumb_travel = (scroll_track.h - thumb_height).max(0.0);
+        let thumb_y = scroll_track.y
+            + if max_scroll == 0 {
+                0.0
+            } else {
+                thumb_travel * state.face_scroll as f32 / max_scroll as f32
+            };
+        let thumb = Rect::new(scroll_track.x, thumb_y, scroll_track.w, thumb_height);
         if !modal_open && !rename_dialog_open && sidebar.contains(ctx.mouse) {
             let (_, wheel) = mouse_wheel();
             if wheel > 0.0 {
@@ -5222,6 +5253,27 @@ pub fn run(
             } else if wheel < 0.0 {
                 state.face_scroll = state.face_scroll.saturating_add((-wheel).ceil() as usize);
             }
+        }
+        if !modal_open && !rename_dialog_open {
+            if is_mouse_button_pressed(MouseButton::Left) && scroll_track.contains(ctx.mouse) {
+                state.face_scroll_drag_offset = Some(if thumb.contains(ctx.mouse) {
+                    ctx.mouse.y - thumb.y
+                } else {
+                    thumb_height * 0.5
+                });
+            }
+            if let Some(drag_offset) = state.face_scroll_drag_offset {
+                if is_mouse_button_down(MouseButton::Left) && max_scroll > 0 && thumb_travel > 0.0 {
+                    let scroll_fraction = ((ctx.mouse.y - scroll_track.y - drag_offset)
+                        / thumb_travel)
+                        .clamp(0.0, 1.0);
+                    state.face_scroll = (scroll_fraction * max_scroll as f32).round() as usize;
+                } else if !is_mouse_button_down(MouseButton::Left) {
+                    state.face_scroll_drag_offset = None;
+                }
+            }
+        } else {
+            state.face_scroll_drag_offset = None;
         }
         state.face_scroll = state
             .face_scroll
@@ -5245,21 +5297,45 @@ pub fn run(
                 })
                 .unwrap_or((0, false));
             let indent = depth as f32 * 10.0 + if nested_face { 10.0 } else { 0.0 };
+            let is_group = matches!(item, SidebarItem::Group(_));
+            let collapse_rect = Rect::new(12.0 + indent, y, 18.0, FACE_ROW_HEIGHT - 2.0);
             let rect = Rect::new(
-                12.0 + indent,
+                12.0 + indent + if is_group { 18.0 } else { 0.0 },
                 y,
-                SIDEBAR_WIDTH
-                    - 24.0
-                    - indent
-                    - usize::from(matches!(item, SidebarItem::Group(_))) as f32 * 100.0,
+                SIDEBAR_WIDTH - 24.0 - indent - usize::from(is_group) as f32 * 118.0,
                 FACE_ROW_HEIGHT - 2.0,
             );
             let configure_rect = Rect::new(SIDEBAR_WIDTH - 108.0, y, 34.0, FACE_ROW_HEIGHT - 2.0);
             let lock_rect = Rect::new(SIDEBAR_WIDTH - 72.0, y, 28.0, FACE_ROW_HEIGHT - 2.0);
             let hide_rect = Rect::new(SIDEBAR_WIDTH - 42.0, y, 28.0, FACE_ROW_HEIGHT - 2.0);
+            let group_can_collapse = match item {
+                SidebarItem::Group(group_id) => {
+                    selected_metadata(catalog, state).is_some_and(|metadata| {
+                        metadata
+                            .group(group_id)
+                            .is_some_and(|group| !group.faces.is_empty())
+                            || metadata
+                                .groups
+                                .iter()
+                                .any(|child| child.parent_id == Some(group_id))
+                    })
+                }
+                SidebarItem::Face { .. } => false,
+            };
             if !modal_open
                 && !rename_dialog_open
-                && matches!(item, SidebarItem::Group(_))
+                && is_group
+                && group_can_collapse
+                && list_row_clicked(collapse_rect, ctx.mouse)
+            {
+                if let SidebarItem::Group(group_id) = item {
+                    if !state.collapsed_groups.remove(&group_id) {
+                        state.collapsed_groups.insert(group_id);
+                    }
+                }
+            } else if !modal_open
+                && !rename_dialog_open
+                && is_group
                 && show_lock_hide
                 && list_row_clicked(lock_rect, ctx.mouse)
             {
@@ -5271,7 +5347,7 @@ pub fn run(
                 }
             } else if !modal_open
                 && !rename_dialog_open
-                && matches!(item, SidebarItem::Group(_))
+                && is_group
                 && show_lock_hide
                 && list_row_clicked(hide_rect, ctx.mouse)
             {
@@ -5283,7 +5359,7 @@ pub fn run(
                 }
             } else if !modal_open
                 && !rename_dialog_open
-                && matches!(item, SidebarItem::Group(_))
+                && is_group
                 && list_row_clicked(configure_rect, ctx.mouse)
             {
                 if let SidebarItem::Group(group_id) = item
@@ -6436,10 +6512,13 @@ pub fn run(
             selected_mesh(catalog, state),
             selected_metadata(catalog, state),
         ) {
-            let items = sidebar_items(metadata, mesh.face_count());
+            let items = sidebar_items(metadata, mesh.face_count(), &state.collapsed_groups);
             let visible_rows = ((screen_height() - FACE_LIST_TOP - 46.0) / FACE_ROW_HEIGHT)
                 .floor()
                 .max(1.0) as usize;
+            state.face_scroll = state
+                .face_scroll
+                .min(items.len().saturating_sub(visible_rows));
             let add_group = Rect::new(12.0, 66.0, 108.0, 30.0);
             let rename = Rect::new(130.0, 66.0, 108.0, 30.0);
             let undo_button = Rect::new(12.0, 102.0, 108.0, 30.0);
@@ -6529,9 +6608,9 @@ pub fn run(
                 };
                 let indent = depth as f32 * 10.0 + if is_face && depth > 0 { 10.0 } else { 0.0 };
                 let is_group = matches!(item, SidebarItem::Group(_));
-                let configure_width = if is_group { 100.0 } else { 0.0 };
+                let configure_width = if is_group { 118.0 } else { 0.0 };
                 let rect = Rect::new(
-                    12.0 + indent,
+                    12.0 + indent + if is_group { 18.0 } else { 0.0 },
                     y,
                     SIDEBAR_WIDTH - 24.0 - indent - configure_width,
                     FACE_ROW_HEIGHT - 2.0,
@@ -6539,6 +6618,23 @@ pub fn run(
                 draw_list_row(ctx, rect, &label, selected, color);
                 if is_group {
                     if let SidebarItem::Group(group_id) = item {
+                        let collapse = Rect::new(12.0 + indent, y, 18.0, FACE_ROW_HEIGHT - 2.0);
+                        let can_collapse = metadata
+                            .group(group_id)
+                            .is_some_and(|group| !group.faces.is_empty())
+                            || metadata
+                                .groups
+                                .iter()
+                                .any(|child| child.parent_id == Some(group_id));
+                        if can_collapse {
+                            let collapsed = state.collapsed_groups.contains(&group_id);
+                            draw_group_action_button(
+                                ctx,
+                                collapse,
+                                if collapsed { "+" } else { "-" },
+                                collapsed,
+                            );
+                        }
                         let configure =
                             Rect::new(rect.x + rect.w + 4.0, y, 34.0, FACE_ROW_HEIGHT - 2.0);
                         let lock = Rect::new(configure.x + 36.0, y, 28.0, FACE_ROW_HEIGHT - 2.0);
@@ -6564,6 +6660,41 @@ pub fn run(
                     }
                 }
             }
+            let scroll_track = Rect::new(
+                SIDEBAR_WIDTH - 8.0,
+                FACE_LIST_TOP,
+                6.0,
+                visible_rows as f32 * FACE_ROW_HEIGHT,
+            );
+            draw_rectangle(
+                scroll_track.x,
+                scroll_track.y,
+                scroll_track.w,
+                scroll_track.h,
+                ctx.colors_rt.panel_border,
+            );
+            let max_scroll = items.len().saturating_sub(visible_rows);
+            let thumb_height = if max_scroll == 0 {
+                scroll_track.h
+            } else {
+                (scroll_track.h * visible_rows as f32 / items.len() as f32)
+                    .max(24.0)
+                    .min(scroll_track.h)
+            };
+            let thumb_travel = (scroll_track.h - thumb_height).max(0.0);
+            let thumb_y = scroll_track.y
+                + if max_scroll == 0 {
+                    0.0
+                } else {
+                    thumb_travel * state.face_scroll as f32 / max_scroll as f32
+                };
+            draw_rectangle(
+                scroll_track.x,
+                thumb_y,
+                scroll_track.w,
+                thumb_height,
+                ctx.colors_rt.button_hover,
+            );
         }
     } else {
         let mut y = 68.0;

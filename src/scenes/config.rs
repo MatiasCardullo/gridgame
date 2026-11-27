@@ -2,7 +2,8 @@ use macroquad::prelude::*;
 
 use crate::TRI_LENGHT;
 use crate::core::ui::{
-    adjust_color_channel, color_target_list, color_target_mut, color_target_name, ui_button,
+    UiValueStepperLayout, UiValueStepperStyle, adjust_color_channel, color_target_list,
+    color_target_mut, color_target_name, draw_value_stepper_row, ui_button,
 };
 use crate::core::{
     AppColors, AppConfig, Axial, ConfigData, FrameContext, Scene, TileData, generate_tiles,
@@ -44,13 +45,22 @@ pub fn run(
 
     let stepper_text = ctx.colors_rt.text_secondary;
     let draw_stepper = |label: &str, value: &str, y: f32| -> (bool, bool) {
-        draw_text(label, label_x, y, ctx.font_md, stepper_text);
-        let rect_dec = Rect::new(btn_x, y - 24.0, btn_w, btn_h);
-        let rect_inc = Rect::new(btn_x + btn_w + btn_gap, y - 24.0, btn_w, btn_h);
-        let (dec, _) = ui_button(rect_dec, "-", ctx.mouse, ctx.font_md, ctx.button_colors);
-        let (inc, _) = ui_button(rect_inc, "+", ctx.mouse, ctx.font_md, ctx.button_colors);
-        draw_text(value, value_x, y, ctx.font_md, stepper_text);
-        (dec, inc)
+        draw_value_stepper_row(
+            label,
+            value,
+            UiValueStepperLayout {
+                label_position: vec2(label_x, y),
+                decrement_rect: Rect::new(btn_x, y - 24.0, btn_w, btn_h),
+                increment_rect: Rect::new(btn_x + btn_w + btn_gap, y - 24.0, btn_w, btn_h),
+                value_position: vec2(value_x, y),
+            },
+            ctx.mouse,
+            UiValueStepperStyle {
+                font_size: ctx.font_md,
+                text_color: stepper_text,
+                button_colors: ctx.button_colors,
+            },
+        )
     };
 
     let (dec, inc) = draw_stepper("Velocidad de zoom", &format!("{:.2}", config.zoom_speed), y);
@@ -322,11 +332,22 @@ pub fn run(
     );
     for (idx, (label, value)) in channels.iter().enumerate() {
         let row_y = y + idx as f32 * row_gap;
-        draw_text(label, label_x, row_y, ctx.font_md, text_secondary);
-        let rect_dec = Rect::new(btn_x, row_y - 24.0, btn_w, btn_h);
-        let rect_inc = Rect::new(btn_x + btn_w + btn_gap, row_y - 24.0, btn_w, btn_h);
-        let (dec, _) = ui_button(rect_dec, "-", ctx.mouse, ctx.font_md, ctx.button_colors);
-        let (inc, _) = ui_button(rect_inc, "+", ctx.mouse, ctx.font_md, ctx.button_colors);
+        let (dec, inc) = draw_value_stepper_row(
+            label,
+            &format!("{value}"),
+            UiValueStepperLayout {
+                label_position: vec2(label_x, row_y),
+                decrement_rect: Rect::new(btn_x, row_y - 24.0, btn_w, btn_h),
+                increment_rect: Rect::new(btn_x + btn_w + btn_gap, row_y - 24.0, btn_w, btn_h),
+                value_position: vec2(value_x, row_y),
+            },
+            ctx.mouse,
+            UiValueStepperStyle {
+                font_size: ctx.font_md,
+                text_color: text_secondary,
+                button_colors: ctx.button_colors,
+            },
+        );
         if dec {
             changed = true;
             adjust_color_channel(color, idx, -8);
@@ -335,13 +356,6 @@ pub fn run(
             changed = true;
             adjust_color_channel(color, idx, 8);
         }
-        draw_text(
-            &format!("{}", value),
-            value_x,
-            row_y,
-            ctx.font_md,
-            text_secondary,
-        );
     }
 
     if changed {

@@ -8,8 +8,22 @@ use crate::core::object_assets::{
     FaceGroupProgram, FaceMetadata, MeshPrimitive, ObjectCatalog, ObjectCategory, ObjectId,
     PlacementProfile, RadialNeighborState, building_model_scale_for_cell, mesh_center_and_scale,
 };
-use crate::core::ui::{fit_status_text, ui_button};
 use crate::core::{FrameContext, Scene};
+
+mod transform;
+mod ui;
+
+use transform::{
+    apply_transform_to_indices, constrained_transform_values, parse_transform_values,
+    transform_has_effect, transform_position,
+};
+use ui::{
+    button, draw_group_action_button, draw_list_row, draw_numeric_transform_panel,
+    draw_object_snap_panel, draw_status_bar, list_row_clicked, numeric_transform_panel_rect,
+};
+
+#[cfg(test)]
+use ui::status_bar_message;
 
 const SIDEBAR_WIDTH: f32 = 250.0;
 const TOOLBAR_HEIGHT: f32 = 62.0;
@@ -403,167 +417,6 @@ fn cad_view_camera(state: &CadSceneState) -> Camera3D {
 
 fn zoom_distance(distance: f32, wheel: f32) -> f32 {
     (distance * (-wheel * 0.01).exp()).clamp(CAMERA_MIN_DISTANCE, CAMERA_MAX_DISTANCE)
-}
-
-fn vec3_is_finite(value: Vec3) -> bool {
-    value.x.is_finite() && value.y.is_finite() && value.z.is_finite()
-}
-
-fn parse_vec3_input(text: &str, label: &str) -> Result<Vec3, String> {
-    let parts = if text.contains(',') {
-        text.split(',').collect::<Vec<_>>()
-    } else {
-        text.split_whitespace().collect::<Vec<_>>()
-    };
-    if parts.len() != 3 {
-        return Err(format!("Enter {label} as three X, Y, Z values"));
-    }
-    let values = parts
-        .into_iter()
-        .map(|value| {
-            let value = value.trim();
-            if value.is_empty() {
-                return Err(format!("Enter {label} as three X, Y, Z values"));
-            }
-            value
-                .parse::<f32>()
-                .map_err(|_| format!("Invalid {label} value '{value}'"))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    let value = vec3(values[0], values[1], values[2]);
-    if !vec3_is_finite(value) {
-        return Err(format!("{label} values must be finite"));
-    }
-    Ok(value)
-}
-
-fn parse_transform_values(mode: TransformMode, text: &str) -> Result<Vec3, String> {
-    let values = parse_vec3_input(text, "transform")?;
-    match mode {
-        TransformMode::Scale
-            if [values.x, values.y, values.z]
-                .iter()
-                .any(|value| *value <= 0.0 || *value > MAX_SCALE_FACTOR) =>
-        {
-            Err(format!(
-                "Scale factors must be greater than 0 and at most {MAX_SCALE_FACTOR}"
-            ))
-        }
-        TransformMode::Move | TransformMode::Rotate
-            if [values.x, values.y, values.z]
-                .iter()
-                .any(|value| value.abs() > MAX_TRANSFORM_VALUE) =>
-        {
-            Err(format!(
-                "Transform values must be between -{MAX_TRANSFORM_VALUE} and {MAX_TRANSFORM_VALUE}"
-            ))
-        }
-        _ => Ok(values),
-    }
-}
-
-fn constrained_transform_values(mode: TransformMode, axis: TransformAxis, values: Vec3) -> Vec3 {
-    let unchanged = if mode == TransformMode::Scale {
-        1.0
-    } else {
-        0.0
-    };
-    match axis {
-        TransformAxis::All => values,
-        TransformAxis::X => vec3(values.x, unchanged, unchanged),
-        TransformAxis::Y => vec3(unchanged, values.y, unchanged),
-        TransformAxis::Z => vec3(unchanged, unchanged, values.z),
-    }
-}
-
-fn transform_position(position: Vec3, command: TransformCommand) -> Vec3 {
-    match command.mode {
-        TransformMode::Move => position + command.values,
-        TransformMode::Rotate => {
-            let mut relative = position - command.pivot;
-            let radians = [
-                command.values.x.to_radians(),
-                command.values.y.to_radians(),
-                command.values.z.to_radians(),
-            ];
-            let (sin_x, cos_x) = radians[0].sin_cos();
-            relative = vec3(
-                relative.x,
-                relative.y * cos_x - relative.z * sin_x,
-                relative.y * sin_x + relative.z * cos_x,
-            );
-            let (sin_y, cos_y) = radians[1].sin_cos();
-            relative = vec3(
-                relative.x * cos_y + relative.z * sin_y,
-                relative.y,
-                -relative.x * sin_y + relative.z * cos_y,
-            );
-            let (sin_z, cos_z) = radians[2].sin_cos();
-            relative = vec3(
-                relative.x * cos_z - relative.y * sin_z,
-                relative.x * sin_z + relative.y * cos_z,
-                relative.z,
-            );
-            command.pivot + relative
-        }
-        TransformMode::Scale => {
-            let relative = position - command.pivot;
-            command.pivot
-                + vec3(
-                    relative.x * command.values.x,
-                    relative.y * command.values.y,
-                    relative.z * command.values.z,
-                )
-        }
-    }
-}
-
-fn apply_transform_to_indices(
-    mesh: &mut EditableMesh,
-    indices: &[usize],
-    command: TransformCommand,
-) -> Result<(), String> {
-    if indices.is_empty() {
-        return Err("Select vertices, edges, or faces before transforming".to_string());
-    }
-    if !vec3_is_finite(command.pivot) || !vec3_is_finite(command.values) {
-        return Err("Transform values must be finite".to_string());
-    }
-    if command.mode == TransformMode::Scale
-        && [command.values.x, command.values.y, command.values.z]
-            .iter()
-            .any(|value| *value <= 0.0 || *value > MAX_SCALE_FACTOR)
-    {
-        return Err("Scale factors must be greater than 0 and at most 1000".to_string());
-    }
-
-    let transformed = indices
-        .iter()
-        .map(|&index| {
-            let vertex = mesh
-                .vertices
-                .get(index)
-                .ok_or_else(|| format!("Selected vertex {index} is out of range"))?;
-            let position = transform_position(vertex.position, command);
-            if !vec3_is_finite(position) {
-                return Err("Transform would create non-finite vertex coordinates".to_string());
-            }
-            Ok((index, position))
-        })
-        .collect::<Result<Vec<_>, String>>()?;
-
-    for (index, position) in transformed {
-        mesh.vertices[index].position = position;
-    }
-    Ok(())
-}
-
-fn transform_has_effect(command: TransformCommand) -> bool {
-    match command.mode {
-        TransformMode::Move => command.values.length_squared() > 1e-8,
-        TransformMode::Rotate => command.values.length_squared() > 1e-8,
-        TransformMode::Scale => (command.values - Vec3::ONE).length_squared() > 1e-8,
-    }
 }
 
 fn axis_direction(axis: TransformAxis) -> Option<Vec3> {
@@ -2511,78 +2364,6 @@ fn placement_cancel_rect(viewport: Rect) -> Rect {
     Rect::new(panel.x + 173.0, panel.y + 117.0, 145.0, 26.0)
 }
 
-fn button(ctx: &FrameContext, rect: Rect, label: &str) -> bool {
-    ui_button(rect, label, ctx.mouse, ctx.font_sm, ctx.button_colors).0
-}
-
-fn list_row_clicked(rect: Rect, mouse: Vec2) -> bool {
-    rect.contains(mouse) && is_mouse_button_pressed(MouseButton::Left)
-}
-
-fn draw_list_row(
-    ctx: &FrameContext,
-    rect: Rect,
-    label: &str,
-    selected: bool,
-    selected_color: Color,
-) {
-    let hovered = rect.contains(ctx.mouse);
-    let fill = if selected {
-        selected_color
-    } else if hovered {
-        ctx.colors_rt.button_hover
-    } else {
-        ctx.colors_rt.button_base
-    };
-    let border = if selected {
-        selected_color
-    } else {
-        ctx.colors_rt.button_border
-    };
-    draw_rectangle(rect.x, rect.y, rect.w, rect.h, fill);
-    draw_rectangle_lines(rect.x, rect.y, rect.w, rect.h, 1.0, border);
-    draw_text(
-        label,
-        rect.x + 10.0,
-        rect.y + rect.h * 0.5 + ctx.font_sm * 0.35,
-        ctx.font_sm,
-        WHITE,
-    );
-}
-
-fn draw_group_action_button(ctx: &FrameContext, rect: Rect, label: &str, active: bool) {
-    let hovered = rect.contains(ctx.mouse);
-    draw_rectangle(
-        rect.x,
-        rect.y,
-        rect.w,
-        rect.h,
-        if active {
-            Color::from_rgba(27, 119, 105, 255)
-        } else if hovered {
-            ctx.colors_rt.button_hover
-        } else {
-            ctx.colors_rt.button_base
-        },
-    );
-    draw_rectangle_lines(
-        rect.x,
-        rect.y,
-        rect.w,
-        rect.h,
-        1.0,
-        ctx.colors_rt.button_border,
-    );
-    let text_width = measure_text(label, None, ctx.font_sm as u16, 1.0).width;
-    draw_text(
-        label,
-        rect.x + (rect.w - text_width) * 0.5,
-        rect.y + rect.h * 0.5 + ctx.font_sm * 0.35,
-        ctx.font_sm,
-        WHITE,
-    );
-}
-
 fn selected_entry<'a>(
     catalog: &'a ObjectCatalog,
     id: ObjectId,
@@ -4128,10 +3909,6 @@ fn draw_group_config_dialog(
     }
 }
 
-fn numeric_transform_panel_rect() -> Rect {
-    Rect::new(SIDEBAR_WIDTH + 12.0, TOOLBAR_HEIGHT + 48.0, 260.0, 108.0)
-}
-
 fn operation_value_panel_rect(viewport: Rect) -> Rect {
     Rect::new(viewport.x + 12.0, viewport.y + 112.0, 310.0, 86.0)
 }
@@ -4139,177 +3916,6 @@ fn operation_value_panel_rect(viewport: Rect) -> Rect {
 fn operation_value_input_rect(viewport: Rect) -> Rect {
     let panel = operation_value_panel_rect(viewport);
     Rect::new(panel.x + 10.0, panel.y + 32.0, panel.w - 20.0, 28.0)
-}
-
-fn draw_numeric_transform_panel(
-    ctx: &FrameContext,
-    catalog: &mut ObjectCatalog,
-    state: &mut CadSceneState,
-) {
-    if !state.numeric_transform_open {
-        return;
-    }
-    let panel = numeric_transform_panel_rect();
-    draw_rectangle(panel.x, panel.y, panel.w, panel.h, ctx.colors_rt.panel_bg);
-    draw_rectangle_lines(
-        panel.x,
-        panel.y,
-        panel.w,
-        panel.h,
-        1.0,
-        ctx.colors_rt.panel_border,
-    );
-    let mode_label = match state.transform_mode {
-        TransformMode::Move => "Move by X, Y, Z",
-        TransformMode::Rotate => "Rotate by degrees X, Y, Z",
-        TransformMode::Scale => "Scale by X, Y, Z",
-    };
-    draw_text(
-        mode_label,
-        panel.x + 10.0,
-        panel.y + 21.0,
-        ctx.font_sm,
-        ctx.colors_rt.text_primary,
-    );
-    let input = Rect::new(panel.x + 10.0, panel.y + 28.0, panel.w - 20.0, 28.0);
-    draw_rectangle(
-        input.x,
-        input.y,
-        input.w,
-        input.h,
-        ctx.colors_rt.button_base,
-    );
-    draw_rectangle_lines(
-        input.x,
-        input.y,
-        input.w,
-        input.h,
-        1.0,
-        if state.numeric_transform_focused {
-            Color::from_rgba(27, 119, 105, 255)
-        } else {
-            ctx.colors_rt.button_border
-        },
-    );
-    if state.numeric_transform_selected {
-        draw_rectangle(
-            input.x + 6.0,
-            input.y + 5.0,
-            (state.numeric_transform_values.chars().count() as f32 * 9.0).min(input.w - 12.0),
-            input.h - 10.0,
-            Color::from_rgba(27, 119, 105, 90),
-        );
-    }
-    draw_text(
-        &state.numeric_transform_values,
-        input.x + 9.0,
-        input.y + 20.0,
-        ctx.font_sm,
-        ctx.colors_rt.text_primary,
-    );
-    if input.contains(ctx.mouse) && is_mouse_button_pressed(MouseButton::Left) {
-        state.numeric_transform_focused = true;
-        state.numeric_transform_selected = true;
-        state.error = None;
-    }
-    let button_y = panel.y + 66.0;
-    let apply_clicked = button(
-        ctx,
-        Rect::new(panel.x + 10.0, button_y, 110.0, 30.0),
-        "Apply",
-    );
-    let close_clicked = button(
-        ctx,
-        Rect::new(panel.x + 140.0, button_y, 110.0, 30.0),
-        "Close",
-    );
-    if apply_clicked {
-        match apply_numeric_transform(catalog, state) {
-            Ok(()) => {
-                state.error = None;
-            }
-            Err(error) => state.error = Some(error),
-        }
-    } else if close_clicked {
-        state.numeric_transform_open = false;
-        state.numeric_transform_focused = false;
-        state.numeric_transform_selected = false;
-        state.error = None;
-    }
-}
-
-fn draw_object_snap_panel(ctx: &FrameContext, panel: Rect, state: &mut CadSceneState) {
-    if !state.snap_settings_open {
-        return;
-    }
-    let popup = object_snap_panel_rect(panel);
-    draw_rectangle(popup.x, popup.y, popup.w, popup.h, ctx.colors_rt.panel_bg);
-    draw_rectangle_lines(
-        popup.x,
-        popup.y,
-        popup.w,
-        popup.h,
-        1.0,
-        ctx.colors_rt.panel_border,
-    );
-    draw_text(
-        "Object snap modes",
-        popup.x + 8.0,
-        popup.y + 19.0,
-        ctx.font_sm,
-        ctx.colors_rt.text_primary,
-    );
-    for (index, (kind, label)) in [
-        (ObjectSnapKind::Endpoint, "End"),
-        (ObjectSnapKind::Midpoint, "Mid"),
-        (ObjectSnapKind::Center, "Center"),
-        (ObjectSnapKind::Intersection, "Intersect"),
-        (ObjectSnapKind::Quadrant, "Quad"),
-        (ObjectSnapKind::Perpendicular, "Perp"),
-        (ObjectSnapKind::Tangent, "Tangent"),
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        let rect = object_snap_button_rect(panel, index);
-        let enabled = state.object_snaps.enabled(kind);
-        if button(ctx, rect, label) {
-            state.object_snaps.set(kind, !enabled);
-        }
-        if enabled {
-            draw_rectangle_lines(
-                rect.x,
-                rect.y,
-                rect.w,
-                rect.h,
-                2.0,
-                Color::from_rgba(27, 119, 105, 255),
-            );
-        }
-    }
-    for (index, label, enabled) in [
-        (0, "Polar", state.polar_tracking),
-        (1, "Grid Snap", state.grid_snap),
-    ] {
-        let rect = object_snap_tracking_button_rect(panel, index);
-        if button(ctx, rect, label) {
-            if index == 0 {
-                state.polar_tracking = !state.polar_tracking;
-            } else {
-                state.grid_snap = !state.grid_snap;
-            }
-        }
-        if enabled {
-            draw_rectangle_lines(
-                rect.x,
-                rect.y,
-                rect.w,
-                rect.h,
-                2.0,
-                Color::from_rgba(27, 119, 105, 255),
-            );
-        }
-    }
 }
 
 fn undo_or_redo(catalog: &mut ObjectCatalog, state: &mut CadSceneState, is_undo: bool) {
@@ -4323,118 +3929,6 @@ fn undo_or_redo(catalog: &mut ObjectCatalog, state: &mut CadSceneState, is_undo:
         Ok(false) => {}
         Err(error) => state.error = Some(error),
     }
-}
-
-fn status_bar_message(state: &CadSceneState, asset_error: Option<&str>) -> (String, bool) {
-    if let Some(error) = &state.error {
-        return (error.clone(), true);
-    }
-    if let Some(error) = asset_error {
-        return (error.to_string(), true);
-    }
-    let message = if state.placing_radial_center {
-        "Click the grid to place the UCS origin; Esc cancels."
-    } else if let Some(placement) = &state.primitive_placement {
-        if placement.center.is_some() {
-            "Primitive placement: click the viewport to set its size; use Create to finish."
-        } else {
-            "Click the grid to place the primitive center; Esc cancels."
-        }
-    } else if state.trim_active && state.trim_phase == TrimPhase::Targets {
-        "Trim 1/2: select target faces; Shift toggles; Enter for cutters."
-    } else if state.trim_active && state.trim_path_active {
-        "Trim path: click the target face; edge and object snaps are active; Enter finishes."
-    } else if state.trim_active && !state.trim_path_points.is_empty() {
-        "Trim 2/2: path ready; Enter to split or Draw Path to replace it."
-    } else if state.trim_active {
-        "Trim 2/2: select cutter faces or Draw Path; Enter to split."
-    } else if state.mirror_active {
-        "Mirror: click three plane points; Backspace removes the last; Enter applies."
-    } else if state.fillet_active {
-        "Fillet: select mesh edges, then set the radius and apply."
-    } else if state.offset_active {
-        "Offset: select faces, then set the distance and apply."
-    } else if state.numeric_transform_open {
-        "Enter X, Y, Z values; Enter applies the transform; Esc closes."
-    } else if state.gizmo_drag.is_some() {
-        "Drag to transform; hold Grid Snap to align the move."
-    } else if state.editing {
-        "Ready."
-    } else {
-        "Select an object to edit."
-    };
-    (message.to_string(), false)
-}
-
-fn draw_status_bar(ctx: &FrameContext, catalog: &ObjectCatalog, state: &CadSceneState) {
-    let height = STATUS_BAR_HEIGHT.min(screen_height());
-    let y = screen_height() - height;
-    draw_rectangle(0.0, y, screen_width(), height, ctx.colors_rt.panel_bg);
-    draw_rectangle_lines(
-        0.0,
-        y,
-        screen_width(),
-        height,
-        1.0,
-        ctx.colors_rt.panel_border,
-    );
-
-    let asset_error = selected_entry(catalog, state.selected).and_then(|entry| {
-        entry
-            .metadata_error
-            .as_deref()
-            .or_else(|| {
-                entry
-                    .states
-                    .iter()
-                    .find_map(|state| state.metadata_error.as_deref())
-            })
-            .or_else(|| entry.states.iter().find_map(|state| state.error.as_deref()))
-            .or(entry.variant_config_error.as_deref())
-            .or(entry.states_error.as_deref())
-            .or(entry.error.as_deref())
-    });
-    let (message, is_error) = status_bar_message(state, asset_error);
-    let baseline = y + height * 0.68;
-    let font_size = ctx.font_sm as u16;
-    let object_label = selected_entry(catalog, state.selected)
-        .map(|entry| entry.definition.label)
-        .unwrap_or("Object");
-    let details = if state.editing {
-        format!(
-            "{} | Grid Snap: {}{}",
-            object_label,
-            if state.grid_snap { "On" } else { "Off" },
-            if state.dirty { " | Unsaved edits" } else { "" }
-        )
-    } else {
-        object_label.to_string()
-    };
-    let details = fit_status_text(&details, screen_width() - 24.0, font_size);
-    let details_width = measure_text(&details, None, font_size, 1.0).width;
-    let message = fit_status_text(&message, screen_width() - details_width - 36.0, font_size);
-    draw_text(
-        &message,
-        12.0,
-        baseline,
-        ctx.font_sm,
-        if is_error {
-            Color::from_rgba(255, 110, 110, 255)
-        } else {
-            ctx.colors_rt.text_primary
-        },
-    );
-    draw_text(
-        &details,
-        (screen_width() - details_width - 12.0).max(12.0),
-        baseline,
-        ctx.font_sm,
-        if state.dirty {
-            Color::from_rgba(255, 220, 100, 255)
-        } else {
-            ctx.colors_rt.text_secondary
-        },
-    );
 }
 
 pub fn handle_api_command(

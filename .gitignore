@@ -8,6 +8,5 @@ Cargo.lock
 *.log
 *.png
 *.bin
-/autocad
 /.obsidian
 /.vscode

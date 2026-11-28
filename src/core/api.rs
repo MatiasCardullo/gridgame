@@ -23,6 +23,7 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 #[serde(rename_all = "snake_case")]
 pub enum ApiBuildingKind {
     Base,
+    Municipality,
     Builder,
     Housing,
     Factory,
@@ -634,6 +635,7 @@ fn parse_request(method: &str, url: &str, body: &[u8]) -> Result<ApiCommand, Par
 fn parse_building_kind(value: &str) -> Result<ApiBuildingKind, ParseError> {
     match value {
         "base" => Ok(ApiBuildingKind::Base),
+        "municipality" => Ok(ApiBuildingKind::Municipality),
         "builder" => Ok(ApiBuildingKind::Builder),
         "housing" => Ok(ApiBuildingKind::Housing),
         "factory" => Ok(ApiBuildingKind::Factory),

@@ -88,9 +88,9 @@ pub enum PlanetUnitItemId {
 impl PlanetUnitItemId {
     pub fn label(self) -> &'static str {
         match self {
-            PlanetUnitItemId::CargoHaulerKit => "Cargo Hauler Kit",
-            PlanetUnitItemId::SiteShuttleKit => "Site Shuttle Kit",
-            PlanetUnitItemId::BuilderTenderKit => "Builder Tender Kit",
+            PlanetUnitItemId::CargoHaulerKit => "Haul Truck Kit",
+            PlanetUnitItemId::SiteShuttleKit => "Container Truck Kit",
+            PlanetUnitItemId::BuilderTenderKit => "Dump Truck Kit",
             PlanetUnitItemId::ModularExcavatorKit => "Modular Excavator Kit",
             PlanetUnitItemId::CompactUtilityLoaderKit => "Compact Utility Loader Kit",
             PlanetUnitItemId::DrillRigKit => "Drill Rig Kit",
@@ -285,7 +285,7 @@ const UNIT_DEFINITIONS: &[PlanetUnitDefinition] = &[
     PlanetUnitDefinition {
         id: PlanetUnitDefinitionId::CargoHauler,
         item_id: PlanetUnitItemId::CargoHaulerKit,
-        label: "Cargo Hauler",
+        label: "Haul Truck",
         category: PlanetUnitCategory::CargoLogistics,
         preset_id: Some(PlanetUnitPresetId::Hauler),
         supported_attachments: NO_ATTACHMENTS,
@@ -294,7 +294,7 @@ const UNIT_DEFINITIONS: &[PlanetUnitDefinition] = &[
     PlanetUnitDefinition {
         id: PlanetUnitDefinitionId::SiteShuttle,
         item_id: PlanetUnitItemId::SiteShuttleKit,
-        label: "Site Shuttle",
+        label: "Container Truck",
         category: PlanetUnitCategory::CargoLogistics,
         preset_id: Some(PlanetUnitPresetId::Shuttle),
         supported_attachments: NO_ATTACHMENTS,
@@ -303,7 +303,7 @@ const UNIT_DEFINITIONS: &[PlanetUnitDefinition] = &[
     PlanetUnitDefinition {
         id: PlanetUnitDefinitionId::BuilderTender,
         item_id: PlanetUnitItemId::BuilderTenderKit,
-        label: "Builder Tender",
+        label: "Dump Truck",
         category: PlanetUnitCategory::LightUtility,
         preset_id: Some(PlanetUnitPresetId::BuilderSupply),
         supported_attachments: LIGHT_UTILITY_ATTACHMENTS,

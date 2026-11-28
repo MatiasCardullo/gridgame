@@ -78,7 +78,7 @@ curl.exe -X POST "http://127.0.0.1:39123/api/v1/units" `
 
 `hauler` and `shuttle` require a Logistics depot and `pickup`/`dropoff` building nodes.
 `builder_supply` requires a Builder depot, `pickup`/`construction` nodes, and an available
-completed Builder Tender kit produced by an assembler in a base interior. The kit is consumed
+completed Dump Truck kit produced by an assembler in a base interior. The kit is consumed
 only when unit creation succeeds. Optional `refuel` nodes must be Refuel buildings. Every
 supplied node must refer to an existing building. Unit behavior and resource deposits
 otherwise remain under the existing simulation.

@@ -30,9 +30,9 @@ Planet units use a declarative runtime in `src/core/planet_units.rs` and a highe
   - supported attachments
   - optional mapping to a runtime preset
 - Current runtime-spawnable definitions map onto existing presets:
-  - `Cargo Hauler` -> `Hauler`
-  - `Site Shuttle` -> `Shuttle`
-  - `Builder Tender` -> `BuilderSupply`
+  - `Haul Truck` -> `Hauler`
+  - `Container Truck` -> `Shuttle`
+  - `Dump Truck` -> `BuilderSupply`
 - Catalog-only definitions already exist for future expansion, even if they are not yet spawnable:
   - `Modular Excavator`
   - `Compact Utility Loader`
@@ -116,13 +116,13 @@ The Base window has the `Auto builder units` toggle.
 
 A completed Logistics building exposes node pickers for `Pickup`, `Dropoff`, and
 `Refuel`. Choose a picker, then click the corresponding building on the planet to
-bind that node. With pickup and dropoff assigned, create a `Cargo Hauler` or
-`Site Shuttle` from the Logistics window. The window also shows definition parts
+bind that node. With pickup and dropoff assigned, create a `Haul Truck` or
+`Container Truck` from the Logistics window. The window also shows definition parts
 and the depot's unit list.
 
 ### Builder
 
-The builder window has three auto-selection toggles plus manual creation for the `Builder Tender` definition:
+The builder window has three auto-selection toggles plus manual creation for the `Dump Truck` definition:
 
 - `Auto source`
 - `Auto build target`
@@ -147,7 +147,7 @@ The builder window also shows:
 For a cargo loop, place a Logistics depot, a resource source such as a Mine, and
 a destination such as a Warehouse. Connect the depot and both nodes with Route
 segments, then open the building controls to bind pickup/dropoff nodes and create
-a Cargo Hauler. Add a completed Refuel building and connect it by route if the
+a Haul Truck. Add a completed Refuel building and connect it by route if the
 unit needs a refuel node.
 
 For construction supply, provide a Builder building and a completed Builder

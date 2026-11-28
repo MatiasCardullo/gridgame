@@ -255,6 +255,18 @@ pub fn resource_kind_to_id(kind: PlanetResourceKind) -> u8 {
         PlanetResourceKind::Stone => 7,
         PlanetResourceKind::FreshWater => 8,
         PlanetResourceKind::Salt => 9,
+        PlanetResourceKind::Earthworks => 11,
+        PlanetResourceKind::Aggregate => 12,
+        PlanetResourceKind::Concrete => 13,
+        PlanetResourceKind::Rebar => 14,
+        PlanetResourceKind::StructuralSteel => 15,
+        PlanetResourceKind::Glass => 16,
+        PlanetResourceKind::GypsumBoard => 17,
+        PlanetResourceKind::Panels => 18,
+        PlanetResourceKind::Cable => 19,
+        PlanetResourceKind::Pipe => 20,
+        PlanetResourceKind::Timber => 21,
+        PlanetResourceKind::Machinery => 22,
     }
 }
 
@@ -271,6 +283,18 @@ pub fn resource_kind_from_id(id: u8) -> Option<PlanetResourceKind> {
         7 => Some(PlanetResourceKind::Stone),
         8 => Some(PlanetResourceKind::FreshWater),
         9 => Some(PlanetResourceKind::Salt),
+        11 => Some(PlanetResourceKind::Earthworks),
+        12 => Some(PlanetResourceKind::Aggregate),
+        13 => Some(PlanetResourceKind::Concrete),
+        14 => Some(PlanetResourceKind::Rebar),
+        15 => Some(PlanetResourceKind::StructuralSteel),
+        16 => Some(PlanetResourceKind::Glass),
+        17 => Some(PlanetResourceKind::GypsumBoard),
+        18 => Some(PlanetResourceKind::Panels),
+        19 => Some(PlanetResourceKind::Cable),
+        20 => Some(PlanetResourceKind::Pipe),
+        21 => Some(PlanetResourceKind::Timber),
+        22 => Some(PlanetResourceKind::Machinery),
         _ => None,
     }
 }

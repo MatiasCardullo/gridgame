@@ -41,7 +41,7 @@ impl PlanetState {
             } else {
                 record.build_progress
             };
-            let interior = if record.kind == PlanetBuildingKind::Base {
+            let interior = if record.kind == PlanetBuildingKind::SpacePod {
                 Some(record.interior.unwrap_or_default())
             } else {
                 None

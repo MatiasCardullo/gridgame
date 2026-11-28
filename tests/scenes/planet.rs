@@ -305,15 +305,18 @@ fn planet_building_scale_is_stable_across_conditioned_geometry() {
 #[test]
 fn radial_neighbors_distinguish_same_building_from_other_buildings() {
     assert_eq!(
-        radial_neighbor_state(PlanetBuildingKind::Base, Some(PlanetBuildingKind::Base)),
+        radial_neighbor_state(
+            PlanetBuildingKind::SpacePod,
+            Some(PlanetBuildingKind::SpacePod)
+        ),
         RadialNeighborState::Route
     );
     assert_eq!(
-        radial_neighbor_state(PlanetBuildingKind::Base, Some(PlanetBuildingKind::Mine)),
+        radial_neighbor_state(PlanetBuildingKind::SpacePod, Some(PlanetBuildingKind::Mine)),
         RadialNeighborState::OtherBuilding
     );
     assert_eq!(
-        radial_neighbor_state(PlanetBuildingKind::Base, None),
+        radial_neighbor_state(PlanetBuildingKind::SpacePod, None),
         RadialNeighborState::Empty
     );
 }
@@ -324,6 +327,20 @@ fn legacy_route_buildings_deserialize_as_unsupported() {
 
     assert_eq!(kind, PlanetBuildingKind::LegacyRoute);
     assert_eq!(building_object_id(kind), None);
+}
+
+#[test]
+fn legacy_base_buildings_deserialize_as_space_pods() {
+    let kind: PlanetBuildingKind = serde_json::from_str("\"Base\"").unwrap();
+
+    assert_eq!(kind, PlanetBuildingKind::SpacePod);
+    assert_eq!(kind.label(), "Space pod");
+}
+
+#[test]
+fn space_pod_is_not_user_buildable_but_municipality_is() {
+    assert!(!is_user_buildable_building(PlanetBuildingKind::SpacePod));
+    assert!(is_user_buildable_building(PlanetBuildingKind::Municipality));
 }
 
 fn test_building() -> PlanetBuildingState {
@@ -358,7 +375,7 @@ fn test_cell(deposits: Vec<PlanetDeposit>) -> PlanetCellState {
 
 fn test_building_with_builder_kits(kits: u32) -> PlanetBuildingState {
     let mut building = test_building();
-    building.kind = PlanetBuildingKind::Base;
+    building.kind = PlanetBuildingKind::SpacePod;
     let mut interior = BaseInteriorState::default();
     interior.blocks.clear();
     interior.containers.clear();

@@ -105,3 +105,29 @@ fn fresh_water_is_not_generated_for_water_cells() {
             .all(|deposit| deposit.kind != PlanetResourceKind::FreshWater)
     );
 }
+
+#[test]
+fn construction_material_ids_round_trip_without_becoming_deposits() {
+    let materials = [
+        PlanetResourceKind::Earthworks,
+        PlanetResourceKind::Aggregate,
+        PlanetResourceKind::Concrete,
+        PlanetResourceKind::Rebar,
+        PlanetResourceKind::StructuralSteel,
+        PlanetResourceKind::Glass,
+        PlanetResourceKind::GypsumBoard,
+        PlanetResourceKind::Panels,
+        PlanetResourceKind::Cable,
+        PlanetResourceKind::Pipe,
+        PlanetResourceKind::Timber,
+        PlanetResourceKind::Machinery,
+    ];
+
+    for material in materials {
+        assert_eq!(
+            PlanetResourceKind::from_u8(material.to_u8()),
+            Some(material)
+        );
+        assert!(deposit_from_score(material, 1.0).is_none());
+    }
+}

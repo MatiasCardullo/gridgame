@@ -468,7 +468,9 @@ enum PlanetLoadStatus {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 enum PlanetBuildingKind {
-    Base,
+    #[serde(alias = "Base")]
+    SpacePod,
+    Municipality,
     Builder,
     Housing,
     Factory,
@@ -489,7 +491,8 @@ enum PlanetTool {
 impl PlanetBuildingKind {
     fn label(self) -> &'static str {
         match self {
-            PlanetBuildingKind::Base => "Base",
+            PlanetBuildingKind::SpacePod => "Space pod",
+            PlanetBuildingKind::Municipality => "Municipality",
             PlanetBuildingKind::Builder => "Builder",
             PlanetBuildingKind::Housing => "Housing",
             PlanetBuildingKind::Factory => "Factory",
@@ -515,6 +518,18 @@ fn resource_name(kind: PlanetResourceKind) -> &'static str {
         PlanetResourceKind::Stone => "stone",
         PlanetResourceKind::FreshWater => "fresh_water",
         PlanetResourceKind::Salt => "salt",
+        PlanetResourceKind::Earthworks => "earthworks",
+        PlanetResourceKind::Aggregate => "aggregate",
+        PlanetResourceKind::Concrete => "concrete",
+        PlanetResourceKind::Rebar => "rebar",
+        PlanetResourceKind::StructuralSteel => "structural_steel",
+        PlanetResourceKind::Glass => "glass",
+        PlanetResourceKind::GypsumBoard => "gypsum_board",
+        PlanetResourceKind::Panels => "panels",
+        PlanetResourceKind::Cable => "cable",
+        PlanetResourceKind::Pipe => "pipe",
+        PlanetResourceKind::Timber => "timber",
+        PlanetResourceKind::Machinery => "machinery",
     }
 }
 
@@ -528,7 +543,7 @@ fn unit_preset_name(preset: PlanetUnitPresetId) -> &'static str {
 
 fn building_object_id(kind: PlanetBuildingKind) -> Option<ObjectId> {
     Some(match kind {
-        PlanetBuildingKind::Base => ObjectId::PlanetBase,
+        PlanetBuildingKind::SpacePod | PlanetBuildingKind::Municipality => ObjectId::PlanetBase,
         PlanetBuildingKind::Builder => ObjectId::PlanetBuilder,
         PlanetBuildingKind::Housing => ObjectId::PlanetHousing,
         PlanetBuildingKind::Factory => ObjectId::PlanetFactory,
@@ -630,7 +645,8 @@ fn api_arm_input_mode(mode: ApiArmInputMode) -> MechanicArmInputMode {
 
 fn building_storage_capacity(kind: PlanetBuildingKind) -> u32 {
     match kind {
-        PlanetBuildingKind::Base => 1_600,
+        PlanetBuildingKind::SpacePod => 1_600,
+        PlanetBuildingKind::Municipality => 4_000,
         PlanetBuildingKind::Builder => 500,
         PlanetBuildingKind::Housing => 350,
         PlanetBuildingKind::Factory => 1_000,
@@ -642,10 +658,18 @@ fn building_storage_capacity(kind: PlanetBuildingKind) -> u32 {
     }
 }
 
+fn is_user_buildable_building(kind: PlanetBuildingKind) -> bool {
+    !matches!(
+        kind,
+        PlanetBuildingKind::LegacyRoute | PlanetBuildingKind::SpacePod
+    )
+}
+
 // Returns construction time in seconds for planet buildings.
 fn planet_build_time(kind: PlanetBuildingKind) -> f32 {
     match kind {
-        PlanetBuildingKind::Base => 0.0,
+        PlanetBuildingKind::SpacePod => 0.0,
+        PlanetBuildingKind::Municipality => 8.0,
         PlanetBuildingKind::Builder => 5.0,
         PlanetBuildingKind::Housing => 6.0,
         PlanetBuildingKind::Factory => 8.0,
@@ -660,7 +684,8 @@ fn planet_build_time(kind: PlanetBuildingKind) -> f32 {
 // Returns construction material requirements per planet building kind.
 fn planet_build_requirements(kind: PlanetBuildingKind) -> Vec<PlanetResourceStack> {
     match kind {
-        PlanetBuildingKind::Base => vec![],
+        PlanetBuildingKind::SpacePod => vec![],
+        PlanetBuildingKind::Municipality => vec![],
         PlanetBuildingKind::Builder => vec![
             PlanetResourceStack {
                 resource_id: resource_kind_to_id(PlanetResourceKind::Stone),
@@ -1065,7 +1090,7 @@ fn unit_ops(
     UnitOps {
         is_route: is_route_kind,
         is_builder: |kind| kind == PlanetBuildingKind::Builder,
-        is_base: |kind| kind == PlanetBuildingKind::Base,
+        is_base: |kind| kind == PlanetBuildingKind::SpacePod,
         is_warehouse: |kind| kind == PlanetBuildingKind::Warehouse,
         is_refuel: |kind| kind == PlanetBuildingKind::Refuel,
         build_requirements: planet_build_requirements,
@@ -1405,7 +1430,9 @@ impl PlanetState {
                     );
                 }
                 let kind = match kind {
-                    ApiBuildingKind::Base => PlanetBuildingKind::Base,
+                    ApiBuildingKind::Base | ApiBuildingKind::Municipality => {
+                        PlanetBuildingKind::Municipality
+                    }
                     ApiBuildingKind::Builder => PlanetBuildingKind::Builder,
                     ApiBuildingKind::Housing => PlanetBuildingKind::Housing,
                     ApiBuildingKind::Factory => PlanetBuildingKind::Factory,
@@ -1570,7 +1597,7 @@ impl PlanetState {
                 "no building exists at base_cell",
             ));
         };
-        if building.kind != PlanetBuildingKind::Base {
+        if building.kind != PlanetBuildingKind::SpacePod {
             return Err(ApiReply::error(
                 409,
                 "not_a_base",
@@ -1597,7 +1624,7 @@ impl PlanetState {
                 "no building exists at base_cell",
             ));
         };
-        if building.kind != PlanetBuildingKind::Base {
+        if building.kind != PlanetBuildingKind::SpacePod {
             return Err(ApiReply::error(
                 409,
                 "not_a_base",
@@ -2042,11 +2069,7 @@ impl PlanetState {
         ) {
             Ok(result) => result,
             Err(UnitSpawnError::MissingBuilderTenderKit) => {
-                return ApiReply::error(
-                    409,
-                    "missing_unit_kit",
-                    "no Builder Tender kit is available",
-                );
+                return ApiReply::error(409, "missing_unit_kit", "no Dump Truck kit is available");
             }
             Err(UnitSpawnError::UnsupportedDefinition) => {
                 return ApiReply::error(
@@ -2287,7 +2310,7 @@ impl PlanetState {
 
     pub fn begin_base_interior_edit(&mut self, cell_index: u32) -> bool {
         if self
-            .building_of_kind(cell_index, PlanetBuildingKind::Base)
+            .building_of_kind(cell_index, PlanetBuildingKind::SpacePod)
             .is_none()
         {
             return false;
@@ -2303,14 +2326,14 @@ impl PlanetState {
 
     pub fn active_base_interior(&self) -> Option<&BaseInteriorState> {
         let cell_index = self.editing_base_cell?;
-        self.building_of_kind(cell_index, PlanetBuildingKind::Base)?
+        self.building_of_kind(cell_index, PlanetBuildingKind::SpacePod)?
             .interior
             .as_ref()
     }
 
     pub fn active_base_interior_mut(&mut self) -> Option<&mut BaseInteriorState> {
         let cell_index = self.editing_base_cell?;
-        self.building_of_kind_mut(cell_index, PlanetBuildingKind::Base)?
+        self.building_of_kind_mut(cell_index, PlanetBuildingKind::SpacePod)?
             .interior
             .as_mut()
     }
@@ -2442,6 +2465,69 @@ impl PlanetState {
             .unwrap_or(false)
     }
 
+    fn seed_starter_space_pod(&mut self) {
+        if self
+            .buildings
+            .values()
+            .any(|building| building.kind == PlanetBuildingKind::SpacePod)
+        {
+            return;
+        }
+        let Some(world) = self.sim_world.as_ref() else {
+            return;
+        };
+        let Some(grid) = self.sim_grid.as_ref() else {
+            return;
+        };
+        let placement = world
+            .cells
+            .iter()
+            .enumerate()
+            .find_map(|(cell_index, cell)| {
+                if !cell.buildable {
+                    return None;
+                }
+                let side_count = grid.vertex_faces.get(cell_index)?.len();
+                (0..side_count).find_map(|triangle_index| {
+                    let slot = BuildingSlot {
+                        cell_index: cell_index as u32,
+                        triangle_index: triangle_index as u8,
+                    };
+                    building_slot_available(slot, side_count, self.buildings.keys().copied())
+                        .then_some(slot)
+                })
+            });
+        let Some(slot) = placement else {
+            return;
+        };
+        let mut storage = HashMap::new();
+        add_storage_amount(&mut storage, PlanetResourceKind::Stone, 1_800);
+        add_storage_amount(&mut storage, PlanetResourceKind::Iron, 80);
+        add_storage_amount(&mut storage, PlanetResourceKind::Copper, 40);
+        add_storage_amount(&mut storage, PlanetResourceKind::Lead, 20);
+        add_storage_amount(&mut storage, PlanetResourceKind::Zinc, 10);
+        self.buildings.insert(
+            slot,
+            PlanetBuildingState {
+                kind: PlanetBuildingKind::SpacePod,
+                mine_extra: Vec::new(),
+                storage,
+                build_progress: 0.0,
+                build_time: 0.0,
+                build_paid: true,
+                build_claimed: false,
+                builder_units_desired: 0,
+                builder_units_created: 0,
+                auto_units_enabled: true,
+                auto_pick_source: false,
+                auto_pick_build: false,
+                auto_pick_refuel: false,
+                interior: Some(BaseInteriorState::default()),
+            },
+        );
+        self.buildings_dirty = true;
+    }
+
     fn building_slot_exists(&self, slot: BuildingSlot) -> bool {
         self.buildings.contains_key(&slot)
     }
@@ -2548,7 +2634,7 @@ impl PlanetState {
         triangle_index: u8,
         kind: PlanetBuildingKind,
     ) -> bool {
-        if kind == PlanetBuildingKind::LegacyRoute {
+        if !is_user_buildable_building(kind) {
             return false;
         }
         let slot = BuildingSlot {
@@ -2591,7 +2677,7 @@ impl PlanetState {
         let build_time = planet_build_time(kind);
         let mut build_paid = false;
         let mut build_progress = 0.0;
-        if kind == PlanetBuildingKind::Base {
+        if kind == PlanetBuildingKind::SpacePod {
             build_paid = true;
             build_progress = build_time;
             add_storage_amount(&mut storage, PlanetResourceKind::Stone, 1_800);
@@ -2599,6 +2685,9 @@ impl PlanetState {
             add_storage_amount(&mut storage, PlanetResourceKind::Copper, 40);
             add_storage_amount(&mut storage, PlanetResourceKind::Lead, 20);
             add_storage_amount(&mut storage, PlanetResourceKind::Zinc, 10);
+        }
+        if kind == PlanetBuildingKind::Municipality {
+            build_paid = true;
         }
         let slot = BuildingSlot {
             cell_index,
@@ -2620,7 +2709,7 @@ impl PlanetState {
                 auto_pick_source: false,
                 auto_pick_build: false,
                 auto_pick_refuel: false,
-                interior: (kind == PlanetBuildingKind::Base).then(BaseInteriorState::default),
+                interior: (kind == PlanetBuildingKind::SpacePod).then(BaseInteriorState::default),
             },
         );
         self.buildings_dirty = true;
@@ -2632,11 +2721,18 @@ impl PlanetState {
             cell_index,
             triangle_index,
         };
+        if self
+            .buildings
+            .get(&slot)
+            .is_some_and(|building| building.kind == PlanetBuildingKind::SpacePod)
+        {
+            return false;
+        }
         let removed = self.buildings.remove(&slot).is_some();
         if removed {
             if self.editing_base_cell == Some(cell_index)
                 && self
-                    .building_of_kind(cell_index, PlanetBuildingKind::Base)
+                    .building_of_kind(cell_index, PlanetBuildingKind::SpacePod)
                     .is_none()
             {
                 self.editing_base_cell = None;
@@ -2818,7 +2914,7 @@ impl PlanetState {
                             && !planet_is_under_construction(building)
                             && matches!(
                                 building.kind,
-                                PlanetBuildingKind::Base
+                                PlanetBuildingKind::SpacePod
                                     | PlanetBuildingKind::Warehouse
                                     | PlanetBuildingKind::Builder
                             )
@@ -4268,7 +4364,8 @@ fn draw_sim_buildings(
         };
 
         let color = match kind {
-            PlanetBuildingKind::Base => Color::from_rgba(80, 220, 220, 255),
+            PlanetBuildingKind::SpacePod => Color::from_rgba(80, 220, 220, 255),
+            PlanetBuildingKind::Municipality => Color::from_rgba(190, 170, 130, 255),
             PlanetBuildingKind::Builder => Color::from_rgba(255, 214, 102, 255),
             PlanetBuildingKind::Housing => Color::from_rgba(118, 203, 152, 255),
             PlanetBuildingKind::Factory => Color::from_rgba(170, 170, 196, 255),
@@ -5249,6 +5346,7 @@ pub fn run(
             ));
             if result.generation == state.sim_world_generation {
                 state.sim_world = Some(result.world);
+                state.seed_starter_space_pod();
                 planet_perf_log(&format!(
                     "sim world ready freq={} cells={} generation={} took_ms={}",
                     freq, cell_count, result.generation, result.took_ms
@@ -5392,7 +5490,7 @@ pub fn run(
         state.selected_build_tool = None;
     }
     if is_key_pressed(KeyCode::Key2) {
-        state.selected_build_tool = Some(PlanetTool::Building(PlanetBuildingKind::Base));
+        state.selected_build_tool = Some(PlanetTool::Building(PlanetBuildingKind::Municipality));
     }
     if is_key_pressed(KeyCode::Key3) {
         state.selected_build_tool = Some(PlanetTool::Building(PlanetBuildingKind::Builder));
@@ -5797,7 +5895,10 @@ pub fn run(
     }
     let panel_buttons: [(Option<PlanetTool>, &'static str); 10] = [
         (None, "Demolish"),
-        (Some(PlanetTool::Building(PlanetBuildingKind::Base)), "Base"),
+        (
+            Some(PlanetTool::Building(PlanetBuildingKind::Municipality)),
+            "Municipality",
+        ),
         (
             Some(PlanetTool::Building(PlanetBuildingKind::Builder)),
             "Builder",
@@ -6211,7 +6312,8 @@ pub fn run(
         |tool| match tool {
             PlanetTool::RouteLine => Color::from_rgba(220, 220, 120, 255),
             PlanetTool::Building(kind) => match kind {
-                PlanetBuildingKind::Base => Color::from_rgba(80, 220, 220, 255),
+                PlanetBuildingKind::SpacePod => Color::from_rgba(80, 220, 220, 255),
+                PlanetBuildingKind::Municipality => Color::from_rgba(190, 170, 130, 255),
                 PlanetBuildingKind::Builder => Color::from_rgba(255, 214, 102, 255),
                 PlanetBuildingKind::Housing => Color::from_rgba(118, 203, 152, 255),
                 PlanetBuildingKind::Factory => Color::from_rgba(170, 170, 196, 255),
@@ -6402,7 +6504,7 @@ pub fn run(
                         ty += 22.0;
                     }
                     match building.kind {
-                        PlanetBuildingKind::Base => {
+                        PlanetBuildingKind::SpacePod => {
                             let kits = building
                                 .interior
                                 .as_ref()
@@ -6420,7 +6522,7 @@ pub fn run(
                             let rect_interior = Rect::new(tx, ty, 190.0, 28.0);
                             let (clicked_interior, _) = ui_button(
                                 rect_interior,
-                                "Open Base Interior",
+                                "Open Space Pod Interior",
                                 mouse,
                                 ctx.font_sm,
                                 ctx.button_colors,
@@ -6445,6 +6547,7 @@ pub fn run(
                             }
                             ty += 30.0;
                         }
+                        PlanetBuildingKind::Municipality => {}
                         PlanetBuildingKind::Mine => {
                             let resource_totals = mine_resource_totals(
                                 state.sim_world.as_ref(),
@@ -6586,14 +6689,14 @@ pub fn run(
                                 let rect_shuttle = Rect::new(tx + 160.0, ty, 150.0, 28.0);
                                 let (clicked_hauler, _) = ui_button(
                                     rect_hauler,
-                                    "Cargo Hauler",
+                                    "Haul Truck",
                                     mouse,
                                     ctx.font_sm,
                                     ctx.button_colors,
                                 );
                                 let (clicked_shuttle, _) = ui_button(
                                     rect_shuttle,
-                                    "Site Shuttle",
+                                    "Container Truck",
                                     mouse,
                                     ctx.font_sm,
                                     ctx.button_colors,
@@ -6874,7 +6977,7 @@ pub fn run(
                                 let rect_spawn = Rect::new(tx, ty, 160.0, 28.0);
                                 let (clicked_spawn, _) = ui_button(
                                     rect_spawn,
-                                    "Builder Tender",
+                                    "Dump Truck",
                                     mouse,
                                     ctx.font_sm,
                                     ctx.button_colors,

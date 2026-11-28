@@ -4249,6 +4249,7 @@ pub fn handle_api_command(
 fn cad_object_id(kind: ApiBuildingKind) -> ObjectId {
     match kind {
         ApiBuildingKind::Base => ObjectId::PlanetBase,
+        ApiBuildingKind::Municipality => ObjectId::PlanetBase,
         ApiBuildingKind::Builder => ObjectId::PlanetBuilder,
         ApiBuildingKind::Housing => ObjectId::PlanetHousing,
         ApiBuildingKind::Factory => ObjectId::PlanetFactory,
@@ -4262,6 +4263,7 @@ fn cad_object_id(kind: ApiBuildingKind) -> ObjectId {
 fn cad_building_name(kind: ApiBuildingKind) -> &'static str {
     match kind {
         ApiBuildingKind::Base => "base",
+        ApiBuildingKind::Municipality => "municipality",
         ApiBuildingKind::Builder => "builder",
         ApiBuildingKind::Housing => "housing",
         ApiBuildingKind::Factory => "factory",

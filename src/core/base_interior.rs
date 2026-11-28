@@ -29,9 +29,9 @@ impl InteriorPartKind {
             InteriorPartKind::HydraulicSet => "Hydraulic Set",
             InteriorPartKind::SensorPack => "Sensor Pack",
             InteriorPartKind::FastenerBundle => "Fastener Bundle",
-            InteriorPartKind::BuilderTenderKit => "Builder Tender Kit",
-            InteriorPartKind::CargoHaulerKit => "Cargo Hauler Kit",
-            InteriorPartKind::SiteShuttleKit => "Site Shuttle Kit",
+            InteriorPartKind::BuilderTenderKit => "Dump Truck Kit",
+            InteriorPartKind::CargoHaulerKit => "Haul Truck Kit",
+            InteriorPartKind::SiteShuttleKit => "Container Truck Kit",
         }
     }
 }
@@ -149,9 +149,9 @@ pub enum AssemblerRecipeId {
 impl AssemblerRecipeId {
     pub fn label(self) -> &'static str {
         match self {
-            AssemblerRecipeId::BuilderTender => "Builder Tender",
-            AssemblerRecipeId::CargoHauler => "Cargo Hauler",
-            AssemblerRecipeId::SiteShuttle => "Site Shuttle",
+            AssemblerRecipeId::BuilderTender => "Dump Truck",
+            AssemblerRecipeId::CargoHauler => "Haul Truck",
+            AssemblerRecipeId::SiteShuttle => "Container Truck",
         }
     }
 

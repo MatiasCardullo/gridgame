@@ -131,9 +131,10 @@ pub(super) fn info_window_height_for_building(
     content_height += 20.0 + 22.0;
 
     match building.kind {
-        PlanetBuildingKind::Base => {
+        PlanetBuildingKind::SpacePod => {
             content_height += 30.0;
         }
+        PlanetBuildingKind::Municipality => {}
         PlanetBuildingKind::Mine => {
             if state
                 .sim_world
@@ -205,7 +206,7 @@ pub(super) fn sync_info_window_layout(state: &mut PlanetState) {
     };
     if !matches!(
         building.kind,
-        PlanetBuildingKind::Logistics | PlanetBuildingKind::Builder | PlanetBuildingKind::Base
+        PlanetBuildingKind::Logistics | PlanetBuildingKind::Builder | PlanetBuildingKind::SpacePod
     ) {
         state.info_window.show_units = false;
     }
@@ -233,5 +234,17 @@ pub(super) fn resource_label(kind: PlanetResourceKind) -> &'static str {
         PlanetResourceKind::Stone => "Stone",
         PlanetResourceKind::FreshWater => "FreshWater",
         PlanetResourceKind::Salt => "Salt",
+        PlanetResourceKind::Earthworks => "Earthworks",
+        PlanetResourceKind::Aggregate => "Aggregate",
+        PlanetResourceKind::Concrete => "Concrete",
+        PlanetResourceKind::Rebar => "Rebar",
+        PlanetResourceKind::StructuralSteel => "Structural steel",
+        PlanetResourceKind::Glass => "Glass",
+        PlanetResourceKind::GypsumBoard => "Gypsum board",
+        PlanetResourceKind::Panels => "Panels",
+        PlanetResourceKind::Cable => "Cable",
+        PlanetResourceKind::Pipe => "Pipe",
+        PlanetResourceKind::Timber => "Timber",
+        PlanetResourceKind::Machinery => "Machinery",
     }
 }

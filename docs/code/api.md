@@ -9,6 +9,18 @@ All endpoints are under `/api/v1`. Requests are handled by the main game loop, w
 remains the only code that mutates planet state. If the planet simulation is still loading,
 `GET /status` returns `planet_ready: false`; other planet-dependent requests return `503`.
 
+## Request lifecycle
+
+The API listener parses and validates an HTTP request into an `ApiCommand`, then sends
+it to the running game's main loop over a channel. The loop dispatches CAD commands to
+the CAD scene state and planet commands to the live `PlanetState`; this keeps simulation
+mutation on the same thread that updates and renders the world. The listener waits for
+the corresponding reply and serializes it as JSON or PNG.
+
+`PUT /scene/planet` changes the active scene but does not wait for planet generation.
+Poll `/status` until `planet_ready` is `true` before issuing planet-dependent commands.
+The screenshot route is also completed by the frame loop so it captures a rendered frame.
+
 ## Read state
 
 | Method and path | Description |
@@ -101,17 +113,6 @@ must be unique, occupied neighbors of the arm. Filters accept component parts su
 `chassis_frame`, `wheel_assembly`, and `engine_core`; completed vehicle kits are outputs,
 not arm filter parts. Use `GET /bases/{cell}/interior` to inspect block placement, container
 contents, machine inputs and outputs, and current arm/forklift activity.
-
-## Verified logistics flow
-
-On the current saved planet, `PUT /scene/planet` entered the scene without UI automation.
-The API placed a Base at cell `3`; two mechanic arms moved the starter interior parts into
-an assembler and produced one Builder Tender kit. The kit was consumed by the base builder
-while constructing two Mines (`26086`, `26404`), a Warehouse (`38967`), a Refuel station
-(`26246`), a Logistics depot (`51686`), and the connecting Route cell (`26087`). Two Haulers
-were then created with separate mine pickups and the same warehouse dropoff. The warehouse
-subsequently contained mined iron and copper, confirming transfer through the live simulation.
-
 ## Responses and errors
 
 Successful requests return JSON. Errors have this shape:

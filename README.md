@@ -37,43 +37,53 @@ cargo test
 
 When GridGame starts, it serves a versioned JSON API at `http://127.0.0.1:39123/api/v1`.
 It binds only to loopback; clients on other machines cannot connect. The API has no
-authentication, so only use it on a trusted computer. See [docs/api.md](docs/api.md)
+authentication, so only use it on a trusted computer. See [the API guide](docs/code/api.md)
 for endpoints and request examples.
+
+## Documentation
+
+- [Code and developer workflows](docs/code/README.md)
+- [Planet scene](docs/code/planet.md)
+- [Planet units](docs/code/planet_units.md)
+- [Build Template](docs/code/build_template.md)
+- [CAD editor](docs/code/cad_editor.md)
 
 ## Controls
 
 ### Planet
 
-- Left click: select or place building.
-- Right click: place selected building or confirm demolition.
+- Left click: focus/select a cell; click an existing building to open its information window.
+- Right click: place the selected building or route segment; with no build tool selected, request demolition.
 - Mouse wheel: zoom.
 - Middle mouse drag: orbit planet camera.
 - Arrow keys: orbit planet camera.
 - `1`: clear building tool.
 - `2`-`9`: select Base, Builder, Housing, Factory, Mine, Warehouse, Refuel, or Logistics.
-- `0`: select Route.
-- `Delete`: select demolition.
+- `0`: select Route Line; `T` toggles Route/RailTrack; `Enter` finishes the chain.
+- `Delete`: remove hovered building or selected/hovered network; `Backspace` confirms network removal.
 - `P`: export test hex map PNG.
 - `Escape`: return to menu and save state.
 
 ### Base interior
 
-- Left click: place or delete machine block.
-- Right click drag: move 3D camera.
+- Open it from a Base's information window using **Open Base Interior**.
+- Select a panel item, then left-click an empty hex to place a machine block.
+- Right-click a block to inspect/configure it; with no block selected, left-click an occupied hex to request removal.
+- Hold right mouse and move to look around.
 - `WASD`: move camera.
 - `Space` / `Ctrl`: move camera vertically.
-- `R`: rotate selected block.
-- `Escape`: return to planet.
+- `R`: rotate the hovered block or next placement.
+- `Enter` / `Escape`: finish/cancel arm input/output picking; `Escape` returns to Planet when no selection or pick mode is active.
 
 ### CAD object viewer
 
 - Select an object category and model in the left panel.
 - Right mouse drag: orbit; middle mouse drag: pan; mouse wheel: zoom.
-- Select **Edit**, then choose vertex or face selection.
+- Select **Edit**, then choose vertex, edge, or face selection.
 - Shift-click vertices to add or remove them from the selection.
 - Use the move and scale buttons to edit the selection; select a face and use **Extrude** to add geometry.
-- **Save** writes changes to the selected GLB asset; **Discard** restores its last saved geometry.
-- Radial Repeat groups, UCS origin placement, and editor metadata persistence are described in [docs/cad_editor.md](docs/cad_editor.md).
+- **Save** writes changes to the selected asset; choose **Discard** in the unsaved-changes prompt to restore the last saved version.
+- Radial Repeat groups, UCS origin placement, and editor metadata persistence are described in [the CAD guide](docs/code/cad_editor.md).
 
 ## Runtime data
 
@@ -83,6 +93,7 @@ The game creates `planet_data/` as needed:
 - `planet_sim_grid.bin`: cached simulation grid.
 - `planet_resources.bin`: resource snapshot.
 - `planet_buildings.json`: building and base-interior snapshot.
+- `planet_networks.json`: route and rail network snapshot.
 - `planet_units.json`: unit snapshot.
 - `zone_maps/`: exported map images.
 - `planet_perf.log`: optional performance log.
@@ -91,10 +102,12 @@ The game creates `planet_data/` as needed:
 ## Project layout
 
 - `src/main.rs`: application loop and scene routing.
-- `src/scenes/`: main menu, configuration, planet, and build-template scenes.
+- `src/scenes/`: main menu, configuration, planet, CAD, and build-template scenes.
+- `src/scenes/planet/`: planet loading, persistence, and UI support modules.
+- `src/scenes/cad/`: CAD transform and UI support modules.
 - `src/core/`: shared grid, planet, unit, interior, persistence, and UI systems.
+- `src/core/ui/`: reusable editor controls and palette components.
 - `src/core/object_assets.rs`: GLB mesh loading, saving, object catalog, and edit operations.
-- `src/scenes/cad.rs`: CAD object browser, viewer, camera, and mesh editor.
+- `docs/code/`: technical references and developer/gameplay workflow documentation.
 - `assets/objects/`: tracked GLB models grouped into `buildings/`, `units/`, and `machine_blocks/`.
 - `config.json`: persisted runtime settings.
-- `roadmap.md`: implementation status and next milestones.

@@ -105,14 +105,20 @@ Current presets:
 
 ### Base
 
-The base window has `Auto builder units` and runtime unit creation for the logistics category.
+The Base window has the `Auto builder units` toggle.
 
 - Enabled: the base may auto-spawn a single `BuilderSupply` for pending construction
 - Disabled: no automatic construction unit is spawned from base
-- Manual logistics creation currently exposes:
-  - `Cargo Hauler`
-  - `Site Shuttle`
-- The UI also shows each unit definition's category and required parts.
+- Base-owned construction units may travel directly to work sites instead of requiring
+  Route segments.
+
+### Logistics
+
+A completed Logistics building exposes node pickers for `Pickup`, `Dropoff`, and
+`Refuel`. Choose a picker, then click the corresponding building on the planet to
+bind that node. With pickup and dropoff assigned, create a `Cargo Hauler` or
+`Site Shuttle` from the Logistics window. The window also shows definition parts
+and the depot's unit list.
 
 ### Builder
 
@@ -135,6 +141,25 @@ The builder window also shows:
 - unit category
 - required parts
 - compatible attachments for the spawned definition
+
+## End-to-end setup
+
+For a cargo loop, place a Logistics depot, a resource source such as a Mine, and
+a destination such as a Warehouse. Connect the depot and both nodes with Route
+segments, then open the building controls to bind pickup/dropoff nodes and create
+a Cargo Hauler. Add a completed Refuel building and connect it by route if the
+unit needs a refuel node.
+
+For construction supply, provide a Builder building and a completed Builder
+Tender kit produced by an assembler in a Base interior. Bind the Builder depot,
+a material source, an unpaid construction target, and optionally a Refuel node;
+or enable the Builder's auto-selection toggles. Route-bound Builder units need a
+connected Route network. Base-owned automatic construction units are the
+exception and may use direct off-road travel.
+
+The [API guide](api.md#verified-logistics-flow) records a verified automated
+logistics example, and the [Build Template guide](build_template.md) describes
+the interior machine workflow that produces vehicle kits.
 
 ## Persistence
 
